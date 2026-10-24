@@ -1,34 +1,10 @@
 # Susanin.Keenetic
 
-[![Language: C11](https://img.shields.io/badge/C-11-blue?logo=c&logoColor=white)](src)
-[![KeeneticOS 5.1.4-5.1.6](https://img.shields.io/badge/KeeneticOS-5.1.4--5.1.6-orange)](README.md)
-[![Entware required](https://img.shields.io/badge/Entware-required-orange)](README.md)
-[![Architectures](https://img.shields.io/badge/arch-mipsel%20%7C%20mips%20%7C%20aarch64%20%7C%20armv7%20%7C%20x86__64-lightgrey)](README.md)
-[![License](https://img.shields.io/github/license/R17a/Susanin.Keenetic)](LICENSE)
-[![Downloads](https://img.shields.io/github/downloads/R17a/Susanin.Keenetic/total)](https://github.com/R17a/Susanin.Keenetic/releases)
+## Дисклеймер
 
-[![Donate CloudTips](https://img.shields.io/badge/donate-CloudTips-598bd7.svg?style=flat)](https://pay.cloudtips.ru/p/dcbf5f2e)
-[![Donate DonationAlerts](https://img.shields.io/badge/donate-DonationAlerts-f5a623.svg?style=flat)](https://www.donationalerts.com/r/dmitriy_r17a)
-[![Join Telegram group](https://img.shields.io/badge/Telegram_group-Join-blue.svg?style=social&logo=telegram)](https://t.me/Susanin_Keenetic)
-
-> **Только Keenetic/Entware.** Этот репозиторий — порт Susanin на роутеры Keenetic
-> (KeeneticOS + Entware), и вся документация ниже — только про них. Для **других
-> платформ** предназначен оригинальный проект:
-> **[Fiark/susanin](https://github.com/Fiark/susanin)** — адаптивная
-> VPN-маршрутизация для MikroTik RouterOS. Идея переноса описана в
-> [статье на Habr](https://habr.com/ru/articles/1076620/).
-
-Адаптивная маршрутизация - программа смотрит, какие соединения «не работают» из-за
-блокировок, пробует их через VPN, запоминает рабочие и дальше держит их в VPN.
-Если VPN недоступен — всё идёт напрямую. Есть и простой список доменов, которые
-должны идти через VPN **всегда** (без ручных списков IP — только имена, как в
-Keenetic).
-
-> **Статус: релиз 0.4.0.** Проверено на Keenetic Viva (MT7621, MIPS) и Keenetic
-> Giga (KN-1012, aarch64), KeeneticOS 5.1.4–5.1.6, Entware; egress —
-> WireGuard/AmneziaWG (`nwg0`/`nwg1`), клиентский OpenConnect-коннектор Keenetic
-> (`nocliN`) и Xray VLESS+REALITY (`egress_type=tproxy`). Работает на старых
-> правилах iptables + ipset (nftables на этом ядре нет). Только IPv4.
+Проект не связан и не аффилирован с Keenetic, Amnezia, WireGuard, MikroTik или
+авторами упомянутых сторонних проектов. Используйте на свой страх и риск —
+сделайте резервную копию конфигурации роутера.
 
 ## Зачем этот порт
 
@@ -56,7 +32,76 @@ Susanin (MikroTik RouterOS) «как есть» на KeeneticOS нельзя —
   `-w`), busybox-`ip` (потому номер таблицы маленький), статические бинарники под
   5 архитектур, только IPv4.
 
-## Пример `susanin.conf` после настройки
+## Только Keenetic/Entware
+
+> Этот репозиторий — порт Susanin на роутеры Keenetic
+> (KeeneticOS + Entware), и вся документация ниже — только про них. Для **других
+> платформ** предназначен оригинальный проект:
+> **[Fiark/susanin](https://github.com/Fiark/susanin)** — адаптивная
+> VPN-маршрутизация для MikroTik RouterOS.
+
+Адаптивная маршрутизация - программа смотрит, какие соединения «не работают» из-за
+блокировок, пробует их через VPN, запоминает рабочие и дальше держит их в VPN.
+Если VPN недоступен — всё идёт напрямую. Есть и простой список доменов, которые
+должны идти через VPN **всегда** (без ручных списков IP — только имена, как в
+Keenetic).
+
+> **Статус: релиз 0.4.0-oc** Проверено на Keenetic Viva (MT7621, MIPS) и Keenetic
+> Giga (KN-1012, aarch64), KeeneticOS 5.1.4–5.1.6, Entware; egress —
+> WireGuard/AmneziaWG (`nwg0`/`nwg1`), клиентский OpenConnect-коннектор Keenetic
+> (`nocliN`) и Xray VLESS+REALITY (`egress_type=tproxy`). Работает на старых
+> правилах iptables + ipset (nftables на этом ядре нет). Только IPv4.
+
+## Требования
+
+- Keenetic с установленным **Entware**;
+- пакеты Entware: `ipset`, `conntrack`, busybox, `iptables` (legacy);
+  для скачивания релизов по HTTPS — `ca-certificates` + `wget-ssl` (у BusyBox
+  `wget` нет HTTPS);
+- работающий VPN-туннель — «Другое подключение» в Keenetic: WireGuard/AmneziaWG
+  (`nwg*`) или клиентский OpenConnect-коннектор (`nocliN`); его интерфейс и будет
+  egress. Альтернатива — Xray/VLESS+REALITY (`egress_type=tproxy`, Xray ставится
+  отдельно);
+- LAN-интерфейсы (обычно `br0`, `br1`);
+- в Keenetic **выключена «Маршрутизация DNS»** (доменные маршруты, которые
+  уводят домены в туннель) — иначе Keenetic и Susanin.Keenetic мешают друг другу;
+
+  ![Маршрутизация DNS отключена в KeeneticOS](DNS_Route.png)
+
+- настроен **шифрованный DNS (DoH/DoT)** — на роутере или на клиентах: иначе
+  провайдер может подменить ответы DNS, и клиент не получит настоящий адрес
+  сайта даже при рабочем VPN (частая причина «YouTube/Claude не открывается»);
+
+  ![Настроенный шифрованный DNS (DoH/DoT)](DNS.png)
+
+- root-доступ по SSH.
+
+## Установка
+
+Простейший способ.
+
+Сначала зависимости: `ca-certificates` + `wget-ssl` нужны, чтобы скачать пакет по
+HTTPS (у BusyBox-wget его нет); остальное (`ipset`, `iptables`, `conntrack`)
+`opkg` подтянет сам из `Depends` пакета.
+Установщик сам определит архитектуру и поставит пакет:
+
+```sh
+opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
+  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.4.0-oc --yes
+```
+
+Вручную, если пакет уже скачан (в примере для aarch64, подставьте свою архитектуру):
+
+```sh
+cd /opt/tmp
+wget https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/susanin-keenetic_0.4.0-oc_aarch64-3.10.ipk
+wget https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/SHA256SUMS
+sha256sum -c SHA256SUMS 2>/dev/null | grep aarch64      # ожидаем: ...: OK
+opkg install susanin-keenetic_0.4.0-oc_aarch64-3.10.ipk
+```
+
+### Пример `susanin.conf` после настройки
 
 `/opt/susanin/etc/susanin.conf` после `install.sh` + `susanin.sh reload` (показаны
 поля, которые реально приходится проверять; полный файл — `config.example.conf`,
@@ -65,7 +110,7 @@ Susanin (MikroTik RouterOS) «как есть» на KeeneticOS нельзя —
 
 ```ini
 # --- egress: куда уходить в туннель (туннель уже поднят в Keenetic) ---
-egress_interface=nocli1      # «Другие подключения» → OpenConnect (netdev nocliN);
+egress_interface=nocli0      # «Другие подключения» → OpenConnect (netdev nocliN);
                              # или nwg0 (WireGuard/AmneziaWG), ovpn0, tproxy (Xray)
 egress_type=interface        # tproxy — только для Xray VLESS+REALITY
 egress_address=              # оставить пустым: адрес пробы читается с интерфейса
@@ -110,122 +155,109 @@ disk_mode=normal             # normal = лог/бэкапы на /opt; soft = м
 `lan_interfaces` (все LAN-мосты). Проверка после `reload`: в `susanin.sh status`
 ненулевые `susanin_test_tcp`/`_udp`, а в `/proc/net/nf_conntrack` появляются
 помеченные потоки клиентов.
-## Что делает
 
-- наблюдает за поведением соединений (conntrack), а не за содержимым;
-- по «тихим» признакам блокировок (TCP SYN без ответа, QUIC/UDP без reply,
-  TCP-stall, late-stall, DPI-RST) отправляет IP на проверку через VPN;
-- подтверждает рабочие направления (кэш `ok`) и держит их в VPN с конечным TTL
-  (`ok_ttl`, по умолчанию 6 ч; продлевается, пока идёт трафик), а если маршрут
-  через VPN перестал отвечать — снимает сам;
-- TCP и UDP/QUIC учит раздельно;
-- список доменов «всегда через VPN» (`vpn_always.txt`): эти направления всегда
-  идут в туннель; поддерживаются wildcard-зоны `*.example.com`, CIDR и IP;
-- список «всегда напрямую» (`vpn_never.txt`, never VPN): домен / IPv4 / CIDR и
-  wildcard `*.example.com` — такие направления никогда не уходят в VPN
-  (например, `forum.keenetic.ru` или собственный прокси на RU-сервере);
-- если сайт ответил по основному каналу, он **не** заворачивается в VPN
-  (кандидатами становятся только направления без ответа);
-- fail-open: при недоступности туннеля — прямой доступ (DIRECT);
-- несколько VPN-подключений: failover на живой + автоматический возврат на
-  приоритетный (failback);
-- egress может быть **интерфейсом** (`nwg*`, `nocli*` — клиентский
-  OpenConnect-коннектор Keenetic, `ovpn*`, `wdtt*`) или **Xray/VLESS+REALITY**
-  (`egress_type=tproxy`, TCP REDIRECT + свой UDP-релей);
-- **профили маршрутизации**: до 4 списков «домены/CIDR → свой туннель»;
-- **веб-панель** в самом агенте (только LAN): статус, конфиг, списки, профили,
-  reload/rescan/restart/reset; по умолчанию выключена;
-- автоматически чинит правила, если их снёс NDM (Web-UI change) — reconcile;
-- может маршрутизировать и клиентов **OpenConnect-сервера** на этом же роутере
-  (интерфейс `oc+`): установщик находит сервер и предлагает добавить его в
-  маршрутизацию;
-- работает как демон под Entware (`/opt`), управление — CLI/SSH или веб-панель.
-
-Не является VPN-клиентом: туннель должен уже работать — «Другое подключение» в
-Keenetic (WireGuard, AmneziaWG, OpenConnect) или отдельный Xray. IPv6 в v1 не
-поддерживается.
-
-## Как это устроено (кратко)
-
-- **Смотрим на соединения, а не на содержимое.** Программа читает
-  `/proc/net/nf_conntrack` — там видно состояние TCP, сколько пакетов и байт
-  ушло и пришло, метки.
-- **Правила фильтрации.** Своя цепочка `SUSANIN` в mangle PREROUTING (после
-  правил Keenetic). Нужные адреса помечаются через `CONNMARK`/`MARK` и уходят
-  в отдельную таблицу маршрутизации (по умолчанию `100`; номер должен быть
-  маленьким — busybox `ip` не понимает большие). Адреса хранятся в наборах
-  ipset `susanin_{test,ok}_{tcp,udp}`.
-- **Таймеры.** Проверки идут по расписанию: FAST 1 с, SOFT 1 с, JUDGE 1 с,
-  HEALTH 5 с. «Зависшие» соединения удаляются из conntrack, чтобы клиент
-  подключился заново — уже через VPN. Пороги взяты из оригинального проекта
-  [Fiark/susanin](https://github.com/Fiark/susanin) (MikroTik RouterOS).
-
-### Наборы адресов (ipset)
-
-Программа хранит адреса в наборах ipset. Команда `status` показывает, сколько
-адресов в каждом наборе (блок «ipset sizes»):
-
-| Набор | Что содержит |
-|---|---|
-| `susanin_ok_tcp` / `susanin_ok_udp` | подтверждённые адреса — идут через VPN (TCP и UDP/QUIC учатся отдельно) |
-| `susanin_test_tcp` / `susanin_test_udp` | адреса, которые сейчас проверяются через VPN |
-| `susanin_ok_net` | диапазоны (CIDR) из `vpn_always.txt` |
-| `susanin_never` | адреса «всегда напрямую» из `vpn_never.txt` |
-
-Пример: `susanin_ok_tcp = 2682` — столько адресов подтверждено и идёт через VPN.
-
-## Требования
-
-- Keenetic с установленным **Entware**;
-- пакеты Entware: `ipset`, `conntrack`, busybox, `iptables` (legacy);
-  для скачивания релизов по HTTPS — `ca-certificates` + `wget-ssl` (у BusyBox
-  `wget` нет HTTPS);
-- работающий VPN-туннель — «Другое подключение» в Keenetic: WireGuard/AmneziaWG
-  (`nwg*`) или клиентский OpenConnect-коннектор (`nocliN`); его интерфейс и будет
-  egress. Альтернатива — Xray/VLESS+REALITY (`egress_type=tproxy`, Xray ставится
-  отдельно);
-- LAN-интерфейсы (обычно `br0`, `br1`);
-- в Keenetic **выключена «Маршрутизация DNS»** (доменные маршруты, которые
-  уводят домены в туннель) — иначе Keenetic и Susanin.Keenetic мешают друг другу;
-
-  ![Маршрутизация DNS отключена в KeeneticOS](DNS_Route.png)
-
-- настроен **шифрованный DNS (DoH/DoT)** — на роутере или на клиентах: иначе
-  провайдер может подменить ответы DNS, и клиент не получит настоящий адрес
-  сайта даже при рабочем VPN (частая причина «YouTube/Claude не открывается»);
-
-  ![Настроенный шифрованный DNS (DoH/DoT)](DNS.png)
-
-- root-доступ по SSH.
-
-## Дистрибутив
-
-Готовые сборки — в разделе **Releases** (по архитектурам, вместе с `SHA256SUMS`):
-- `susanin-keenetic-deploy-<arch>.tar.gz`, где arch = `mipsel`, `mips`,
-  `aarch64`, `armv7`, `x86_64`. Внутри всё для установки: `susanin-agent`,
-  `datapath.sh`, `susanin.sh`, `update.sh`, `uninstall.sh`, `install.sh`,
-  конфиг, `vpn_always.txt`, `vpn_never.txt`, `www/`, `docs/`;
-- `susanin-keenetic_<версия>_<arch>.ipk` — пакет Entware для тех же 5
-  архитектур (`opkg install`, обновление через `opkg`, см. ниже).
-
-**Проверено на живом роутере:** Keenetic Viva / KeeneticOS 5.1.4–5.1.5 / Entware,
-архитектура **mipsel**; Keenetic Giga (KN-1012) / KeeneticOS 5.1.6 / Entware
-aarch64 — в том числе с клиентским OpenConnect-коннектором в роли egress.
-Остальные архитектуры собраны и приложены к релизам, но на живом железе не
-проверялись — если что-то не работает, напишите в Issues.
-
-**Собрать без локального компилятора** — через готовый образ на GitHub:
-
+После редактирования для применения рестартим сервис:
 ```sh
-docker pull ghcr.io/r17a/susanin.keenetic:latest
-docker run --rm -v "$PWD/build:/out" ghcr.io/r17a/susanin.keenetic:latest \
-  sh -c 'cp /src/susanin-agent /out/susanin-agent.mipsel'
+/opt/susanin/tools/susanin.sh restart
 ```
 
-Образ: https://github.com/users/R17a/packages/container/package/susanin.keenetic
+### Диагностика
 
-Для других архитектур используйте мультиархитектурную сборку
-`sh tools/wsl-build.sh mipsel mips aarch64 armv7 x86_64` (см. «Сборка»).
+Для проверки корректности настройки или если что-то работает не так — запустите скрипт диагностики: он проверит окружение,
+настройки, правила и списки, а в конце выдаст **рекомендации**:
+
+```sh
+sh /opt/susanin/tools/diagnose.sh
+```
+
+## Веб-панель (только LAN)
+
+В агенте есть встроенный мини-HTTP-сервер — отдельный процесс `susanin-agent web`,
+внешний httpd/lighttpd не нужен. По умолчанию **выключен**.
+
+Включение — один блок команд в SSH-сессии роутера (root, Shell — порт 222):
+
+```sh
+# адрес LAN-интерфейса берём автоматически: панель слушает только его
+# (0.0.0.0 запрещён намеренно), а токен — любая случайная строка
+LAN_IP=$(ip -4 -o addr show dev br0 | awk '{print $4}' | cut -d/ -f1)
+TOKEN=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+/opt/susanin/bin/susanin-agent config set web_enable 1
+/opt/susanin/bin/susanin-agent config set web_listen "$LAN_IP"
+/opt/susanin/bin/susanin-agent config set web_token  "$TOKEN"
+
+# поднять процесс панели (демон перезапускать не нужно) и проверить
+sh /opt/susanin/tools/susanin.sh web restart
+sh /opt/susanin/tools/susanin.sh status | grep -i '^web'    # ожидаем: web: RUNNING
+
+# ссылка для браузера из LAN: первый GET с токеном ставит cookie, дальше вход без него
+echo "http://$LAN_IP:8087/?token=$TOKEN"
+```
+
+Три вещи, на которых панель обычно и спотыкается:
+
+- `web_listen` обязан быть **фактическим** адресом роутера. В конфиге по умолчанию
+  стоит `192.168.1.1`, а у прошивки это вполне может быть `192.168.0.1` — тогда
+  процесс не поднимется с `web: cannot bind …`. Точную причину видно при запуске в
+  foreground: `sh /opt/susanin/tools/susanin.sh web stop; /opt/susanin/bin/susanin-agent web`
+  (там же — `refusing to listen on 0.0.0.0` и `port busy?`, если порт занят:
+  `netstat -ltn | grep 8087`, затем другой `web_port`);
+- панель доступна **только из LAN**: ни из WAN, ни от клиентов OpenConnect/qWDTT
+  (`oc+`, `wdtt+`) она не откроется, TLS в ней нет;
+- `web_token` не обязателен: с пустым значением панель откроется без пароля (в лог
+  пишется предупреждение), но тогда любой хост в LAN сможет править конфиг, чистить
+  списки и перезапускать демон. Включили панель только на время разбора — после
+  него верните `web_enable=0`.
+
+Те же значения можно править и в файле `/opt/susanin/etc/susanin.conf`;
+`web_token` и `web_listen` самой панелью не меняются — только `config set` или файл:
+
+```sh
+web_enable=1
+web_listen=192.168.1.1     # только LAN-адрес роутера, не 0.0.0.0
+web_port=8087
+web_token=                 # пусто = вход без пароля (доступ только из LAN)
+```
+
+Что умеет: статус (egress/health, размеры наборов, профили, память), правка
+конфига, списки `vpn_always`/`vpn_never` (drag&drop и Memo-редактор всего файла),
+профили, действия Reload/Rescan/Restart/Reset. Токен сравнивается за постоянное
+время; `?token=` принимается только для первого GET; без TLS — при необходимости
+ставьте панель за своим прокси или не выставляйте её в недоверенный сегмент.
+
+## Важно: «Приоритеты подключений» Keenetic и Susanin.Keenetic
+
+Keenetic умеет сам направлять устройства и сегменты в VPN (Web →
+**«Приоритеты подключений»**). Это **отдельный механизм**: его правила идут с
+приоритетом 100–107, а правила Susanin.Keenetic — 2000/2001. Поэтому для клиента,
+привязанного к политике Keenetic, весь трафик идёт по решению Keenetic (в VPN
+или напрямую — зависит от политики), а списки и обучение Susanin.Keenetic на него
+**не действуют**.
+
+Простое правило: **у каждого клиента должен быть один «решающий» механизм.**
+
+- Хотите, чтобы решал Susanin.Keenetic (что через VPN, что напрямую) — у клиента или
+  сегмента **не должно быть назначено никакой политики** (оставьте системную
+  «по умолчанию»). Это про **любую** политику: названия задаёте вы сами, и
+  любая назначенная политика перекрывает Susanin.Keenetic. Например, при политике
+  «только напрямую» заблокированный сайт не откроется, и Susanin.Keenetic не сможет
+  завернуть его в VPN.
+- Хотите «всё и всегда через VPN» — можно назначить политику Keenetic, но тогда
+  списки и обучение Susanin.Keenetic для этого клиента не работают.
+- Смешивать оба для одного клиента нельзя.
+
+Проверить привязки:
+
+```sh
+ndmc -c "show running-config" | grep -i "ip policy"
+```
+(или Web → «Приоритеты подключений»).
+
+Как понять по conntrack, кто управляет клиентом:
+- `mark=2684xxxxx` (`0xffffaXX`) — клиент под политикой Keenetic, Susanin.Keenetic его не
+  обрабатывает;
+- `mark=0` или `mark=536870912` (`0x20000000`) — работает Susanin.Keenetic (напрямую или
+  через VPN).
 
 ## Домены, которые всегда через VPN
 
@@ -273,7 +305,7 @@ CIDR), по умолчанию пустой. Поддерживается **`*.e
 попал в VPN-кэш — уберите его командой
 `sh /opt/susanin/tools/susanin.sh reset <ip|домен>` (синоним — `forget`).
 
-## OpenConnect VPN на том же роутере
+## OpenConnect Server на том же роутере
 
 > Не путать с **коннектором-клиентом**: «Другие подключения» → OpenConnect
 > (netdev `nocliN`) — это обычный egress, он настраивается без `oc+` и без
@@ -324,7 +356,7 @@ Susanin.Keenetic может выносить помеченный трафик �
 ```sh
 # 1) вместе с установкой: любой способ, флаг --with-xray(-tproxy)
 sh bootstrap.sh --with-xray --yes                       # tar-архив
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
   | sh -s -- --ipk --with-xray-tproxy                    # пакет .ipk
 # 2) вручную: xray/xray.<arch> из репозитория -> /opt/sbin/xray, chmod +x,
 #    sha256 сверить с xray/SHA256SUMS
@@ -479,94 +511,7 @@ sh /opt/susanin/tools/profiles.sh down     # снять
 
 Смотрите также «Вместе с qWDTT_Server_Keenetic» и [XRAY.md](XRAY.md).
 
-## Веб-панель (только LAN)
 
-В агенте есть встроенный мини-HTTP-сервер — отдельный процесс `susanin-agent web`,
-внешний httpd/lighttpd не нужен. По умолчанию **выключен**.
-
-Включение — один блок команд в SSH-сессии роутера (root, Shell — порт 222):
-
-```sh
-# адрес LAN-интерфейса берём автоматически: панель слушает только его
-# (0.0.0.0 запрещён намеренно), а токен — любая случайная строка
-LAN_IP=$(ip -4 -o addr show dev br0 | awk '{print $4}' | cut -d/ -f1)
-TOKEN=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
-/opt/susanin/bin/susanin-agent config set web_enable 1
-/opt/susanin/bin/susanin-agent config set web_listen "$LAN_IP"
-/opt/susanin/bin/susanin-agent config set web_token  "$TOKEN"
-
-# поднять процесс панели (демон перезапускать не нужно) и проверить
-sh /opt/susanin/tools/susanin.sh web restart
-sh /opt/susanin/tools/susanin.sh status | grep -i '^web'    # ожидаем: web: RUNNING
-
-# ссылка для браузера из LAN: первый GET с токеном ставит cookie, дальше вход без него
-echo "http://$LAN_IP:8087/?token=$TOKEN"
-```
-
-Три вещи, на которых панель обычно и спотыкается:
-
-- `web_listen` обязан быть **фактическим** адресом роутера. В конфиге по умолчанию
-  стоит `192.168.1.1`, а у прошивки это вполне может быть `192.168.0.1` — тогда
-  процесс не поднимется с `web: cannot bind …`. Точную причину видно при запуске в
-  foreground: `sh /opt/susanin/tools/susanin.sh web stop; /opt/susanin/bin/susanin-agent web`
-  (там же — `refusing to listen on 0.0.0.0` и `port busy?`, если порт занят:
-  `netstat -ltn | grep 8087`, затем другой `web_port`);
-- панель доступна **только из LAN**: ни из WAN, ни от клиентов OpenConnect/qWDTT
-  (`oc+`, `wdtt+`) она не откроется, TLS в ней нет;
-- `web_token` не обязателен: с пустым значением панель откроется без пароля (в лог
-  пишется предупреждение), но тогда любой хост в LAN сможет править конфиг, чистить
-  списки и перезапускать демон. Включили панель только на время разбора — после
-  него верните `web_enable=0`.
-
-Те же значения можно править и в файле `/opt/susanin/etc/susanin.conf`;
-`web_token` и `web_listen` самой панелью не меняются — только `config set` или файл:
-
-```sh
-web_enable=1
-web_listen=192.168.1.1     # только LAN-адрес роутера, не 0.0.0.0
-web_port=8087
-web_token=                 # пусто = вход без пароля (доступ только из LAN)
-```
-
-Что умеет: статус (egress/health, размеры наборов, профили, память), правка
-конфига, списки `vpn_always`/`vpn_never` (drag&drop и Memo-редактор всего файла),
-профили, действия Reload/Rescan/Restart/Reset. Токен сравнивается за постоянное
-время; `?token=` принимается только для первого GET; без TLS — при необходимости
-ставьте панель за своим прокси или не выставляйте её в недоверенный сегмент.
-
-## Важно: «Приоритеты подключений» Keenetic и Susanin.Keenetic
-
-Keenetic умеет сам направлять устройства и сегменты в VPN (Web →
-**«Приоритеты подключений»**). Это **отдельный механизм**: его правила идут с
-приоритетом 100–107, а правила Susanin.Keenetic — 2000/2001. Поэтому для клиента,
-привязанного к политике Keenetic, весь трафик идёт по решению Keenetic (в VPN
-или напрямую — зависит от политики), а списки и обучение Susanin.Keenetic на него
-**не действуют**.
-
-Простое правило: **у каждого клиента должен быть один «решающий» механизм.**
-
-- Хотите, чтобы решал Susanin.Keenetic (что через VPN, что напрямую) — у клиента или
-  сегмента **не должно быть назначено никакой политики** (оставьте системную
-  «по умолчанию»). Это про **любую** политику: названия задаёте вы сами, и
-  любая назначенная политика перекрывает Susanin.Keenetic. Например, при политике
-  «только напрямую» заблокированный сайт не откроется, и Susanin.Keenetic не сможет
-  завернуть его в VPN.
-- Хотите «всё и всегда через VPN» — можно назначить политику Keenetic, но тогда
-  списки и обучение Susanin.Keenetic для этого клиента не работают.
-- Смешивать оба для одного клиента нельзя.
-
-Проверить привязки:
-
-```sh
-ndmc -c "show running-config" | grep -i "ip policy"
-```
-(или Web → «Приоритеты подключений»).
-
-Как понять по conntrack, кто управляет клиентом:
-- `mark=2684xxxxx` (`0xffffaXX`) — клиент под политикой Keenetic, Susanin.Keenetic его не
-  обрабатывает;
-- `mark=0` или `mark=536870912` (`0x20000000`) — работает Susanin.Keenetic (напрямую или
-  через VPN).
 
 ## Установка / обновление / удаление
 
@@ -574,19 +519,19 @@ ndmc -c "show running-config" | grep -i "ip policy"
 
 Сначала зависимости: `ca-certificates` + `wget-ssl` нужны, чтобы скачать пакет по
 HTTPS (у BusyBox-wget его нет); остальное (`ipset`, `iptables`, `conntrack`)
-`opkg` подтянет сам из `Depends` пакета:
+`opkg` может подтянуть и сам из `Depends` пакета:
 
 ```sh
-opkg update && opkg install ca-certificates wget-ssl
+opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 ```
 
 **Способ 1 — установщик сам определит архитектуру и поставит пакет**:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 ```
 
-> Пакет установщик берёт из последнего релиза (`v0.4.0`) и сверяет SHA256 по
+> Пакет установщик берёт из последнего релиза (`v0.4.0-oc`) и сверяет SHA256 по
 > `SHA256SUMS` из релиза. Ответ `ERROR: unknown arg: --ipk` означает, что взят
 > старый скрипт (кэш или ветка до 0.4.0).
 
@@ -595,7 +540,7 @@ wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.s
 `susanin-keenetic_<версия>_<arch>.ipk` из релиза в `/opt/tmp`, сверяет SHA256 по
 `SHA256SUMS` из этого же релиза (не совпало — установка отменяется) и выполняет
 `opkg install` (с `--force` — `opkg install --force-reinstall`).
-Флаги: `--version v0.4.0` (без него — последний релиз), `--force`
+Флаги: `--version v0.4.0-oc` (без него — последний релиз), `--force`
 (переустановить), `--yes` (без вопросов), `--arch mipsel|mips|aarch64|armv7|x86_64`
 (если автоопределение не сработало), `--with-xray-tproxy` — режим VLESS/REALITY:
 скачает Xray в `/opt/sbin/xray`, сверит SHA256 и положит шаблон tproxy-конфига
@@ -604,7 +549,7 @@ wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.s
 
 ```sh
 # VLESS/REALITY пакетом: Xray в .ipk не входит, установщик скачает его отдельно
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
   | sh -s -- --ipk --with-xray-tproxy
 ```
 
@@ -617,11 +562,11 @@ opkg print-architecture | awk '{print $2}'
 
 | Архитектура Entware | Файл из релиза |
 |---|---|
-| `mipsel-3.4` (MT7621: Viva, Giga, Ultra и т.п.) | `susanin-keenetic_0.4.0_mipsel-3.4.ipk` |
-| `mips-3.4` | `susanin-keenetic_0.4.0_mips-3.4.ipk` |
-| `aarch64-3.10` | `susanin-keenetic_0.4.0_aarch64-3.10.ipk` |
-| `armv7sf-k3.2` | `susanin-keenetic_0.4.0_armv7sf-k3.2.ipk` |
-| `x86-64` | `susanin-keenetic_0.4.0_x86-64.ipk` |
+| `mipsel-3.4` (MT7621: Viva, Giga, Ultra и т.п.) | `susanin-keenetic_0.4.0-oc_mipsel-3.4.ipk` |
+| `mips-3.4` | `susanin-keenetic_0.4.0-oc_mips-3.4.ipk` |
+| `aarch64-3.10` | `susanin-keenetic_0.4.0-oc_aarch64-3.10.ipk` |
+| `armv7sf-k3.2` | `susanin-keenetic_0.4.0-oc_armv7sf-k3.2.ipk` |
+| `x86-64` | `susanin-keenetic_0.4.0-oc_x86-64.ipk` |
 
 Скачивание, **проверка суммы и только потом установка** (подставьте свой файл из
 таблицы; в имени и в URL — одна и та же версия):
@@ -629,11 +574,11 @@ opkg print-architecture | awk '{print $2}'
 ```sh
 mkdir -p /opt/tmp && cd /opt/tmp
 wget -O susanin-keenetic_0.4.0_mipsel-3.4.ipk \
-  https://github.com/R17a/Susanin.Keenetic/releases/download/v0.4.0/susanin-keenetic_0.4.0_mipsel-3.4.ipk
+  https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/susanin-keenetic_0.4.0-oc_mipsel-3.4.ipk
 wget -O SHA256SUMS \
-  https://github.com/R17a/Susanin.Keenetic/releases/download/v0.4.0/SHA256SUMS
+  https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/SHA256SUMS
 sha256sum -c SHA256SUMS 2>/dev/null | grep mipsel-3.4   # ожидаем: ...: OK
-opkg install susanin-keenetic_0.4.0_mipsel-3.4.ipk
+opkg install susanin-keenetic_0.4.0-oc_mipsel-3.4.ipk
 susanin version && susanin status && susanin diagnose
 ```
 
@@ -678,13 +623,13 @@ opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 определит LAN и VPN, затем спросит подтверждение:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh
 ```
 
 Либо поставьте curl и используйте его:
 ```sh
 opkg install curl
-curl -fsSL https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh
 ```
 
 Установка идёт с ветки `main` — это стабильная версия; установщик сам скачает
@@ -714,7 +659,7 @@ Xray (`--with-xray`):
 
 ```sh
 cd /opt/tmp
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/bootstrap.sh | sh -s -- --yes
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/bootstrap.sh | sh -s -- --yes
 # пакетом:           sh -s -- --yes --ipk
 # пакетом + Xray:    sh -s -- --yes --ipk --with-xray
 # tar-архив + Xray:  sh -s -- --yes --with-xray
@@ -815,18 +760,6 @@ susanin-agent run
 susanin-agent install | uninstall
 ```
 
-## Сборка
-
-Кросс-компиляция в MIPS (mipsel, static) — через WSL или Docker:
-
-```sh
-# WSL (Debian/Ubuntu):
-sudo apt-get install -y gcc-mipsel-linux-gnu make file
-sh tools/wsl-build.sh            # -> build/susanin-agent.mipsel
-
-# Docker:
-docker build -f Dockerfile.cross -t susanin-build .
-```
 
 ## Конфиг (важные поля)
 
@@ -942,6 +875,70 @@ tail -f /opt/susanin/var/soak.log        # Ctrl-C -> сводка с росто�
 - `dns_sniff` и `dns_hijack` покрывают DNS, который идёт по IPv4/UDP/TCP через
   роутер; DoH/DoT внутри туннеля к внешнему резолверу не перехватывается.
 
+## Что делает
+
+- наблюдает за поведением соединений (conntrack), а не за содержимым;
+- по «тихим» признакам блокировок (TCP SYN без ответа, QUIC/UDP без reply,
+  TCP-stall, late-stall, DPI-RST) отправляет IP на проверку через VPN;
+- подтверждает рабочие направления (кэш `ok`) и держит их в VPN с конечным TTL
+  (`ok_ttl`, по умолчанию 6 ч; продлевается, пока идёт трафик), а если маршрут
+  через VPN перестал отвечать — снимает сам;
+- TCP и UDP/QUIC учит раздельно;
+- список доменов «всегда через VPN» (`vpn_always.txt`): эти направления всегда
+  идут в туннель; поддерживаются wildcard-зоны `*.example.com`, CIDR и IP;
+- список «всегда напрямую» (`vpn_never.txt`, never VPN): домен / IPv4 / CIDR и
+  wildcard `*.example.com` — такие направления никогда не уходят в VPN
+  (например, `forum.keenetic.ru` или собственный прокси на RU-сервере);
+- если сайт ответил по основному каналу, он **не** заворачивается в VPN
+  (кандидатами становятся только направления без ответа);
+- fail-open: при недоступности туннеля — прямой доступ (DIRECT);
+- несколько VPN-подключений: failover на живой + автоматический возврат на
+  приоритетный (failback);
+- egress может быть **интерфейсом** (`nwg*`, `nocli*` — клиентский
+  OpenConnect-коннектор Keenetic, `ovpn*`, `wdtt*`) или **Xray/VLESS+REALITY**
+  (`egress_type=tproxy`, TCP REDIRECT + свой UDP-релей);
+- **профили маршрутизации**: до 4 списков «домены/CIDR → свой туннель»;
+- **веб-панель** в самом агенте (только LAN): статус, конфиг, списки, профили,
+  reload/rescan/restart/reset; по умолчанию выключена;
+- автоматически чинит правила, если их снёс NDM (Web-UI change) — reconcile;
+- может маршрутизировать и клиентов **OpenConnect-сервера** на этом же роутере
+  (интерфейс `oc+`): установщик находит сервер и предлагает добавить его в
+  маршрутизацию;
+- работает как демон под Entware (`/opt`), управление — CLI/SSH или веб-панель.
+
+Не является VPN-клиентом: туннель должен уже работать — «Другое подключение» в
+Keenetic (WireGuard, AmneziaWG, OpenConnect) или отдельный Xray. IPv6 в v1 не
+поддерживается.
+
+## Как это устроено (кратко)
+
+- **Смотрим на соединения, а не на содержимое.** Программа читает
+  `/proc/net/nf_conntrack` — там видно состояние TCP, сколько пакетов и байт
+  ушло и пришло, метки.
+- **Правила фильтрации.** Своя цепочка `SUSANIN` в mangle PREROUTING (после
+  правил Keenetic). Нужные адреса помечаются через `CONNMARK`/`MARK` и уходят
+  в отдельную таблицу маршрутизации (по умолчанию `100`; номер должен быть
+  маленьким — busybox `ip` не понимает большие). Адреса хранятся в наборах
+  ipset `susanin_{test,ok}_{tcp,udp}`.
+- **Таймеры.** Проверки идут по расписанию: FAST 1 с, SOFT 1 с, JUDGE 1 с,
+  HEALTH 5 с. «Зависшие» соединения удаляются из conntrack, чтобы клиент
+  подключился заново — уже через VPN. Пороги взяты из оригинального проекта
+  [Fiark/susanin](https://github.com/Fiark/susanin) (MikroTik RouterOS).
+
+### Наборы адресов (ipset)
+
+Программа хранит адреса в наборах ipset. Команда `status` показывает, сколько
+адресов в каждом наборе (блок «ipset sizes»):
+
+| Набор | Что содержит |
+|---|---|
+| `susanin_ok_tcp` / `susanin_ok_udp` | подтверждённые адреса — идут через VPN (TCP и UDP/QUIC учатся отдельно) |
+| `susanin_test_tcp` / `susanin_test_udp` | адреса, которые сейчас проверяются через VPN |
+| `susanin_ok_net` | диапазоны (CIDR) из `vpn_always.txt` |
+| `susanin_never` | адреса «всегда напрямую» из `vpn_never.txt` |
+
+Пример: `susanin_ok_tcp = 2682` — столько адресов подтверждено и идёт через VPN.
+
 ## Документы
 
 - [CHANGELOG.md](CHANGELOG.md) — что нового по версиям;
@@ -950,35 +947,6 @@ tail -f /opt/susanin/var/soak.log        # Ctrl-C -> сводка с росто�
 - [DEPLOY.md](DEPLOY.md) — установка/обновление/удаление на роутере;
 - [XRAY.md](XRAY.md) — XRay/VLESS-REALITY и Susanin.Keenetic: совместимость, конфликты, XKeen;
 - `tools/susanin.sh`, `tools/datapath.sh` — управление демоном и правилами.
-
-## Благодарности
-
-Спасибо людям, которые помогали проекту — тестированием на своих роутерах,
-отчётами с логами, разбором проблем и предложениями по улучшению:
-
-- **Gave_Karen**
-- **pegakmop**
-- **NJmist**
-
-Ваши отчёты (conntrack, `iptables`, `diagnose.sh`) — то, без чего большинство
-исправлений в этом репозитории просто не нашлось бы. Спасибо!
-
-## Поддержать проект
-
-Проект развивается на энтузиазме. Если он оказался полезным — можно поддержать
-разработку:
-
-<p align="center">
-  <a href="https://www.donationalerts.com/r/dmitriy_r17a"><img src="https://www.donationalerts.com/img/brand/donationalerts.svg" alt="DonationAlerts" height="44"></a>
-  &nbsp; &nbsp; &nbsp; &nbsp;
-  <a href="https://pay.cloudtips.ru/p/dcbf5f2e"><img src="https://static.tildacdn.com/tild3431-6231-4938-b464-663831306266/Horiz.svg" alt="CloudTips" height="44"></a>
-</p>
-
-## Дисклеймер
-
-Проект не связан и не аффилирован с Keenetic, Amnezia, WireGuard, MikroTik или
-авторами упомянутых сторонних проектов. Используйте на свой страх и риск —
-сделайте резервную копию конфигурации роутера.
 
 ## Лицензия
 
