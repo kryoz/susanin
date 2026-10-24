@@ -73,11 +73,14 @@ static int egress_any_alive(const susanin_config *c)
     return iface_exists(c->egress_interface) && !iface_excluded(c, c->egress_interface);
 }
 
-/* Кандидат на egress: имена nwg, wg, amnezia, ovpn. */
+/* Кандидат на egress: имена nwg, wg, amnezia, ovpn и nocli — клиентский
+ * OpenConnect-коннектор Keenetic (`interface OpenConnect1` -> netdev nocliN).
+ * Серверные клиенты (oc0, oc1, …) не входят: это LAN-подобные tun, а не egress. */
 static int is_egress_name(const char *n)
 {
     return !strncmp(n, "nwg", 3) || !strncmp(n, "wg", 2) ||
-           !strncmp(n, "amnezia", 7) || !strncmp(n, "ovpn", 4);
+           !strncmp(n, "amnezia", 7) || !strncmp(n, "ovpn", 4) ||
+           !strncmp(n, "nocli", 5);
 }
 
 /* Список UP-интерфейсов — из sysfs (/sys/class/net/<if>/flags, IFF_UP),
@@ -142,7 +145,7 @@ static int list_default_devs(char names[][64], int max)
     return n;
 }
 
-static int iface_addr4(const char *name, char *out, size_t outsz)
+int iface_addr4(const char *name, char *out, size_t outsz)
 {
     struct ifaddrs *ifa, *p;
     out[0] = '\0';
