@@ -633,8 +633,13 @@ fi
 # а status зелёный»). Поэтому — шаблон 'oc+' в КОНЕЦ списка.
 oc_srv=0
 [ -f /var/run/ocserv/ocserv.conf ] && oc_srv=1
-command -v iptables >/dev/null 2>&1 && iptables -t mangle -S _NDM_OCSRVVPN_MARK >/dev/null 2>&1 && oc_srv=1
-command -v ipset >/dev/null 2>&1 && ipset list -n _NDM_SRV_OCSRVVPN >/dev/null 2>&1 && oc_srv=1
+# Цепочка _NDM_OCSRVVPN_MARK и ipset _NDM_SRV_OCSRVVPN есть и при выключенном
+# сервере (KeeneticOS 5.1.6) — по ним не определяем, иначе вопрос про oc+
+# всплывает у каждого. Признаки: рабочий конфиг ocserv или живой клиентский
+# tun (oc0, oc1, …).
+for _oci in /sys/class/net/oc[0-9]*; do
+    [ -e "$_oci" ] && oc_srv=1
+done
 if [ "$oc_srv" = 1 ]; then
     case ",$LAN," in
         *",oc+"*|*",oc0"*)

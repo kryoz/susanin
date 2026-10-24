@@ -470,23 +470,25 @@ fi
 sec "OpenConnect (серверный VPN на этом роутере)"
 OC_SRV=0
 [ -f /var/run/ocserv/ocserv.conf ] && OC_SRV=1
-if command -v iptables >/dev/null 2>&1; then
-    iptables -t mangle -S _NDM_OCSRVVPN_MARK >/dev/null 2>&1 && OC_SRV=1
-fi
-if command -v ipset >/dev/null 2>&1; then
-    ipset list -n _NDM_SRV_OCSRVVPN >/dev/null 2>&1 && OC_SRV=1
-fi
+# Цепочка _NDM_OCSRVVPN_MARK и ipset _NDM_SRV_OCSRVVPN Keenetic создаёт и без
+# включённого сервера (KeeneticOS 5.1.6), поэтому по ним сервер не определяется:
+# иначе диагностика на любом роутере советует «добавь oc+» и «включи dns_hijack».
+# Признаки настоящего сервера — рабочий конфиг ocserv или живой клиентский tun
+# (oc0, oc1, …), который появляется только при подключении клиента.
+for _ocd in /sys/class/net/oc[0-9]*; do
+    [ -e "$_ocd" ] && OC_SRV=1
+done
 if [ "$OC_SRV" = "1" ]; then
     echo "OpenConnect-сервер: обнаружен"
     case ",$LAN," in
-        *oc*)
+        *,oc+*|*,oc[0-9]*)
             echo "lan_interfaces: содержит oc* — клиенты обрабатываются" ;;
         *)
             echo "lan_interfaces: НЕТ ни одного oc*"
             rec "На роутере работает OpenConnect-сервер, а в lan_interfaces нет 'oc+': клиенты (телефон/ноутбук) не обрабатываются — часть сайтов висит, обычный интернет «тормозит». Добавьте 'oc+' В КОНЕЦ списка lan_interfaces и выполните: susanin.sh restart" ;;
     esac
     case ",$LAN," in
-        *oc*) ;;
+        *,oc+*|*,oc[0-9]*) ;;
         *)
             if printf '%s' "$SUB" | grep -q '172\.16\.'; then
                 rec "Полу-состояние: подсеть пула OpenConnect (172.16.x) есть в lan_subnets, но 'oc+' в lan_interfaces нет. Именно так теряется обработка клиентов после 'rescan' при отключённом телефоне; 'discover' с 0.4.0 возвращает 'oc+' сам (если сервер жив)."
