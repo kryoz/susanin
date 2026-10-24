@@ -348,15 +348,20 @@ static int iface_prefix_in_list(const char *list, const char *pfx)
  * напрямую (снаружи это «vpn_always не работает»). */
 int backend_ready(const susanin_config *c)
 {
-    char *argv[6];
+    char *argv[7];
     char out[8192], needle[96];
 
+    /* iptables — всегда с `-w` (как в datapath.sh): без ожидания xtables-lock
+     * чтение правил в момент перекладки NDM возвращало ошибку, агент считал её
+     * за «датаплейн снесён» и зря перепровижнивал. Форма одна: iptables 1.4.21 из
+     * Entware принимает только голый `-w`, `-w 5` и `-w5` для него — ошибка. */
     argv[0] = (char *)tool_iptables();
-    argv[1] = "-t";
-    argv[2] = "mangle";
-    argv[3] = "-S";
-    argv[4] = "SUSANIN";
-    argv[5] = NULL;
+    argv[1] = "-w";
+    argv[2] = "-t";
+    argv[3] = "mangle";
+    argv[4] = "-S";
+    argv[5] = "SUSANIN";
+    argv[6] = NULL;
     if (run_argv(argv) != 0)
         return 0;
 
@@ -368,9 +373,10 @@ int backend_ready(const susanin_config *c)
         (iface_prefix_in_list(c->lan_interfaces, "oc") ||
          iface_prefix_in_list(c->lan_interfaces, "wdtt") ||
          iface_prefix_in_list(c->lan_interfaces, "wdttraw"))) {
-        char *na[6];
+        char *na[7];
         na[0] = (char *)tool_iptables();
-        na[1] = "-t"; na[2] = "nat"; na[3] = "-S"; na[4] = "PREROUTING"; na[5] = NULL;
+        na[1] = "-w"; na[2] = "-t"; na[3] = "nat"; na[4] = "-S";
+        na[5] = "PREROUTING"; na[6] = NULL;
         if (run_capture_argv(na, out, sizeof(out)) != 0 ||
             !strstr(out, "susanin-dns"))
             return 0;
@@ -380,7 +386,8 @@ int backend_ready(const susanin_config *c)
         /* TCP REDIRECT -> tproxy_port */
         snprintf(needle, sizeof(needle), "-j REDIRECT --to-ports %d", c->tproxy_port);
         argv[0] = (char *)tool_iptables();
-        argv[1] = "-t"; argv[2] = "nat"; argv[3] = "-S"; argv[4] = "PREROUTING"; argv[5] = NULL;
+        argv[1] = "-w"; argv[2] = "-t"; argv[3] = "nat"; argv[4] = "-S";
+        argv[5] = "PREROUTING"; argv[6] = NULL;
         if (run_capture_argv(argv, out, sizeof(out)) != 0 || !strstr(out, needle))
             return 0;
 
@@ -388,7 +395,8 @@ int backend_ready(const susanin_config *c)
         if (c->udp_relay) {
             snprintf(needle, sizeof(needle), "TPROXY --on-port %d", c->udp_relay_port);
             argv[0] = (char *)tool_iptables();
-            argv[1] = "-t"; argv[2] = "mangle"; argv[3] = "-S"; argv[4] = "PREROUTING"; argv[5] = NULL;
+            argv[1] = "-w"; argv[2] = "-t"; argv[3] = "mangle"; argv[4] = "-S";
+            argv[5] = "PREROUTING"; argv[6] = NULL;
             if (run_capture_argv(argv, out, sizeof(out)) != 0 || !strstr(out, needle))
                 return 0;
         }
@@ -439,14 +447,14 @@ int backend_ready(const susanin_config *c)
          * серверных VPN (oc+/wdtt+) не доходят до туннеля. */
         {
             char mbuf[48];
-            char *fargv[12];
+            char *fargv[13];
             snprintf(mbuf, sizeof(mbuf), "0x%lx/0x%lx",
                      (unsigned long)c->mark_ok, (unsigned long)c->mark_mask);
             fargv[0] = (char *)tool_iptables();
-            fargv[1] = "-t"; fargv[2] = "filter"; fargv[3] = "-C";
-            fargv[4] = "FORWARD"; fargv[5] = "-m"; fargv[6] = "mark";
-            fargv[7] = "--mark"; fargv[8] = mbuf; fargv[9] = "-j";
-            fargv[10] = "ACCEPT"; fargv[11] = NULL;
+            fargv[1] = "-w"; fargv[2] = "-t"; fargv[3] = "filter"; fargv[4] = "-C";
+            fargv[5] = "FORWARD"; fargv[6] = "-m"; fargv[7] = "mark";
+            fargv[8] = "--mark"; fargv[9] = mbuf; fargv[10] = "-j";
+            fargv[11] = "ACCEPT"; fargv[12] = NULL;
             if (run_argv(fargv) != 0)
                 return 0;
         }
