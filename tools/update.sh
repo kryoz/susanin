@@ -5,7 +5,9 @@
 #   sh update.sh [--arch mipsel] [--version latest|vX.Y.Z] [--prefix /opt/susanin]
 set -eu
 
-REPO="R17a/Susanin.Keenetic"
+# Репозиторий-источник релизов: у форков/зеркал свои релизы, поэтому он
+# переопределяется SUSANIN_REPO. Без переопределения поведение не меняется.
+REPO="${SUSANIN_REPO:-R17a/Susanin.Keenetic}"
 PREFIX=/opt/susanin
 ARCH=""
 VERSION="latest"

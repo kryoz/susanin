@@ -12,7 +12,9 @@
 # POSIX sh (busybox ash compatible).
 set -eu
 
-REPO="R17a/Susanin.Keenetic"
+# Репозиторий-источник релизов: у форков/зеркал свои релизы, поэтому он
+# переопределяется SUSANIN_REPO. Без переопределения поведение не меняется.
+REPO="${SUSANIN_REPO:-R17a/Susanin.Keenetic}"
 # Ветка, откуда берётся Xray (xray/). Обычно main; переопределяется
 # SUSANIN_BRANCH для своих форков/зеркал.
 BRANCH="${SUSANIN_BRANCH:-main}"
