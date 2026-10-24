@@ -18,7 +18,10 @@ DOCKER="${DOCKER:-docker}"
 VER=$(sed -n 's/^#define SUSANIN_VERSION "\(.*\)"/\1/p' "$SRC/src/version.h")
 ARCHES="${*:-mipsel mips aarch64 armv7 x86_64}"
 
-die() { echo "docker-release: $*" >&2; exit 1; }
+die() {
+	echo "docker-release: $*" >&2
+	exit 1
+}
 
 command -v "$DOCKER" >/dev/null 2>&1 || die "нет '$DOCKER' (IMAGE/DOCKER — переопределяются)"
 [ -n "$VER" ] || die "не прочитал версию из src/version.h"
@@ -27,7 +30,7 @@ JOB=$(mktemp "${TMPDIR:-/tmp}/susanin-release.XXXXXX") || die "mktemp не уд�
 # shellcheck disable=SC2064
 trap "rm -f '$JOB'" EXIT INT TERM
 
-cat > "$JOB" <<'JOB_EOF'
+cat >"$JOB" <<'JOB_EOF'
 set -eu
 
 # arch -> "пакет gcc | пакет libc | триплет"
