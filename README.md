@@ -1,7 +1,7 @@
 # Susanin.Keenetic
 
 [![Language: C11](https://img.shields.io/badge/C-11-blue?logo=c&logoColor=white)](src)
-[![KeeneticOS 5.1.4-5.1.5](https://img.shields.io/badge/KeeneticOS-5.1.4--5.1.5-orange)](README.md)
+[![KeeneticOS 5.1.4-5.1.6](https://img.shields.io/badge/KeeneticOS-5.1.4--5.1.6-orange)](README.md)
 [![Entware required](https://img.shields.io/badge/Entware-required-orange)](README.md)
 [![Architectures](https://img.shields.io/badge/arch-mipsel%20%7C%20mips%20%7C%20aarch64%20%7C%20armv7%20%7C%20x86__64-lightgrey)](README.md)
 [![License](https://img.shields.io/github/license/R17a/Susanin.Keenetic)](LICENSE)
@@ -11,11 +11,12 @@
 [![Donate DonationAlerts](https://img.shields.io/badge/donate-DonationAlerts-f5a623.svg?style=flat)](https://www.donationalerts.com/r/dmitriy_r17a)
 [![Join Telegram group](https://img.shields.io/badge/Telegram_group-Join-blue.svg?style=social&logo=telegram)](https://t.me/Susanin_Keenetic)
 
-> Проект сделан по статье на
-> [Habr](https://habr.com/ru/articles/1076620/) и проекту
-> [Fiark/susanin](https://github.com/Fiark/susanin) (адаптивная
-> VPN-маршрутизация для MikroTik RouterOS), перенесён на роутеры
-> Keenetic/Entware.
+> **Только Keenetic/Entware.** Этот репозиторий — порт Susanin на роутеры Keenetic
+> (KeeneticOS + Entware), и вся документация ниже — только про них. Для **других
+> платформ** предназначен оригинальный проект:
+> **[Fiark/susanin](https://github.com/Fiark/susanin)** — адаптивная
+> VPN-маршрутизация для MikroTik RouterOS. Идея переноса описана в
+> [статье на Habr](https://habr.com/ru/articles/1076620/).
 
 Адаптивная маршрутизация - программа смотрит, какие соединения «не работают» из-за
 блокировок, пробует их через VPN, запоминает рабочие и дальше держит их в VPN.
@@ -23,10 +24,11 @@
 должны идти через VPN **всегда** (без ручных списков IP — только имена, как в
 Keenetic).
 
-> **Статус: релиз 0.4.0.** Проверено на Keenetic Viva (MT7621, MIPS),
-> KeeneticOS 5.1.4–5.1.5, Entware, туннели WireGuard/AmneziaWG (`nwg0`/`nwg1`),
-> Xray VLESS+REALITY (`egress_type=tproxy`), Keenetic Giga/Ultra. Работает на
-> старых правилах iptables + ipset (nftables на этом ядре нет).
+> **Статус: релиз 0.4.0.** Проверено на Keenetic Viva (MT7621, MIPS) и Keenetic
+> Giga (KN-1012, aarch64), KeeneticOS 5.1.4–5.1.6, Entware; egress —
+> WireGuard/AmneziaWG (`nwg0`/`nwg1`), клиентский OpenConnect-коннектор Keenetic
+> (`nocliN`) и Xray VLESS+REALITY (`egress_type=tproxy`). Работает на старых
+> правилах iptables + ipset (nftables на этом ядре нет). Только IPv4.
 
 ## Что делает
 
@@ -47,7 +49,8 @@ Keenetic).
 - fail-open: при недоступности туннеля — прямой доступ (DIRECT);
 - несколько VPN-подключений: failover на живой + автоматический возврат на
   приоритетный (failback);
-- egress может быть **интерфейсом** (`nwg*`, `wdtt*`) или **Xray/VLESS+REALITY**
+- egress может быть **интерфейсом** (`nwg*`, `nocli*` — клиентский
+  OpenConnect-коннектор Keenetic, `ovpn*`, `wdtt*`) или **Xray/VLESS+REALITY**
   (`egress_type=tproxy`, TCP REDIRECT + свой UDP-релей);
 - **профили маршрутизации**: до 4 списков «домены/CIDR → свой туннель»;
 - **веб-панель** в самом агенте (только LAN): статус, конфиг, списки, профили,
@@ -58,8 +61,9 @@ Keenetic).
   маршрутизацию;
 - работает как демон под Entware (`/opt`), управление — CLI/SSH или веб-панель.
 
-Не является VPN-клиентом: туннель (WireGuard/AmneziaWG «Дополнительное
-подключение») должен уже работать. IPv6 в v1 не поддерживается.
+Не является VPN-клиентом: туннель должен уже работать — «Другое подключение» в
+Keenetic (WireGuard, AmneziaWG, OpenConnect) или отдельный Xray. IPv6 в v1 не
+поддерживается.
 
 ## Как это устроено (кратко)
 
@@ -73,7 +77,8 @@ Keenetic).
   ipset `susanin_{test,ok}_{tcp,udp}`.
 - **Таймеры.** Проверки идут по расписанию: FAST 1 с, SOFT 1 с, JUDGE 1 с,
   HEALTH 5 с. «Зависшие» соединения удаляются из conntrack, чтобы клиент
-  подключился заново — уже через VPN. Пороги взяты из проекта Susanin.MikroTik.
+  подключился заново — уже через VPN. Пороги взяты из оригинального проекта
+  [Fiark/susanin](https://github.com/Fiark/susanin) (MikroTik RouterOS).
 
 ### Наборы адресов (ipset)
 
@@ -95,8 +100,10 @@ Keenetic).
 - пакеты Entware: `ipset`, `conntrack`, busybox, `iptables` (legacy);
   для скачивания релизов по HTTPS — `ca-certificates` + `wget-ssl` (у BusyBox
   `wget` нет HTTPS);
-- работающий VPN-туннель (WireGuard/AmneziaWG) — его интерфейс будет egress,
-  либо Xray/VLESS+REALITY (`egress_type=tproxy`, Xray ставится отдельно);
+- работающий VPN-туннель — «Другое подключение» в Keenetic: WireGuard/AmneziaWG
+  (`nwg*`) или клиентский OpenConnect-коннектор (`nocliN`); его интерфейс и будет
+  egress. Альтернатива — Xray/VLESS+REALITY (`egress_type=tproxy`, Xray ставится
+  отдельно);
 - LAN-интерфейсы (обычно `br0`, `br1`);
 - в Keenetic **выключена «Маршрутизация DNS»** (доменные маршруты, которые
   уводят домены в туннель) — иначе Keenetic и Susanin.Keenetic мешают друг другу;
@@ -121,10 +128,11 @@ Keenetic).
 - `susanin-keenetic_<версия>_<arch>.ipk` — пакет Entware для тех же 5
   архитектур (`opkg install`, обновление через `opkg`, см. ниже).
 
-**Проверено на живом роутере:** Keenetic Viva / KeeneticOS 5.1.4–5.1.5 /
-Entware, архитектура **mipsel**. Остальные архитектуры собраны и приложены к
-релизам, но на живом железе не проверялись — если что-то не работает, напишите
-в Issues.
+**Проверено на живом роутере:** Keenetic Viva / KeeneticOS 5.1.4–5.1.5 / Entware,
+архитектура **mipsel**; Keenetic Giga (KN-1012) / KeeneticOS 5.1.6 / Entware
+aarch64 — в том числе с клиентским OpenConnect-коннектором в роли egress.
+Остальные архитектуры собраны и приложены к релизам, но на живом железе не
+проверялись — если что-то не работает, напишите в Issues.
 
 **Собрать без локального компилятора** — через готовый образ на GitHub:
 
@@ -186,6 +194,11 @@ CIDR), по умолчанию пустой. Поддерживается **`*.e
 `sh /opt/susanin/tools/susanin.sh reset <ip|домен>` (синоним — `forget`).
 
 ## OpenConnect VPN на том же роутере
+
+> Не путать с **коннектором-клиентом**: «Другие подключения» → OpenConnect
+> (netdev `nocliN`) — это обычный egress, он настраивается без `oc+` и без
+> `dns_hijack`. Раздел ниже — только про **ocserv на этом же роутере**, чьи
+> клиенты приходят обратно как `oc0`, `oc1`, …
 
 Если на роутере работает **OpenConnect-сервер** (ocserv), его клиенты ходят через
 интерфейсы `oc0`, `oc1`, … (по одному на клиента), поэтому в конфиг добавляется
@@ -712,7 +725,7 @@ docker build -f Dockerfile.cross -t susanin-build .
 
 | Поле | Назначение | По умолчанию |
 |---|---|---|
-| `egress_interface` | VPN-интерфейс(ы); несколько через запятую = фейловер + failback. Можно указать `tproxy` (синоним `xray`) — резервный путь через Xray: проверяется SOCKS-пробой, при переключении датаплейн пересобирается в tproxy-режиме | `nwg0` |
+| `egress_interface` | VPN-интерфейс(ы) — `nwg*`, `wg*`, `amnezia*`, `ovpn*`, `nocli*`; несколько через запятую = фейловер + failback. Можно указать `tproxy` (синоним `xray`) — резервный путь через Xray: проверяется SOCKS-пробой, при переключении датаплейн пересобирается в tproxy-режиме | `nwg0` |
 | `egress_type` | `interface` (обычный туннель) или `tproxy` (Xray VLESS+REALITY) | `interface` |
 | `egress_address` | запасной исходный адрес health-проб, по порядку с `egress_interface`; пусто = адрес читается с самого интерфейса (туннельный адрес обычно динамический) | (пусто) |
 | `egress_failback` / `egress_failback_debounce` | возврат на приоритетный туннель, когда он снова жив; пауза стабильности, сек | `1` / `30` |

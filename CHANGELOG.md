@@ -25,6 +25,13 @@
   выключенном сервере (KeeneticOS 5.1.6), из-за чего диагностика советовала
   «добавь `oc+`» и «включи `dns_hijack`» на роутерах без сервера. Признак теперь —
   `/var/run/ocserv/ocserv.conf` или живой `oc<число>` интерфейс.
+- **README: явно указано, что этот репозиторий — только про Keenetic/Entware.** Для
+  MikroTik RouterOS и других платформ — оригинальный проект
+  [Fiark/susanin](https://github.com/Fiark/susanin). Заодно приведён в порядок
+  список egress (`nwg*`, `wg*`, `amnezia*`, `ovpn*`, `nocli*`), в «проверено»
+  добавлены KeeneticOS 5.1.6 и Giga (KN-1012, aarch64), а в разделе про
+  OpenConnect-сервер — предупреждение, что `oc+`/`dns_hijack` это про ocserv, а не
+  про коннектор-клиент `nocliN`.
 
 ## v0.4.0
 
