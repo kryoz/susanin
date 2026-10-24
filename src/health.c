@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "health.h"
 #include "log.h"
+#include "discover.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -169,22 +170,34 @@ static int probe_tcp(const char *dst, int port, const char *src, const char *dev
     return r == 0 ? 1 : 0;
 }
 
+/* Источник пробы. Адрес туннеля сервер выдаёт заново при каждом
+ * переподключении (OpenConnect, WG с DHCP), поэтому держим его не в конфиге, а
+ * читаем с самого интерфейса: egress_address остаётся запасным вариантом — для
+ * интерфейсов без IPv4 и когда нужен другой source. */
+static const char *probe_src(const susanin_config *c, const char *dev,
+                             const char *src, char *buf, size_t n)
+{
+    char *comma;
+    if (dev && dev[0] && iface_addr4(dev, buf, n) == 0)
+        return buf;
+    if (src && src[0]) {
+        snprintf(buf, n, "%s", src);
+        return buf;
+    }
+    snprintf(buf, n, "%s", c->egress_address);   /* список: берём первый адрес */
+    comma = strchr(buf, ',');
+    if (comma)
+        *comma = '\0';
+    return buf;   /* пустая строка = адреса нет; NULL ушёл бы в inet_pton и уронил демон */
+}
+
 int health_probe_dev(const susanin_config *c, const char *dev, const char *src,
                      int *ok, int *total)
 {
     char buf[512], *save = NULL, *tok;
     char srcbuf[64];
     int o = 0, t = 0;
-    const char *psrc = src;
-    if (!psrc || !psrc[0]) {
-        /* egress_address — список: берём первый адрес. */
-        char *comma;
-        snprintf(srcbuf, sizeof(srcbuf), "%s", c->egress_address);
-        comma = strchr(srcbuf, ',');
-        if (comma)
-            *comma = '\0';
-        psrc = srcbuf;
-    }
+    const char *psrc = probe_src(c, dev, src, srcbuf, sizeof(srcbuf));
     int tcp_mode = !strcmp(c->health_mode, "tcp");
     int tcp_port = c->health_tcp_port > 0 ? c->health_tcp_port : 443;
     if (ok) *ok = 0;
@@ -279,15 +292,7 @@ int health_probe_tcp_egress(const susanin_config *c, const char *dev,
 {
     char buf[512], *save = NULL, *tok;
     char srcbuf[64];
-    const char *psrc = src;
-    if (!psrc || !psrc[0]) {
-        char *comma;
-        snprintf(srcbuf, sizeof(srcbuf), "%s", c->egress_address);
-        comma = strchr(srcbuf, ',');
-        if (comma)
-            *comma = '\0';
-        psrc = srcbuf;
-    }
+    const char *psrc = probe_src(c, dev, src, srcbuf, sizeof(srcbuf));
     if (port <= 0)
         port = c->health_tcp_port > 0 ? c->health_tcp_port : 443;
     snprintf(buf, sizeof(buf), "%s", c->health_probe);

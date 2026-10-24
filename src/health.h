@@ -3,9 +3,10 @@
 
 #include "config.h"
 
-/* Returns 0 on success. *ok = number of probes that got a reply, *total = sent.
- * src — source address for the probes (tunnel address of the current egress);
- * if NULL/empty, cfg->egress_address is used. */
+/* Возвращает 0. *ok — сколько проб получили ответ, *total — сколько отправлено.
+ * Источник пробы берётся с самого интерфейса (адрес туннеля динамический: сервер
+ * выдаёт его заново при переподключении). src и cfg->egress_address — только
+ * запасной вариант для интерфейсов без IPv4 и явного переопределения. */
 int health_probe(const susanin_config *c, const char *src, int *ok, int *total);
 
 /* То же, но проба жёстко привязана к интерфейсу (SO_BINDTODEVICE). Нужно для
