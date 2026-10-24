@@ -484,18 +484,48 @@ sh /opt/susanin/tools/profiles.sh down     # снять
 В агенте есть встроенный мини-HTTP-сервер — отдельный процесс `susanin-agent web`,
 внешний httpd/lighttpd не нужен. По умолчанию **выключен**.
 
+Включение — один блок команд в SSH-сессии роутера (root, Shell — порт 222):
+
 ```sh
-# /opt/susanin/etc/susanin.conf
+# адрес LAN-интерфейса берём автоматически: панель слушает только его
+# (0.0.0.0 запрещён намеренно), а токен — любая случайная строка
+LAN_IP=$(ip -4 -o addr show dev br0 | awk '{print $4}' | cut -d/ -f1)
+TOKEN=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+/opt/susanin/bin/susanin-agent config set web_enable 1
+/opt/susanin/bin/susanin-agent config set web_listen "$LAN_IP"
+/opt/susanin/bin/susanin-agent config set web_token  "$TOKEN"
+
+# поднять процесс панели (демон перезапускать не нужно) и проверить
+sh /opt/susanin/tools/susanin.sh web restart
+sh /opt/susanin/tools/susanin.sh status | grep -i '^web'    # ожидаем: web: RUNNING
+
+# ссылка для браузера из LAN: первый GET с токеном ставит cookie, дальше вход без него
+echo "http://$LAN_IP:8087/?token=$TOKEN"
+```
+
+Три вещи, на которых панель обычно и спотыкается:
+
+- `web_listen` обязан быть **фактическим** адресом роутера. В конфиге по умолчанию
+  стоит `192.168.1.1`, а у прошивки это вполне может быть `192.168.0.1` — тогда
+  процесс не поднимется с `web: cannot bind …`. Точную причину видно при запуске в
+  foreground: `sh /opt/susanin/tools/susanin.sh web stop; /opt/susanin/bin/susanin-agent web`
+  (там же — `refusing to listen on 0.0.0.0` и `port busy?`, если порт занят:
+  `netstat -ltn | grep 8087`, затем другой `web_port`);
+- панель доступна **только из LAN**: ни из WAN, ни от клиентов OpenConnect/qWDTT
+  (`oc+`, `wdtt+`) она не откроется, TLS в ней нет;
+- `web_token` не обязателен: с пустым значением панель откроется без пароля (в лог
+  пишется предупреждение), но тогда любой хост в LAN сможет править конфиг, чистить
+  списки и перезапускать демон. Включили панель только на время разбора — после
+  него верните `web_enable=0`.
+
+Те же значения можно править и в файле `/opt/susanin/etc/susanin.conf`;
+`web_token` и `web_listen` самой панелью не меняются — только `config set` или файл:
+
+```sh
 web_enable=1
 web_listen=192.168.1.1     # только LAN-адрес роутера, не 0.0.0.0
 web_port=8087
 web_token=                 # пусто = вход без пароля (доступ только из LAN)
-```
-
-```sh
-sh /opt/susanin/tools/susanin.sh web restart
-# затем в браузере: http://192.168.1.1:8087/
-# с токеном:      http://192.168.1.1:8087/?token=ВАШ_ТОКЕН (ставит cookie)
 ```
 
 Что умеет: статус (egress/health, размеры наборов, профили, память), правка
