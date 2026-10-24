@@ -38,6 +38,12 @@
   поднимает Keenetic, `filter/FORWARD` — DROP со своим SNAT, и всё живёт только в
   Entware. Следом — **пример `susanin.conf` после настройки** с полями, которые
   чаще всего ломают обучение (`lan_subnets`, `lan_interfaces`, `egress_address`).
+- **`tools/docker-release.sh` — релизная сборка в Docker** для хоста без
+  кросс-компиляторов (macOS, чистый Linux): те же шаги, что в `release.yml` —
+  бинарь, tar-архив по манифесту, `.ipk`, `check-shipping.sh` и `SHA256SUMS`;
+  архитектуры списком аргументов, результат в `dist/` (в `packaging/dev-only.txt`).
+  Нативные `gcc`+`binutils` в контейнер обязательны: без них кросс-gcc в
+  Ubuntu 24.04 падает с «cannot execute 'as'».
 
 ## v0.4.0
 

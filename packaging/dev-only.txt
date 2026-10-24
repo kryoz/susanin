@@ -9,6 +9,8 @@ tools/build-mips.sh         — сборка под MIPS (инструмент �
 tools/make-ipk.sh           — сборка .ipk-пакетов (инструмент упаковки)
 tools/stage-release.sh      — раскладка tar-архива релиза по манифесту
 tools/check-shipping.sh     — сверка манифеста с .ipk
+tools/docker-release.sh  — релизная сборка в Docker (бинарь + tar + .ipk +
+                           SHA256SUMS); инструмент упаковки, на устройстве не нужен
 
 # --- внешний наблюдатель "интерфейс -> Xray" (штатный путь — кандидат tproxy) ---
 tools/egress-failover.sh    — два механизма одновременно конфликтуют; в движке
