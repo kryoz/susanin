@@ -30,6 +30,86 @@ Keenetic).
 > (`nocliN`) и Xray VLESS+REALITY (`egress_type=tproxy`). Работает на старых
 > правилах iptables + ipset (nftables на этом ядре нет). Только IPv4.
 
+## Зачем этот порт
+
+Расчёт сделан на владельца Keenetic с Entware: туннель поднимает Keenetic, а Susanin
+разбирается, какие направления не работают из-за блокировок. Перенести оригинальный
+Susanin (MikroTik RouterOS) «как есть» на KeeneticOS нельзя — датаплейн и часть
+логики переписаны под реалии этой прошивки:
+
+- **nftables на этом ядре нет** (4.9-ndm-5) — правила строятся на `iptables`
+  (legacy) + `ipset`, поэтому нужны свои цепочка `SUSANIN`, таблицы и наборы, а не
+  выгрузка правил одним списком;
+- **правила на Keenetic живут недолго**: NDM перекладывает `ip rule`, маршруты и
+  цепочки после изменений в веб-интерфейсе, после ребута и при пере-резолве
+  «маршрутизации по доменам» (`object-group fqdn`). Агент сверяет датаплейн каждые
+  5 с и восстанавливает его сам (`reconcile`) — разово выставленные правила на
+  Keenetic обязательно бы разъехались;
+- **туннель — зона ответственности Keenetic**: «Другие подключения» →
+  WireGuard/AmneziaWG (`nwg*`), OpenConnect-коннектор (`nocliN`), OpenVPN (`ovpn*`)
+  или отдельный Xray (`egress_type=tproxy`). Сам Susanin VPN-клиентом не является и
+  адрес туннеля не запрашивает;
+- **политика Keenetic — `filter/FORWARD` DROP**, а SNAT (MASQUERADE) и клампинг MSS
+  делает сама прошивка: поэтому агент добавляет ACCEPT по своей метке и не лезет в
+  NAT, а `mark_mask` оставляет в покое чужие биты (метки NDM и qWDTT);
+- **всё только в Entware**: `busybox ash`, `iptables` 1.4.21 (знает только голый
+  `-w`), busybox-`ip` (потому номер таблицы маленький), статические бинарники под
+  5 архитектур, только IPv4.
+
+## Пример `susanin.conf` после настройки
+
+`/opt/susanin/etc/susanin.conf` после `install.sh` + `susanin.sh reload` (показаны
+поля, которые реально приходится проверять; полный файл — `config.example.conf`,
+описание полей — таблица «Конфиг» ниже). Править лучше не руками, а
+`susanin-agent config set <ключ> <значение>` — атомарно и с сохранением комментариев.
+
+```ini
+# --- egress: куда уходить в туннель (туннель уже поднят в Keenetic) ---
+egress_interface=nocli1      # «Другие подключения» → OpenConnect (netdev nocliN);
+                             # или nwg0 (WireGuard/AmneziaWG), ovpn0, tproxy (Xray)
+egress_type=interface        # tproxy — только для Xray VLESS+REALITY
+egress_address=              # оставить пустым: адрес пробы читается с интерфейса
+                             # (сервер выдаёт новый при каждом переподключении)
+health_probe=1.1.1.1,8.8.8.8   # публичные адреса, проверяемые через туннель
+health_mode=tcp              # по умолчанию icmp; tcp — если ICMP в туннеле молчит
+health_tcp_port=443
+
+# --- что учить ---
+lan_interfaces=br0           # все LAN-мосты: br0, плюс br1, если есть
+lan_subnets=192.168.1.0/24   # ОБЯЗАТЕЛЬНО сеть br0: ошибка = молча выключенное
+                             # обучение (клиенты просто не попадают в разбор)
+lan_server_interfaces=       # серверные tun этого же роутера: oc+ (ocserv), wdtt+
+
+# --- таблицы и метки (менять не нужно) ---
+routing_table=100
+mark_test=0x10000000
+mark_ok=0x20000000
+mark_mask=0x30000000         # всё вне маски — чужие биты (NDM, qWDTT), их не трогаем
+ip_rule_priority_start=2000
+
+# --- списки (перечитываются сами, рестарт не нужен) ---
+vpn_always_file=/opt/susanin/etc/vpn_always.txt   # всегда в VPN: домен, *.zone, CIDR
+vpn_never_file=/opt/susanin/etc/vpn_never.txt     # всегда напрямую
+vpn_always_interval=300
+vpn_never_interval=300
+
+# --- кэш обучения ---
+ok_ttl=21600                 # держать подтверждённое в VPN 6 ч (продлевается трафиком)
+ok_max_entries=4096
+test_ttl=1
+cooldown_ttl=5
+
+# --- служебное ---
+learn_exclude_ports=22,23,53,135,137,138,139,445,500,554,853,1433,1723,3306,3389,4500,5432,5900,6379,7547,8567,9100,11211,27017
+log_level=info
+disk_mode=normal             # normal = лог/бэкапы на /opt; soft = минимум записей (NAND/flash)
+```
+
+Два поля, которые установщик чаще всего пишет неверно и которые нужно сверить
+сразу: `lan_subnets` (фактическая сеть `br0` — `ip -4 -o addr show dev br0`) и
+`lan_interfaces` (все LAN-мосты). Проверка после `reload`: в `susanin.sh status`
+ненулевые `susanin_test_tcp`/`_udp`, а в `/proc/net/nf_conntrack` появляются
+помеченные потоки клиентов.
 ## Что делает
 
 - наблюдает за поведением соединений (conntrack), а не за содержимым;

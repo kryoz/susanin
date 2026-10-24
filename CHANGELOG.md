@@ -32,6 +32,12 @@
   добавлены KeeneticOS 5.1.6 и Giga (KN-1012, aarch64), а в разделе про
   OpenConnect-сервер — предупреждение, что `oc+`/`dns_hijack` это про ocserv, а не
   про коннектор-клиент `nocliN`.
+- **README: раздел «Зачем этот порт» — в самом начале.** Почему перенос Susanin с
+  RouterOS на KeeneticOS не работает «как есть»: на ядре 4.9-ndm-5 нет nftables,
+  NDM периодически перекладывает правила (нужен reconcile каждые 5 с), туннель
+  поднимает Keenetic, `filter/FORWARD` — DROP со своим SNAT, и всё живёт только в
+  Entware. Следом — **пример `susanin.conf` после настройки** с полями, которые
+  чаще всего ломают обучение (`lan_subnets`, `lan_interfaces`, `egress_address`).
 
 ## v0.4.0
 
