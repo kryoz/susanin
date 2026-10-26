@@ -382,10 +382,15 @@ int ops_status(const susanin_config *cfg, const char *conf_path)
         int n = count_list_lines(cfg->vpn_always_file);
         printf("  file: %s (%s)\n", cfg->vpn_always_file,
                n < 0 ? "absent — disabled" : "present");
-        if (n >= 0)
-            printf("  domains: %d (refresh every %ds%s)\n", n,
-                   cfg->vpn_always_interval,
-                   cfg->vpn_always_dns[0] ? "" : ", resolver: auto");
+        if (n >= 0) {
+            char srv[64];
+            va_pick_resolver(cfg, srv, sizeof(srv));
+            printf("  domains: %d (refresh every %ds, resolver: %s%s)\n", n,
+                   cfg->vpn_always_interval, srv[0] ? srv : "-",
+                   cfg->vpn_always_dns[0] ? ""
+                                          : "  <-- авто: это резолвер роутера, "
+                                            "не DNS туннеля");
+        }
     }
 
     printf("cache:\n");

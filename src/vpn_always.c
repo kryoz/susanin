@@ -2,6 +2,7 @@
 #include "vpn_always.h"
 #include "backend.h"
 #include "cdn.h"
+#include "classifier.h"
 #include "log.h"
 
 #include <arpa/inet.h>
@@ -776,7 +777,7 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
     time_t now = time(NULL);
     int i, ndes = 0, ndesn = 0, added = 0, removed = 0, pending = 0;
     int addn = 0, remn = 0, new_epoch = 0;
-    int nfail = 0, nex = 0;
+    int nfail = 0, nex = 0, npriv = 0;
     char exa[3][64] = { "", "", "" };
     long long t0 = now_ms();
     int interval = cfg->vpn_always_interval > 0 ? cfg->vpn_always_interval : 300;
@@ -977,6 +978,13 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
         }
         for (k = 0; k < v->dom[i].nips && ndes < VA_TRACK; k++) {
             int j;
+            /* Приватные адреса пинить бессмысленно: rule_priv() в datapath.sh
+             * делает RETURN до susanin_ok_* — метки не будет никогда. До таких
+             * хостов и так ведёт маршрутизация Keenetic. */
+            if (clf_is_private_dst(v->dom[i].ips[k])) {
+                npriv++;
+                continue;
+            }
             for (j = 0; j < ndes; j++)
                 if (strcmp(desired[j], v->dom[i].ips[k]) == 0)
                     break;
@@ -1134,6 +1142,22 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
                   nfail, ex);
             last_nfail = nfail;
             last_tsum = now;
+        }
+    }
+
+    if (npriv > 0) {
+        /* Тот же приём, что у nfail: одна сводка, и не чаще раза в час, если
+         * число не меняется. Иначе список вида «*.vpn внутрь туннеля» выглядит
+         * настроенным, хотя трафик никогда не помечается. */
+        static int last_npriv = -1;
+        static time_t last_tpriv = 0;
+        if (npriv != last_npriv || now - last_tpriv >= 3600) {
+            slogf(SL_WARN, "vpn_always: %d адрес(ов) ведут в приватные сети "
+                  "(10/8, 172.16/12, 192.168/16, ...) — rule_priv в датаплейне "
+                  "делает RETURN раньше susanin_ok_*, метки не будет; CIDR-строки "
+                  "туда же пинить не надо", npriv);
+            last_npriv = npriv;
+            last_tpriv = now;
         }
     }
 

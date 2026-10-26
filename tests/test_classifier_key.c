@@ -48,6 +48,15 @@ int main(void)
               "state_key/pair_key/state_key_split согласованы");
     }
 
+    printf("=== приватные сети = rule_priv() из tools/datapath.sh ===\n");
+    CHECK(clf_is_private_dst("172.16.10.72") && clf_is_private_dst("192.168.0.1") &&
+          clf_is_private_dst("10.0.0.5") && clf_is_private_dst("100.64.0.1") &&
+          clf_is_private_dst("169.254.1.1") && clf_is_private_dst("127.0.0.1"),
+          "все сети из rule_priv — приватные (vpn_always их не пинит)");
+    CHECK(!clf_is_private_dst("8.8.8.8") && !clf_is_private_dst("172.15.0.1") &&
+          !clf_is_private_dst("172.32.0.1") && !clf_is_private_dst("100.128.0.1"),
+          "публичные и адреса сразу за границами диапазонов — не приватные");
+
     printf("\n%s\n", failures ? "ЕСТЬ ОШИБКИ" : "все проверки пройдены");
     return failures ? 1 : 0;
 }
