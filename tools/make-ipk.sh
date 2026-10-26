@@ -116,7 +116,10 @@ build_one() { # build_one <target-arch> <binary>
     [ -n "${_size:-}" ] || _size=0
     sed -e "s|{{VER}}|$VER|g" -e "s|{{ARCH}}|$_oa|g" -e "s|{{SIZE}}|$_size|g" \
         "$SRC/opkg/control.template" > "$_ctrl/control"
-    for s in postinst prerm postrm; do
+    # postinst — ОДИН файл на оба пути установки: он же лежит в tools/ (класс
+    # tool в манифесте) и его же вызывает install.sh в tar-режиме.
+    [ -f "$SRC/tools/postinst.sh" ] && cp "$SRC/tools/postinst.sh" "$_ctrl/postinst"
+    for s in prerm postrm; do
         [ -f "$SRC/opkg/$s" ] && cp "$SRC/opkg/$s" "$_ctrl/$s"
     done
     chmod 755 "$_ctrl/postinst" "$_ctrl/prerm" "$_ctrl/postrm" 2>/dev/null || true

@@ -584,7 +584,7 @@ opkg print-architecture | awk '{print $2}'
 
 ```sh
 mkdir -p /opt/tmp && cd /opt/tmp
-wget -O susanin-keenetic_0.4.0_mipsel-3.4.ipk \
+wget -O susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk \
   https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
 wget -O SHA256SUMS \
   https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/SHA256SUMS
@@ -599,10 +599,16 @@ susanin version && susanin status && susanin diagnose
 (например `0.4.1-oc` и тег `v0.4.1-oc`) — суффикс должен быть и в имени файла.
 
 Пакет ставит демон, скрипты, init-скрипты Entware, веб-панель и документацию в
-`/opt/susanin`. Конфиг (`susanin.conf`), списки `vpn_always`/`vpn_never`,
-состояние и профили при обновлении **не перезаписываются**; при первой установке
-конфиг создаётся из `config.example.conf` — проверьте в нём `egress_interface` и
-`lan_interfaces`. Обновление = `opkg install` нового `.ipk`; удаление:
+`/opt/susanin`; отдельной «регистрации сервиса» нет — в Entware автозапуск включает
+сам префикс `S` в имени init-скрипта (`S94susanin`, `S95susanin-web`, они тоже в
+составе пакета). Конфиг (`susanin.conf`), списки `vpn_always`/`vpn_never`,
+состояние и профили при обновлении **не перезаписываются**. Всё это делает
+`tools/postinst.sh` — один и тот же скрипт для `.ipk` (opkg выполняет его из
+`control.tar.gz`) и для tar-архива (его же вызывает `install.sh`). При первой
+установке он правит только заведомо мёртвые значения примера — интерфейс
+`egress_interface`, которого нет в системе, и `lan_subnets`, который не покрывает
+фактическую сеть LAN; значения берёт из `susanin-agent discover`, своё никто не
+затирает. Обновление = `opkg install` нового `.ipk`; удаление:
 
 > Если стоит `0.4.0.RC1.Hotfix`, opkg считает `0.4.0` **понижением**
 > (`0.4.0` < `0.4.0.RC1.Hotfix`) и откажется ставить. Свежий `install.sh`
