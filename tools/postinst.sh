@@ -26,6 +26,28 @@ SHARE="$PREFIX/share"
 
 say() { echo "[susanin] $*"; }
 
+# opkg запускает maintainer-скрипты с узким PATH — busybox `ip` ищем явно.
+IPBIN=""
+if command -v ip >/dev/null 2>&1; then
+	IPBIN=$(command -v ip)
+else
+	for _p in /bin/ip /sbin/ip /opt/bin/ip; do
+		[ -x "$_p" ] && IPBIN=$_p && break
+	done
+fi
+
+# Подсети LAN по connected-маршрутам интерфейсов (тот же приём, что в install.sh).
+lan_subnets_of() { # lan_subnets_of <if,if>
+	_out=""
+	[ -n "$IPBIN" ] || return 0
+	for _i in $(printf '%s' "$1" | tr ',' ' '); do
+		_p=$("$IPBIN" route show 2>/dev/null |
+			awk -v d="$_i" '$0 ~ ("dev " d " ") && $1 ~ /\// {print $1; exit}')
+		[ -n "$_p" ] && _out="${_out:+$_out,}$_p"
+	done
+	printf '%s' "$_out"
+}
+
 # --- пути и права (файлы сюда уже положил opkg или install.sh) --------------
 mkdir -p "$PREFIX/var" "$PREFIX/var/backup" "$PREFIX/etc/profiles" \
 	"$PREFIX/etc/profiles.d" "$SHARE"
@@ -198,19 +220,22 @@ autodetect() {
 	fi
 
 	# lan_subnets: ни одна подсеть конфига не покрывает фактическую сеть LAN.
+	# Значение НЕ берём из discover: discover_defaults() возвращает lan_subnets
+	# как есть из конфига (rescan не должен чинить то, что задал пользователь),
+	# поэтому подсеть считаем по connected-маршрутам LAN-интерфейсов.
 	_ls=$(cfg_val lan_subnets)
-	_d_ls=$(printf '%s\n' "$_d" | sed -n 's/^lan_subnets=//p' | head -n1)
-	if [ -n "$_d_ls" ]; then
+	_act=$(lan_subnets_of "$(cfg_val lan_interfaces)")
+	if [ -n "$_act" ]; then
 		if [ -z "$_ls" ]; then
-			cfg_set lan_subnets "$_d_ls" "подсети LAN не заданы"
+			cfg_set lan_subnets "$_act" "подсети LAN не заданы"
 		else
 			_lsc=$(printf '%s' "$_ls" | tr -d ' \t')
 			_cover=0
-			for _s in $(printf '%s' "$_d_ls" | tr ',' ' '); do
+			for _s in $(printf '%s' "$_act" | tr ',' ' '); do
 				case ",$_lsc," in *",$_s,"*) _cover=1 ;; esac
 			done
 			[ "$_cover" = 0 ] &&
-				cfg_set lan_subnets "$_d_ls" "«$_ls» не покрывает фактическую сеть"
+				cfg_set lan_subnets "$_act" "«$_ls» не покрывает $_act"
 		fi
 	fi
 }
