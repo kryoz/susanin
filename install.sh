@@ -803,11 +803,13 @@ _cfg_val() { # значение ключа из уже установленно�
 	sed -n "s/^$1=[ \t]*//p" "$PREFIX/etc/susanin.conf" 2>/dev/null | head -1
 }
 
-if [ ! -f "$PREFIX/etc/susanin.conf" ]; then
-	_cfg=$(find_file config.example.conf) || _cfg=""
-	[ -n "$_cfg" ] && cp "$_cfg" "$PREFIX/etc/susanin.conf"
-	say "config created: $PREFIX/etc/susanin.conf"
-fi
+# egress/lan/subnets и disk_mode пишет tools/postinst.sh — тот же скрипт, который
+# opkg запускает из control.tar.gz при установке .ipk. Сюда они попадают через
+# окружение и только когда их разрешено писать: конфиг создан заново либо
+# запущено --force (раньше эти же sed-строки жили здесь и разошлись с postinst).
+_SE=""
+_SL=""
+_SS=""
 if [ ! -f "$PREFIX/etc/susanin.conf" ] || [ "$FORCE" = 1 ]; then
 	if [ "$FORCE" = 1 ]; then
 		# --force не затирает lan_*: объединяем автоопределённое с текущим.
@@ -816,216 +818,20 @@ if [ ! -f "$PREFIX/etc/susanin.conf" ] || [ "$FORCE" = 1 ]; then
 		[ -n "$_old_lan" ] && LAN=$(merge_csv "$_old_lan" "$LAN")
 		[ -n "$_old_sub" ] && SUBNETS=$(merge_csv "$_old_sub" "$SUBNETS")
 	fi
-	sed -i "s|^egress_interface=.*|egress_interface=$EGRESS|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
-	sed -i "s|^lan_interfaces=.*|lan_interfaces=$LAN|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
-	sed -i "s|^lan_subnets=.*|lan_subnets=$SUBNETS|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
-	EA=$(addr_of "$EGRESS")
-	[ -n "$EA" ] && sed -i "s|^egress_address=.*|egress_address=${EA%%/*}|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
-	say "config written: $PREFIX/etc/susanin.conf"
-else
-	say "config kept: $PREFIX/etc/susanin.conf"
+	_SE="$EGRESS"
+	_SL="$LAN"
+	_SS="$SUBNETS"
 fi
-
-# disk_mode применяем всегда (в т.ч. когда конфиг уже существовал).
-if [ -f "$PREFIX/etc/susanin.conf" ]; then
-	if grep -q '^disk_mode=' "$PREFIX/etc/susanin.conf" 2>/dev/null; then
-		sed -i "s|^disk_mode=.*|disk_mode=$DISK_MODE|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
-	else
-		echo "disk_mode=$DISK_MODE" >>"$PREFIX/etc/susanin.conf"
-	fi
-	say "disk_mode=$DISK_MODE -> $PREFIX/etc/susanin.conf"
-fi
-# Дополнить существующий список новыми строками из пакета. Ничего не удаляем и
-# не перезаписываем: добавляем только те «чистые» строки (домены/IP/CIDR), которых
-# ещё нет. Идемпотентно: повторный запуск ничего не меняет.
-merge_list() { # merge_list <user_file> <package_file> <label>
-	_uf="$1"
-	_pf="$2"
-	_label="$3"
-	[ -f "$_uf" ] && [ -f "$_pf" ] || return 0
-	_tmp=$(mktemp 2>/dev/null) || _tmp="/tmp/susanin-merge.$$"
-	sed 's/#.*//' "$_uf" | tr -d ' \t\r' | grep -v '^$' | sort -u >"$_tmp" || true
-	_added=0
-	while IFS= read -r _line; do
-		_e=$(printf '%s' "$_line" | sed 's/#.*//' | tr -d ' \t\r')
-		if [ -z "$_e" ]; then
-			continue
-		fi
-		if grep -qxF "$_e" "$_tmp"; then
-			continue
-		fi
-		if [ "$_added" -eq 0 ]; then
-			if ! grep -qF 'susanin-update:' "$_uf"; then
-				printf '\n# susanin-update: added missing default entries\n' >>"$_uf"
-			fi
-		fi
-		printf '%s\n' "$_e" >>"$_uf"
-		printf '%s\n' "$_e" >>"$_tmp"
-		_added=$((_added + 1))
-	done <"$_pf"
-	rm -f "$_tmp"
-	if [ "$_added" -gt 0 ]; then
-		say "$_label: добавлено новых строк: $_added"
-	fi
-	return 0
-}
-
-_va=$(find_file vpn_always.txt) || _va=""
-if [ ! -f "$PREFIX/etc/vpn_always.txt" ] && [ -n "$_va" ]; then
-	cp "$_va" "$PREFIX/etc/vpn_always.txt"
-	say "vpn_always list installed: $PREFIX/etc/vpn_always.txt"
-else
-	say "vpn_always list kept (not overwritten; may be merged with new entries)"
-	if [ -n "$_va" ]; then
-		merge_list "$PREFIX/etc/vpn_always.txt" "$_va" "vpn_always"
-	fi
-fi
-_vn=$(find_file vpn_never.txt) || _vn=""
-if [ ! -f "$PREFIX/etc/vpn_never.txt" ] && [ -n "$_vn" ]; then
-	cp "$_vn" "$PREFIX/etc/vpn_never.txt"
-	say "vpn_never list installed: $PREFIX/etc/vpn_never.txt"
-else
-	say "vpn_never list kept (not overwritten; may be merged with new entries)"
-	if [ -n "$_vn" ]; then
-		merge_list "$PREFIX/etc/vpn_never.txt" "$_vn" "vpn_never"
-	fi
-fi
-# Одноразовая уборка накопленных бэкапов списков старого формата
-# (<список>.bak-ГГГГММДД-ЧЧММСС): правки через панель плодили десятки копий.
-# Теперь бэкап один — <список>.bak (перезаписывается).
-rm -f "$PREFIX/etc/vpn_always.txt".bak-[0-9]* \
-	"$PREFIX/etc/vpn_never.txt".bak-[0-9]* 2>/dev/null || true
-_cdn=$(find_file cdn_ranges.txt) || _cdn=""
-if [ ! -f "$PREFIX/etc/cdn_ranges.txt" ] && [ -n "$_cdn" ]; then
-	cp "$_cdn" "$PREFIX/etc/cdn_ranges.txt"
-	say "CDN ranges installed: $PREFIX/etc/cdn_ranges.txt"
-else
-	say "CDN ranges kept (not overwritten; auto-updates from cdn_ranges_url)"
-fi
-
-# Дописать отсутствующие дефолтные ключи: старый susanin.conf мог их не
-# содержать, и тогда `sed 's|^key=.*|...|'` молча ничего не делал (web_*,
-# egress_type, tproxy_port и т.п.). Ничего не перезаписываем — только добавляем.
-ensure_key() { # ensure_key <file> <key> <default>
-	_f="$1"
-	_k="$2"
-	_d="$3"
-	[ -f "$_f" ] || return 0
-	grep -q "^${_k}=" "$_f" 2>/dev/null || printf '%s=%s\n' "$_k" "$_d" >>"$_f"
-}
-if [ -f "$PREFIX/etc/susanin.conf" ]; then
-	ensure_key "$PREFIX/etc/susanin.conf" web_enable 0
-	ensure_key "$PREFIX/etc/susanin.conf" web_listen ""
-	ensure_key "$PREFIX/etc/susanin.conf" web_port 8087
-	ensure_key "$PREFIX/etc/susanin.conf" web_token ""
-	ensure_key "$PREFIX/etc/susanin.conf" egress_type interface
-	ensure_key "$PREFIX/etc/susanin.conf" tproxy_port 12345
-	ensure_key "$PREFIX/etc/susanin.conf" discover_exclude "wdtt0,wdttraw0,tun0,tap0"
-	ensure_key "$PREFIX/etc/susanin.conf" fast_syn_min_op 2
-	ensure_key "$PREFIX/etc/susanin.conf" ok_max_entries 4096
-	ensure_key "$PREFIX/etc/susanin.conf" ok_evict_misses 3
-	ensure_key "$PREFIX/etc/susanin.conf" promo_per_min 120
-	ensure_key "$PREFIX/etc/susanin.conf" soft_state_interval 12
-	ensure_key "$PREFIX/etc/susanin.conf" learn_exclude_ports "22,23,53,135,137,138,139,445,500,554,853,1433,1723,3306,3389,4500,5432,5900,6379,7547,8567,9100,11211,27017"
-	ensure_key "$PREFIX/etc/susanin.conf" vpn_always_file /opt/susanin/etc/vpn_always.txt
-	ensure_key "$PREFIX/etc/susanin.conf" vpn_always_dns ""
-	ensure_key "$PREFIX/etc/susanin.conf" vpn_always_interval 300
-	ensure_key "$PREFIX/etc/susanin.conf" vpn_never_file /opt/susanin/etc/vpn_never.txt
-	ensure_key "$PREFIX/etc/susanin.conf" vpn_never_interval 300
-	ensure_key "$PREFIX/etc/susanin.conf" lan_server_interfaces ""
-	ensure_key "$PREFIX/etc/susanin.conf" dp_check_interval 15
-	ensure_key "$PREFIX/etc/susanin.conf" learn_min_op 10
-	ensure_key "$PREFIX/etc/susanin.conf" learn_min_bytes 2000
-	ensure_key "$PREFIX/etc/susanin.conf" confirm_min_bytes 512
-	ensure_key "$PREFIX/etc/susanin.conf" learn_strict 0
-	# Пресет порогов (strict|normal|aggressive); пусто = выключен.
-	ensure_key "$PREFIX/etc/susanin.conf" precision ""
-	ensure_key "$PREFIX/etc/susanin.conf" cdn_ranges_file /opt/susanin/etc/cdn_ranges.txt
-	ensure_key "$PREFIX/etc/susanin.conf" cdn_ranges_url https://www.cloudflare.com/ips-v4
-	ensure_key "$PREFIX/etc/susanin.conf" cdn_ranges_interval 86400
-	ensure_key "$PREFIX/etc/susanin.conf" cdn_prefix_learn 1
-	ensure_key "$PREFIX/etc/susanin.conf" cdn_prefix_ttl 3600
-	ensure_key "$PREFIX/etc/susanin.conf" cdn_prefix_max 24
-	ensure_key "$PREFIX/etc/susanin.conf" aggregate_confirm 2
-	ensure_key "$PREFIX/etc/susanin.conf" ipv6_block 1
-	ensure_key "$PREFIX/etc/susanin.conf" quic_block 1
-	ensure_key "$PREFIX/etc/susanin.conf" health_mode icmp
-	ensure_key "$PREFIX/etc/susanin.conf" health_tcp_port 443
-	# Остальные ключи, которые есть в веб-панели — чтобы поля не показывались
-	# как «нет в файле». Существующие значения НЕ меняются (ensure_key только
-	# дописывает отсутствующую строку).
-	ensure_key "$PREFIX/etc/susanin.conf" egress_interface nwg0
-	ensure_key "$PREFIX/etc/susanin.conf" egress_address 10.8.1.1
-	ensure_key "$PREFIX/etc/susanin.conf" lan_interfaces br0
-	ensure_key "$PREFIX/etc/susanin.conf" lan_subnets ""
-	ensure_key "$PREFIX/etc/susanin.conf" routing_table 100
-	ensure_key "$PREFIX/etc/susanin.conf" mark_test 0x10000000
-	ensure_key "$PREFIX/etc/susanin.conf" mark_ok 0x20000000
-	ensure_key "$PREFIX/etc/susanin.conf" mark_mask 0x30000000
-	ensure_key "$PREFIX/etc/susanin.conf" ip_rule_priority_start 2000
-	ensure_key "$PREFIX/etc/susanin.conf" fast_interval 1
-	ensure_key "$PREFIX/etc/susanin.conf" soft_interval 1
-	ensure_key "$PREFIX/etc/susanin.conf" judge_interval 1
-	ensure_key "$PREFIX/etc/susanin.conf" health_interval 5
-	ensure_key "$PREFIX/etc/susanin.conf" ok_ttl 21600
-	ensure_key "$PREFIX/etc/susanin.conf" ok_refresh_below 3
-	ensure_key "$PREFIX/etc/susanin.conf" test_ttl 1
-	ensure_key "$PREFIX/etc/susanin.conf" cooldown_ttl 5
-	ensure_key "$PREFIX/etc/susanin.conf" cooldown_ok_ttl 30
-	ensure_key "$PREFIX/etc/susanin.conf" watch_ttl 8
-	ensure_key "$PREFIX/etc/susanin.conf" watch_retry_below 4
-	ensure_key "$PREFIX/etc/susanin.conf" health_probe "1.1.1.1,8.8.8.8"
-	ensure_key "$PREFIX/etc/susanin.conf" udp_relay 0
-	ensure_key "$PREFIX/etc/susanin.conf" udp_relay_port 1081
-	ensure_key "$PREFIX/etc/susanin.conf" socks_addr 127.0.0.1
-	ensure_key "$PREFIX/etc/susanin.conf" socks_port 1080
-	ensure_key "$PREFIX/etc/susanin.conf" log_level info
-	ensure_key "$PREFIX/etc/susanin.conf" xray_loglevel warning
-	# 0.4.0-dev5: failback/watchdog/offload/dns-sniff/pin_reassert.
-	ensure_key "$PREFIX/etc/susanin.conf" egress_failback 1
-	ensure_key "$PREFIX/etc/susanin.conf" egress_failback_debounce 30
-	ensure_key "$PREFIX/etc/susanin.conf" egress_race 0
-	ensure_key "$PREFIX/etc/susanin.conf" xray_gogc 50
-	ensure_key "$PREFIX/etc/susanin.conf" xray_gomemlimit 64MiB
-	ensure_key "$PREFIX/etc/susanin.conf" xray_watchdog 1
-	ensure_key "$PREFIX/etc/susanin.conf" kernel_offload 0
-	ensure_key "$PREFIX/etc/susanin.conf" kernel_egress ""
-	ensure_key "$PREFIX/etc/susanin.conf" kernel_offload_max 24
-	ensure_key "$PREFIX/etc/susanin.conf" dns_sniff 0
-	ensure_key "$PREFIX/etc/susanin.conf" dns_sniff_ttl 300
-	ensure_key "$PREFIX/etc/susanin.conf" dns_sniff_iface ""
-	ensure_key "$PREFIX/etc/susanin.conf" dns_hijack 0
-	ensure_key "$PREFIX/etc/susanin.conf" dns_hijack_target ""
-	ensure_key "$PREFIX/etc/susanin.conf" vpn_always_cdn_prefix 0
-	ensure_key "$PREFIX/etc/susanin.conf" pin_reassert 1
-	ensure_key "$PREFIX/etc/susanin.conf" auto_direct 1
-	ensure_key "$PREFIX/etc/susanin.conf" direct_pref_ttl 3600
-	ensure_key "$PREFIX/etc/susanin.conf" media_enabled 0
-	ensure_key "$PREFIX/etc/susanin.conf" media_ports "80,443,554,1935,8080,8443"
-	ensure_key "$PREFIX/etc/susanin.conf" media_min_bytes 1048576
-	ensure_key "$PREFIX/etc/susanin.conf" media_ratio 8
-	ensure_key "$PREFIX/etc/susanin.conf" media_min_rate 150000
-	ensure_key "$PREFIX/etc/susanin.conf" media_min_age 12
-	ensure_key "$PREFIX/etc/susanin.conf" media_ttl 21600
-	ensure_key "$PREFIX/etc/susanin.conf" media_prefix_max 24
-	ensure_key "$PREFIX/etc/susanin.conf" mss_clamp 0
-	ensure_key "$PREFIX/etc/susanin.conf" mss_clamp_lan 0
-	ensure_key "$PREFIX/etc/susanin.conf" profile_failover 1
-fi
-
-# --- миграция значений по умолчанию (0.4.0) ----------------------------------
-# promo_per_min: дефолт поднят 30 -> 120 (обучение быстрее). Меняем только если
-# в конфиге стоит прежний дефолт — своё значение пользователя не трогаем.
-if [ -f "$PREFIX/etc/susanin.conf" ]; then
-	_pp=$(sed -n 's/^promo_per_min=//p' "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
-	if [ "$_pp" = "30" ]; then
-		sed -i 's/^promo_per_min=.*/promo_per_min=120/' "$PREFIX/etc/susanin.conf" 2>/dev/null &&
-			say "promo_per_min: 30 -> 120 (новый дефолт)"
-	fi
-fi
-
-# Каталоги профилей маршрутизации: profiles (списки) и profiles.d (секции).
-mkdir -p "$PREFIX/etc/profiles" "$PREFIX/etc/profiles.d" 2>/dev/null || true
+# Примеры и списки пакета — в $PREFIX/share: оттуда их берёт postinst.sh (создаёт
+# из них конфиг и списки, дополняет при обновлении) и там же их ищет xray_setup
+# в .ipk-раскладке.
+mkdir -p "$PREFIX/share"
+for _s in "config.example.conf:susanin.conf.example" "vpn_always.txt:vpn_always.txt" \
+	"vpn_never.txt:vpn_never.txt" "cdn_ranges.txt:cdn_ranges.txt" \
+	"xray-tproxy.json.example:xray-tproxy.json.example"; do
+	_p=$(find_file "${_s%%:*}") || _p=""
+	[ -n "$_p" ] && cp "$_p" "$PREFIX/share/${_s##*:}" 2>/dev/null || true
+done
 
 _s94=$(find_file S94susanin) || _s94=""
 if [ -n "$_s94" ]; then
@@ -1058,46 +864,12 @@ if [ -n "$_s95" ]; then
 	chmod +x "$INITD/S95susanin-web"
 fi
 
-# Короткий вызов: `susanin status` вместо длинного пути. /opt/bin есть в PATH у
-# Entware; если имя уже занято (не нашим симлинком) — не трогаем.
-if [ -d /opt/bin ]; then
-	chmod +x "$PREFIX/tools/susanin.sh" 2>/dev/null || true
-	if [ -L /opt/bin/susanin ]; then
-		say "короткий вызов уже настроен: /opt/bin/susanin -> $(readlink /opt/bin/susanin 2>/dev/null)"
-	elif [ -e /opt/bin/susanin ]; then
-		say "/opt/bin/susanin занят другим файлом — симлинк не создаю"
-	elif ln -s "$PREFIX/tools/susanin.sh" /opt/bin/susanin 2>/dev/null; then
-		say "короткий вызов: susanin {status|check|diagnose|report|restart|...}"
-	else
-		say "симлинк /opt/bin/susanin создать не удалось (не критично)"
-	fi
-fi
-
-# Если оставшийся/выбранный конфиг в tproxy-режиме — поднять Xray ДО старта
-# агента, иначе агент не станет поднимать tproxy-правила (fail-open -> DIRECT).
-if grep -q '^egress_type=tproxy' "$PREFIX/etc/susanin.conf" 2>/dev/null; then
-	if [ -x /opt/sbin/xray ] && [ -f "$PREFIX/etc/xray-tproxy.json" ]; then
-		# restart (не start): чтобы применился свежий уровень логов Xray и конфиг,
-		# даже если Xray уже был запущен с прошлых тестов.
-		[ -x "$INITD/S93xray-tproxy" ] && sh "$INITD/S93xray-tproxy" restart >/dev/null 2>&1 || true
-		say "tproxy: Xray поднят перед стартом агента"
-	else
-		say "ВНИМАНИЕ: egress_type=tproxy, но нет /opt/sbin/xray или $PREFIX/etc/xray-tproxy.json"
-		say "         пока Xray не готов, агент оставит трафик в DIRECT (fail-open)"
-	fi
-fi
-
-if [ "$NO_START" -ne 1 ]; then
-	if ps 2>/dev/null | grep '[s]usanin-agent' >/dev/null 2>&1; then
-		sh "$PREFIX/tools/susanin.sh" restart || true
-	else
-		sh "$PREFIX/tools/susanin.sh" start || true
-	fi
-	# web — ОТДЕЛЬНЫЙ процесс: `restart` демона его не трогает (чтобы /api/restart
-	# не ронял панель). После подмены бинаря его нужно перезапустить принудительно,
-	# иначе панель продолжит работать СТАРЫМ кодом из памяти.
-	sh "$PREFIX/tools/susanin.sh" web restart || true
-fi
+# «Пути + конфиг + сервис» — ровно тот же скрипт, который opkg выполняет из
+# control.tar.gz при установке .ipk (он же поднимает Xray в tproxy-режиме и
+# перезапускает веб-панель после подмены бинаря).
+SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNETS="$_SS" \
+	SUSANIN_DISK_MODE="$DISK_MODE" SUSANIN_NO_START="$NO_START" \
+	sh "$PREFIX/tools/postinst.sh"
 say "installed to $PREFIX (run: sh $PREFIX/tools/susanin.sh status)"
 
 # XRay-egress (tproxy): скачать Xray (если нет), положить шаблон конфига и
