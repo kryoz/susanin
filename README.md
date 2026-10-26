@@ -46,7 +46,7 @@ Susanin (MikroTik RouterOS) «как есть» на KeeneticOS нельзя —
 должны идти через VPN **всегда** (без ручных списков IP — только имена, как в
 Keenetic).
 
-> **Статус: релиз 0.4.0-oc** Проверено на Keenetic Viva (MT7621, MIPS) и Keenetic
+> **Статус: релиз 0.4.1-oc** Проверено на Keenetic Viva (MT7621, MIPS) и Keenetic
 > Giga (KN-1012, aarch64), KeeneticOS 5.1.4–5.1.6, Entware; egress —
 > WireGuard/AmneziaWG (`nwg0`/`nwg1`), клиентский OpenConnect-коннектор Keenetic
 > (`nocliN`) и Xray VLESS+REALITY (`egress_type=tproxy`). Работает на старых
@@ -88,17 +88,17 @@ HTTPS (у BusyBox-wget его нет); остальное (`ipset`, `iptables`, 
 ```sh
 opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
-  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.4.0-oc --yes
+  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.4.1-oc --yes
 ```
 
 Вручную, если пакет уже скачан (в примере для aarch64, подставьте свою архитектуру):
 
 ```sh
 cd /opt/tmp
-wget https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/susanin-keenetic_0.4.0-oc_aarch64-3.10.ipk
-wget https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/SHA256SUMS
+wget https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/susanin-keenetic_0.4.1-oc_aarch64-3.10.ipk
+wget https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/SHA256SUMS
 sha256sum -c SHA256SUMS 2>/dev/null | grep aarch64      # ожидаем: ...: OK
-opkg install susanin-keenetic_0.4.0-oc_aarch64-3.10.ipk
+opkg install susanin-keenetic_0.4.1-oc_aarch64-3.10.ipk
 ```
 
 ### Пример `susanin.conf` после настройки
@@ -542,7 +542,7 @@ opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 ```
 
-> Пакет установщик берёт из последнего релиза (`v0.4.0-oc`) и сверяет SHA256 по
+> Пакет установщик берёт из последнего релиза (`v0.4.1-oc`) и сверяет SHA256 по
 > `SHA256SUMS` из релиза. Ответ `ERROR: unknown arg: --ipk` означает, что взят
 > старый скрипт (кэш или ветка до 0.4.0).
 
@@ -551,7 +551,7 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 `susanin-keenetic_<версия>_<arch>.ipk` из релиза в `/opt/tmp`, сверяет SHA256 по
 `SHA256SUMS` из этого же релиза (не совпало — установка отменяется) и выполняет
 `opkg install` (с `--force` — `opkg install --force-reinstall`).
-Флаги: `--version v0.4.0-oc` (без него — последний релиз), `--force`
+Флаги: `--version v0.4.1-oc` (без него — последний релиз), `--force`
 (переустановить), `--yes` (без вопросов), `--arch mipsel|mips|aarch64|armv7|x86_64`
 (если автоопределение не сработало), `--with-xray-tproxy` — режим VLESS/REALITY:
 скачает Xray в `/opt/sbin/xray`, сверит SHA256 и положит шаблон tproxy-конфига
@@ -573,11 +573,11 @@ opkg print-architecture | awk '{print $2}'
 
 | Архитектура Entware | Файл из релиза |
 |---|---|
-| `mipsel-3.4` (MT7621: Viva, Giga, Ultra и т.п.) | `susanin-keenetic_0.4.0-oc_mipsel-3.4.ipk` |
-| `mips-3.4` | `susanin-keenetic_0.4.0-oc_mips-3.4.ipk` |
-| `aarch64-3.10` | `susanin-keenetic_0.4.0-oc_aarch64-3.10.ipk` |
-| `armv7sf-k3.2` | `susanin-keenetic_0.4.0-oc_armv7sf-k3.2.ipk` |
-| `x86-64` | `susanin-keenetic_0.4.0-oc_x86-64.ipk` |
+| `mipsel-3.4` (MT7621: Viva, Giga, Ultra и т.п.) | `susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk` |
+| `mips-3.4` | `susanin-keenetic_0.4.1-oc_mips-3.4.ipk` |
+| `aarch64-3.10` | `susanin-keenetic_0.4.1-oc_aarch64-3.10.ipk` |
+| `armv7sf-k3.2` | `susanin-keenetic_0.4.1-oc_armv7sf-k3.2.ipk` |
+| `x86-64` | `susanin-keenetic_0.4.1-oc_x86-64.ipk` |
 
 Скачивание, **проверка суммы и только потом установка** (подставьте свой файл из
 таблицы; в имени и в URL — одна и та же версия):
@@ -585,19 +585,18 @@ opkg print-architecture | awk '{print $2}'
 ```sh
 mkdir -p /opt/tmp && cd /opt/tmp
 wget -O susanin-keenetic_0.4.0_mipsel-3.4.ipk \
-  https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/susanin-keenetic_0.4.0-oc_mipsel-3.4.ipk
+  https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
 wget -O SHA256SUMS \
-  https://github.com/kryoz/susanin/releases/download/v0.4.0-oc/SHA256SUMS
+  https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/SHA256SUMS
 sha256sum -c SHA256SUMS 2>/dev/null | grep mipsel-3.4   # ожидаем: ...: OK
-opkg install susanin-keenetic_0.4.0-oc_mipsel-3.4.ipk
+opkg install susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
 susanin version && susanin status && susanin diagnose
 ```
 
 Если `wget` без HTTPS (BusyBox) — вместо `wget -O …` используйте
 `curl -fL -o …` с тем же адресом. Для новой версии замените `0.4.0`
 (и `v0.4.0` в URL) на её номер; у сборок форка номер с суффиксом
-(например `0.4.0-oc` и тег `v0.4.0-oc`) — суффикс должен быть и в имени файла.
-(и `v0.4.0` в URL) на её номер.
+(например `0.4.1-oc` и тег `v0.4.1-oc`) — суффикс должен быть и в имени файла.
 
 Пакет ставит демон, скрипты, init-скрипты Entware, веб-панель и документацию в
 `/opt/susanin`. Конфиг (`susanin.conf`), списки `vpn_always`/`vpn_never`,
