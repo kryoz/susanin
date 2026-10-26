@@ -621,7 +621,10 @@ fi
 [ -n "${BINFILE:-}" ] && [ -f "$DIR/$BINFILE" ] || die "susanin-agent binary not found in $DIR (arch=$ARCH)"
 say "binary: $BINFILE"
 
-ifaces() { awk -F: '{print $1}' /proc/net/dev | tr -d ' ' | grep -v '^$'; }
+# Только строки вида «имя:»: в /proc/net/dev две первые строки — заголовок
+# («Inter-| Receive | Transmit» и «face |bytes …»), которые без фильтра
+# уезжали в список интерфейсов и становились «кандидатами» на egress.
+ifaces() { awk -F: '/^[ \t]*[A-Za-z0-9._-]+:/ {gsub(/[ \t]/, "", $1); print $1}' /proc/net/dev; }
 addr_of() { ip addr show "$1" 2>/dev/null | awk '/inet /{print $2}' | head -1; }
 
 pick() {
@@ -636,7 +639,9 @@ pick() {
 		printf "%s [1-%d]: " "$_what" "$_n" >&2
 		read _sel </dev/tty || _sel=1
 	else
-		die "ambiguous $_what; pass flag explicitly (no tty)"
+		# Пусто + rc=2: die внутри $(pick ...) убил бы только подоболочку, а
+		# вызывающий получил бы мусор вместо ответа — решает он же.
+		return 2
 	fi
 	_n=0
 	for _i in "$@"; do
@@ -656,7 +661,10 @@ default_devs() {
 }
 
 if [ -z "$EGRESS" ]; then
-	CAND=$(ifaces | grep -E '^(nwg|wg[0-9]*|amnezia|ovpn)' | grep -Ev "^($EXCL_RE)" || true)
+	# Список кандидатов обязан совпадать с is_egress_name() в src/discover.c:
+	# без nocli* (клиентский OpenConnect-коннектор Keenetic) установка tar-архивом
+	# на такой коробке не находила egress вообще и требовала --egress вручную.
+	CAND=$(ifaces | grep -E '^(nwg|wg[0-9]*|amnezia|ovpn|nocli)' | grep -Ev "^($EXCL_RE)" || true)
 	if [ -z "$CAND" ]; then
 		CAND=$(ifaces | grep -E '^(tun[0-9]+|tap[0-9]+)$' | grep -Ev "^($EXCL_RE)" || true)
 	fi
@@ -671,14 +679,15 @@ if [ -z "$EGRESS" ]; then
 				break
 			fi
 		done
-		[ -n "$EGRESS" ] || EGRESS=$(printf '%s\n' "$CAND" | grep -E '^(nwg|wg)' | head -1)
+		[ -n "$EGRESS" ] || EGRESS=$(printf '%s\n' "$CAND" | grep -E '^(nwg|wg|nocli)' | head -1)
 		[ -n "$EGRESS" ] || EGRESS=$(printf '%s\n' "$CAND" | head -1)
 		say "selected egress=$EGRESS (candidates: $(printf '%s ' $CAND)); use --egress to override"
 	elif ifaces | grep -qx nwg0; then
 		EGRESS=nwg0
 	else
 		say "no VPN interface auto-detected; select manually"
-		EGRESS=$(pick "select egress (VPN)" $(ifaces | grep -Ev "^(lo|ppp|tunl|$EXCL_RE)" || true))
+		EGRESS=$(pick "select egress (VPN)" $(ifaces | grep -Ev "^(lo|ppp|tunl|$EXCL_RE)" || true)) ||
+			die "egress не определён: добавьте --egress <интерфейс> (для клиентского OpenConnect-коннектора Keenetic — nocliN)"
 	fi
 fi
 say "egress=$EGRESS addr=$(addr_of "$EGRESS")"
@@ -786,7 +795,7 @@ fi
 
 mkdir -p "$PREFIX/bin" "$PREFIX/tools" "$PREFIX/etc" "$PREFIX/etc/profiles" "$PREFIX/var" "$INITD"
 cp "$DIR/$BINFILE" "$PREFIX/bin/susanin-agent"
-for f in datapath.sh susanin.sh update.sh uninstall.sh install.sh report.sh diagnose.sh profiles.sh xray-egress.sh; do
+for f in datapath.sh susanin.sh update.sh uninstall.sh install.sh report.sh diagnose.sh profiles.sh xray-egress.sh postinst.sh; do
 	_src=$(find_file "$f") || _src=""
 	[ -n "$_src" ] && cp "$_src" "$PREFIX/tools/$f"
 done
@@ -867,7 +876,7 @@ fi
 # «Пути + конфиг + сервис» — ровно тот же скрипт, который opkg выполняет из
 # control.tar.gz при установке .ipk (он же поднимает Xray в tproxy-режиме и
 # перезапускает веб-панель после подмены бинаря).
-SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNETS="$_SS" \
+SUSANIN_PREFIX="$PREFIX" SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNETS="$_SS" \
 	SUSANIN_DISK_MODE="$DISK_MODE" SUSANIN_NO_START="$NO_START" \
 	sh "$PREFIX/tools/postinst.sh"
 say "installed to $PREFIX (run: sh $PREFIX/tools/susanin.sh status)"
