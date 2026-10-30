@@ -48,6 +48,8 @@ test: $(TESTS)
 	./tests/test_web_token
 	./tests/test_release
 	sh tests/test-egress-failover.sh
+	@if command -v python3 >/dev/null 2>&1; then python3 tools/dataset.py --selftest; \
+	 else echo "python3 нет — самопроверка tools/dataset.py пропущена"; fi
 
 tests/test_state: tests/test_state.c src/state.c src/state.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_state.c src/state.c
