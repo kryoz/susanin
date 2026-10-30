@@ -819,6 +819,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     int xray_tries = 0;
     int stuck_tries = 0;      /* подряд «процесс есть, но порт не слушается» */
     time_t last_dnssniff = 0;
+    time_t last_snifdiag = 0;
     time_t last_prof = 0;
     int force_pending = 0;
     const char *state_path = "/opt/susanin/var/susanin.state";
@@ -954,8 +955,18 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     while (!g_stop) {
         time_t now = time(NULL);
 
-        if (cfg->dns_sniff)
+        if (cfg->dns_sniff) {
             dns_sniff_poll();
+            /* Без счётчиков «dom= пустой» нераспознаваемо: так выглядит и «нет
+             * DNS в поле зрения», и «не доходит до сокета», и «не парсится».
+             * Раз в минуту — одна строка, где видно каждое звено цепочки. */
+            if (now - last_snifdiag >= 60) {
+                char sd[160];
+                last_snifdiag = now;
+                dns_sniff_diag(sd, sizeof(sd));
+                slogf(SL_DEBUG, "dns_sniff: %s", sd);
+            }
+        }
 
         if (g_reload) {
             susanin_config nc;

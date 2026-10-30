@@ -31,6 +31,8 @@ void dns_sniff_set_state(susanin_state *st);
 void dns_sniff_reset_pins(void);
 
 int  dns_sniff_count(void);
+/* Счётчики цепочки захвата в одну строку (диагностика пустого dom=). */
+void dns_sniff_diag(char *out, size_t n);
 /* 1 = нашли домен для IP; domain_out заполняется (может быть ""). */
 int  dns_sniff_domain_of(const char *ip, char *domain_out, unsigned n);
 

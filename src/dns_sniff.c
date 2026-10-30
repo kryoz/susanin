@@ -52,6 +52,18 @@ typedef struct {
 } lcache;
 static lcache lc[2];
 
+/* Счётчики цепочки: захват → фильтр 53 → разбор → сохранение → поиск. Пока
+ * dom= пустой, по ним видно, на каком звене рвётся (и рвётся ли). */
+static unsigned long g_c_read, g_c_udp53, g_c_ans, g_c_store, g_c_look;
+
+void dns_sniff_diag(char *out, size_t n)
+{
+    snprintf(out, n,
+             "read=%lu udp53=%lu ans=%lu stored=%lu tab=%d look=%lu ifc=%d",
+             g_c_read, g_c_udp53, g_c_ans, g_c_store, dns_sniff_count(),
+             g_c_look, g_nfd);
+}
+
 static unsigned long dns_hash(const char *s)
 {
     unsigned long h = 5381;
@@ -68,6 +80,7 @@ static void dns_store(const char *domain, const char *ip, int ttl)
 
     if (!domain[0] || !ip[0])
         return;
+    g_c_store++;
     h = dns_hash(domain) % DNS_MAX_ENTRIES;
     for (idx = 0; idx < DNS_MAX_ENTRIES; idx++) {
         int s = (int)((h + (unsigned long)idx) % DNS_MAX_ENTRIES);
@@ -153,6 +166,7 @@ static void dns_parse(const uint8_t *p, int len)
     off += 4;                       /* qtype + qclass */
 
     ttlcap = (g_cfg && g_cfg->dns_sniff_ttl > 0) ? g_cfg->dns_sniff_ttl : 300;
+    g_c_ans++;
     for (i = 0; i < an && off + 10 <= len; i++) {
         int type, cls, rdlen, ttl;
         char aname[DNS_DOMAIN_MAX];
@@ -367,6 +381,7 @@ void dns_sniff_poll(void)
             }
             if (r < 20)
                 continue;
+            g_c_read++;
             ihl = (unsigned)(buf[0] & 0x0f) * 4;
             if (ihl < 20 || (ssize_t)ihl + 8 > r || buf[9] != 17)
                 continue;
@@ -376,6 +391,7 @@ void dns_sniff_poll(void)
                 uint16_t dp = (uint16_t)((udp[2] << 8) | udp[3]);
                 if (sp != 53 && dp != 53)
                     continue;
+                g_c_udp53++;
                 ulen = (unsigned)((udp[4] << 8) | udp[5]);
                 if (ulen < 8 || ihl + ulen > (unsigned)r)
                     continue;
@@ -596,6 +612,7 @@ int dns_sniff_domain_of(const char *ip, char *domain_out, unsigned n)
         domain_out[0] = '\0';
     if (!ip)
         return 0;
+    g_c_look++;
     for (i = 0; i < DNS_MAX_ENTRIES; i++) {
         dns_entry *e = &g_tab[i];
         if (e->domain[0] && e->expire > now && !strcmp(e->ip, ip)) {
