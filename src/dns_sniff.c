@@ -55,13 +55,18 @@ static lcache lc[2];
 /* Счётчики цепочки: захват → фильтр 53 → разбор → сохранение → поиск. Пока
  * dom= пустой, по ним видно, на каком звене рвётся (и рвётся ли). */
 static unsigned long g_c_read, g_c_udp53, g_c_ans, g_c_store, g_c_look;
+/* Куда именно отваливаются пакеты между «порт 53» и «разобрали ответ». */
+static unsigned long g_c_bad, g_c_short, g_c_query, g_c_counts, g_c_name;
+static int g_dumped;
 
 void dns_sniff_diag(char *out, size_t n)
 {
     snprintf(out, n,
-             "read=%lu udp53=%lu ans=%lu stored=%lu tab=%d look=%lu ifc=%d",
+             "read=%lu udp53=%lu ans=%lu stored=%lu tab=%d look=%lu ifc=%d "
+             "| drop: bad=%lu short=%lu query=%lu counts=%lu name=%lu",
              g_c_read, g_c_udp53, g_c_ans, g_c_store, dns_sniff_count(),
-             g_c_look, g_nfd);
+             g_c_look, g_nfd, g_c_bad, g_c_short, g_c_query, g_c_counts,
+             g_c_name);
 }
 
 static unsigned long dns_hash(const char *s)
@@ -150,19 +155,25 @@ static void dns_parse(const uint8_t *p, int len)
     char qname[DNS_DOMAIN_MAX];
     uint16_t flags;
 
-    if (len < 12)
+    if (len < 12) {
+        g_c_short++;
         return;
+    }
     flags = (uint16_t)((p[2] << 8) | p[3]);
-    if (!(flags & 0x8000))
+    if (!(flags & 0x8000)) {
+        g_c_query++;
         return;                     /* только ответы */
+    }
     qd = (p[4] << 8) | p[5];
     an = (p[6] << 8) | p[7];
-    if (qd < 1 || an < 1)
+    if (qd < 1 || an < 1) {
+        g_c_counts++;
         return;
-    if (dns_name(p, len, 12, qname, sizeof(qname), &off) != 0)
+    }
+    if (dns_name(p, len, 12, qname, sizeof(qname), &off) != 0 || off + 4 > len) {
+        g_c_name++;
         return;
-    if (off + 4 > len)
-        return;
+    }
     off += 4;                       /* qtype + qclass */
 
     ttlcap = (g_cfg && g_cfg->dns_sniff_ttl > 0) ? g_cfg->dns_sniff_ttl : 300;
@@ -393,8 +404,32 @@ void dns_sniff_poll(void)
                     continue;
                 g_c_udp53++;
                 ulen = (unsigned)((udp[4] << 8) | udp[5]);
-                if (ulen < 8 || ihl + ulen > (unsigned)r)
+                if (!g_dumped) {
+                    /* Ровно один раз — настоящие байты DNS: запрос это или
+                     * ответ, счётчики RR и не съехал ли заголовок. До
+                     * фильтров, чтобы увидеть и отбракованные пакеты. */
+                    char hx[3 * 32 + 1];
+                    int k, m = (int)ulen - 8, avail = (int)(r - (ssize_t)ihl) - 8;
+                    g_dumped = 1;
+                    if (m > avail)
+                        m = avail;
+                    if (m > 32)
+                        m = 32;
+                    if (m < 0)
+                        m = 0;
+                    hx[0] = '\0';
+                    for (k = 0; k < m; k++) {
+                        char b[4];
+                        snprintf(b, sizeof(b), "%02x ", udp[8 + k]);
+                        strncat(hx, b, sizeof(hx) - strlen(hx) - 1);
+                    }
+                    slogf(SL_DEBUG, "dns_sniff: udp53 ulen=%u r=%zd ihl=%u %s",
+                          ulen, r, ihl, hx);
+                }
+                if (ulen < 8 || ihl + ulen > (unsigned)r) {
+                    g_c_bad++;
                     continue;
+                }
                 dns_parse(udp + 8, (int)(ulen - 8));
             }
         }
