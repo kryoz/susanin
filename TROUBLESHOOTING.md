@@ -13,7 +13,7 @@ sh /opt/susanin/tools/report.sh     # отчёт: /opt/susanin/var/report.txt
 
 ```sh
 cd /opt/tmp
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/bootstrap.sh | sh -s -- --yes
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/bootstrap.sh | sh -s -- --yes
 # только показать платформу (arch, ядро, BusyBox): sh susanin-install.sh --check
 ```
 

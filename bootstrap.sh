@@ -25,11 +25,11 @@
 #
 # Быстрый старт (последний релиз), без сохранения файла:
 #   cd /opt/tmp
-#   wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/bootstrap.sh | sh -s -- --yes
+#   wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/bootstrap.sh | sh -s -- --yes
 #
 # То же с сохранением файла (удобно перезапускать и смотреть `--check`):
 #   cd /opt/tmp && rm -f susanin-install.sh && \
-#   wget -O susanin-install.sh https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/bootstrap.sh && \
+#   wget -O susanin-install.sh https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/bootstrap.sh && \
 #   sh susanin-install.sh --yes
 #
 # Последний релиз (архив под свою архитектуру, качается с GitHub Releases):
@@ -47,7 +47,9 @@
 # POSIX sh (BusyBox ash совместимо).
 set -eu
 
-REPO="R17a/Susanin.Keenetic"
+# Репозиторий-источник релизов: у форков/зеркал свои релизы, поэтому он
+# переопределяется SUSANIN_REPO. Без переопределения поведение не меняется.
+REPO="${SUSANIN_REPO:-kryoz/susanin}"
 CHANNEL="stable"
 VERSION="latest"
 URL=""
@@ -162,8 +164,8 @@ case "$CHANNEL" in
     *) die "неверный --channel: $CHANNEL (только stable)" ;;
 esac
 
-# Xray берём из стабильной ветки main.
-XRAY_BRANCH=main
+# Xray берём из Keenetic-мейнлайна этого форка.
+XRAY_BRANCH=fix/oc-connector-egress
 
 # --- определение платформы ---------------------------------------------------
 # Endianness по ELF-заголовку: байт 5 (EI_DATA): 1 — little, 2 — big.

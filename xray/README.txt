@@ -16,7 +16,7 @@ Xray-core — дистрибутив для режима Susanin egress_type=tpr
 
 Вручную (на роутере, по архитектуре):
   wget -O /opt/sbin/xray \
-    https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/xray/xray.mipsel
+    https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/xray/xray.mipsel
   # aarch64: .../main/xray/xray.aarch64
   chmod +x /opt/sbin/xray
   # сверить: sha256sum /opt/sbin/xray  (значение — в xray/SHA256SUMS)

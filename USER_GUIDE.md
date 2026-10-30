@@ -14,10 +14,10 @@
 opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 
 # 2. Установка пакетом .ipk (рекомендуется): архитектура и SHA256 — автоматически
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 
 # либо из tar-архива:
-# wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh
+# wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh
 
 # 3. Проверка
 susanin version && susanin status
@@ -32,7 +32,7 @@ susanin version && susanin status
 
 ```sh
 cd /opt/tmp
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/bootstrap.sh | sh -s -- --yes
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/bootstrap.sh | sh -s -- --yes
 # пакетом .ipk:  sh -s -- --yes --ipk
 ```
 
@@ -196,7 +196,7 @@ CIDR; `#` — комментарий). Адрес обрабатывается �
 Сам бинарь Xray в поставку не входит — его скачивает установщик:
 ```sh
 sh bootstrap.sh --with-xray --yes                    # tar-архив
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
   | sh -s -- --ipk --with-xray-tproxy                 # пакет .ipk
 ```
 (Xray ставится в `/opt/sbin/xray`, SHA256 сверяется; конфиг-шаблон —
@@ -223,7 +223,7 @@ wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.s
 ## Обновление и удаление
 
 ```sh
-sh /opt/susanin/tools/susanin.sh update 0.4.0     # или latest — последний релиз
+sh /opt/susanin/tools/susanin.sh update 0.4.1-oc     # или latest — последний релиз
 sh /opt/susanin/tools/susanin.sh uninstall        # снять, конфиг сохранить
 sh /opt/susanin/tools/susanin.sh uninstall --purge # удалить всё
 ```
@@ -232,17 +232,17 @@ sh /opt/susanin/tools/susanin.sh uninstall --purge # удалить всё
 скачает пакет из релиза, сверит SHA256 и выполнит `opkg install`:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 ```
 
-Флаги: `--version v0.4.0`, `--force` (переустановить), `--yes` (без вопросов),
+Флаги: `--version v0.4.1-oc`, `--force` (переустановить), `--yes` (без вопросов),
 `--with-xray-tproxy` (плюс Xray). Вручную то же самое:
 
 ```sh
 mkdir -p /opt/tmp
-wget -O /opt/tmp/susanin-keenetic_0.4.0_mipsel-3.4.ipk \
-  https://github.com/R17a/Susanin.Keenetic/releases/download/v0.4.0/susanin-keenetic_0.4.0_mipsel-3.4.ipk
-opkg install /opt/tmp/susanin-keenetic_0.4.0_mipsel-3.4.ipk
+wget -O /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk \
+  https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
+opkg install /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
 ```
 
 Файл под свою архитектуру (её показывает `opkg print-architecture`) выбирайте по

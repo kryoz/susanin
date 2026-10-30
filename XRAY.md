@@ -66,7 +66,7 @@ echo | openssl s_client -connect <IP_сервера>:443 -servername example.org
    Вручную — скачать из репозитория и проверить сумму (каталог `xray/`):
    ```sh
    wget -O /opt/sbin/xray \
-     https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/xray/xray.mipsel
+     https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/xray/xray.mipsel
    # aarch64: .../main/xray/xray.aarch64
    chmod +x /opt/sbin/xray
    sha256sum /opt/sbin/xray             # сверить с xray/SHA256SUMS
