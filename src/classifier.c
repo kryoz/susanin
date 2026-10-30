@@ -52,9 +52,9 @@ void clf_trace_line(char *dst, size_t n, const ct_flow *f, const char *stage,
     char dom[128];
     trace_domain(dom, sizeof(dom), domain);
     snprintf(dst, n,
-             "TRC sig=%s/%s pr=%s st=%s dp=%u sp=%u op=%lu ob=%lu rp=%lu "
+             "TRC sig=%s/%s dst=%s pr=%s st=%s dp=%u sp=%u op=%lu ob=%lu rp=%lu "
              "rb=%lu hr=%d fn=%d dom=%s",
-             stage, reason, f->proto, f->tcp_state, f->dport, f->sport,
+             stage, reason, f->dst, f->proto, f->tcp_state, f->dport, f->sport,
              f->op, f->ob, f->rp, f->rb, f->has_reply, f->fastnat,
              dom[0] ? dom : "-");
 }

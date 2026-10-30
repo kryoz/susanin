@@ -45,6 +45,8 @@ int main(void)
     clf_trace_line(buf, sizeof(buf), &f, "FAST", "TCP-SYN", "");
     printf("    %s\n", buf);
     CHECK(has_substr(buf, "TRC sig=FAST/TCP-SYN"), "стадия и сигнал");
+    CHECK(has_substr(buf, "dst=203.0.113.7"),
+          "адрес есть: без него отказные строки не склеить с вердиктом");
     CHECK(has_substr(buf, "pr=tcp") && has_substr(buf, "st=SYN_SENT"),
           "протокол и состояние TCP");
     CHECK(has_substr(buf, "dp=443") && has_substr(buf, "sp=51234"), "порты");
