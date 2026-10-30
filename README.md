@@ -187,9 +187,14 @@ web_token=                 # пусто = вход без пароля (дост
 
 Что умеет: статус (egress/health, размеры наборов, профили, память), правка
 конфига, списки `vpn_always`/`vpn_never` (drag&drop и Memo-редактор всего файла),
-профили, действия Reload/Rescan/Restart/Reset. Токен сравнивается за постоянное
-время; `?token=` принимается только для первого GET; без TLS — при необходимости
-ставьте панель за своим прокси или не выставляйте её в недоверенный сегмент.
+профили, действия Reload/Rescan/Restart/Reset. Если на GitHub есть более новый
+релиз, рядом с версией в шапке появляется оранжевый знак «!» с подсказкой
+«Есть обновление до версии …»; клик открывает страницу релиза. Проверка идёт не
+чаще `release_check_interval` (по умолчанию 12 ч), результат кэшируется в
+`/opt/susanin/var/release.state`, отключается ключом `release_check=0`.
+Токен сравнивается за постоянное время; `?token=` принимается только для первого
+GET; без TLS — при необходимости ставьте панель за своим прокси или не
+выставляйте её в недоверенный сегмент.
 
 ## Важно: «Приоритеты подключений» Keenetic и Susanin.Keenetic
 
@@ -266,6 +271,7 @@ ndmc -c "show running-config" | grep -i "ip policy"
   `/opt/susanin/etc/vpn_always.txt` **только если файла ещё нет** — при
   установке и обновлении ваш список **не перезаписывается**, но может
   **дополняться** новыми записями из сборки (merge; существующие не удаляются).
+  Дополнение выключается флагом `--keep-lists` (см. «Установка / обновление»).
   Проверить: `sh /opt/susanin/tools/susanin.sh status` покажет домены.
 
 ## Домены, которые всегда НАПРЯМУЮ (never VPN)
@@ -490,6 +496,7 @@ sh /opt/susanin/tools/profiles.sh down     # снять
 
 
 
+
 ## Установка / обновление / удаление
 
 ### Пакетом Entware `.ipk` (0.4.0+, рекомендуется)
@@ -624,7 +631,8 @@ curl -fsSL https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egre
 `--arch mipsel|mips|aarch64|armv7|x86_64` (задать вручную),
 `--version latest|vX.Y.Z`, `--egress <if>`, `--lan <if,if>`,
 `--subnets <cidr,cidr>`, `--yes` (без подтверждений), `--force`
-(перезаписать `susanin.conf`), `--no-start`, `--prefix <dir>`.
+(перезаписать `susanin.conf`), `--no-start`, `--prefix <dir>`,
+`--keep-lists` (не трогать существующие `vpn_always.txt`/`vpn_never.txt`).
 
 Подтверждения (`[y/N]`) можно либо отвечать вручную (`y` или `yes`), либо
 заранее передать `--yes` (`-y`) и не отвечать ни на что.
@@ -652,12 +660,18 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 
 Флаги: `--channel stable|dev`, `--version`, `--file`, `--url`, `--check`,
 `--dry-run`, `--ipk`, `--with-xray`, `--verify`, `--tmp DIR`; остальные
-(`--yes`, `--arch`, `--egress`, `--lan`, `--force`, `--deps`) передаются в
-`install.sh`.
+(`--yes`, `--arch`, `--egress`, `--lan`, `--force`, `--deps`, `--keep-lists`)
+передаются в `install.sh`.
 
 Ваши `/opt/susanin/etc/susanin.conf`, `vpn_always.txt` и `vpn_never.txt` при
 установке и обновлении **не перезаписываются**, но списки могут **дополняться**
-новыми записями из сборки (merge; существующие строки не удаляются).
+новыми записями из сборки (merge; существующие строки не удаляются). Чтобы
+обновление не касалось списков вообще, добавьте флаг `--keep-lists`:
+
+```sh
+sh /opt/susanin/tools/susanin.sh update v0.4.1 --keep-lists
+sh install.sh --keep-lists          # то же для установки
+```
 
 Если на роутере есть **OpenConnect-сервер (ocserv)** и его интерфейс (`oc0`) не
 в маршрутизации, установщик спросит (по-английски), добавить ли его:
@@ -673,13 +687,21 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 opkg install /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk   # или opkg upgrade при включённом фиде
 
 # скриптом (tar-архив):
-sh /opt/susanin/tools/susanin.sh update 0.4.1-oc    # или `susanin update 0.4.1-oc`; latest = последний релиз
+sh /opt/susanin/tools/susanin.sh update 0.4.2-oc    # или `susanin update 0.4.2-oc`; latest = последний релиз
+
+# то же, но списки vpn_always.txt / vpn_never.txt не трогать вообще:
+sh /opt/susanin/tools/susanin.sh update 0.4.2 --keep-lists
 ```
 
 > `susanin.sh update` сам определяет установленную версию и архитектуру, скачивает
 > deploy-архив из Releases, **сохраняет** `susanin.conf`, списки и `susanin.state`,
 > дописывает новые ключи/списки и перезапускает службу. Обновление `.ipk` делает
 > `opkg` (данные тоже не перезаписываются).
+>
+> `--keep-lists` (синоним `--no-lists`) отключает только автодополнение списков:
+> `vpn_always.txt` и `vpn_never.txt` остаются ровно такими, какие они есть.
+> Бинарь, `tools/`, `www/` и конфиг обновляются как обычно; обратный флаг —
+> `--lists` (поведение по умолчанию).
 
 ![Susanin.Keenetic uninstall](demo2.png)
 
@@ -713,7 +735,7 @@ sh /opt/susanin/tools/susanin.sh install    # datapath up + setup
 | Версия | `sh /opt/susanin/tools/susanin.sh version` (то же, что `susanin-agent version`) |
 | Снять правила | `sh /opt/susanin/tools/susanin.sh down` |
 | Убрать IP/домен из кэша | `sh /opt/susanin/tools/susanin.sh reset <ip|домен>` (синоним `forget`) |
-| Обновление | `sh /opt/susanin/tools/susanin.sh update 0.4.1-oc` (или `latest`) |
+| Обновление | `sh /opt/susanin/tools/susanin.sh update 0.4.2-oc` (или `latest`); без правки списков — `… update 0.4.2 --keep-lists` |
 | Удаление | `sh /opt/susanin/tools/susanin.sh uninstall [--purge]` |
 | Добавить IP в VPN вручную | `sh /opt/susanin/tools/susanin.sh add <ip> tcp test` |
 
@@ -779,6 +801,7 @@ susanin-agent install | uninstall
 | `soft_state_interval` | как часто сохранять состояние в `soft`, ч (0 = никогда) | `12` |
 | `web_enable` / `web_listen` / `web_port` | встроенная веб-панель: включить, LAN-адрес, порт | `0` / `192.168.1.1` / `8087` |
 | `web_token` | токен панели; пусто = вход без пароля (только LAN) | (пусто) |
+| `release_check` / `release_check_interval` | проверять новые релизы на GitHub и показывать «!»; период, сек (0 = не проверять) | `1` / `43200` |
 | `xray_loglevel` | уровень логов Xray (`debug`/`info`/`warning`/`none`) | `warning` |
 
 Про `learn_exclude_ports`: для этих портов отключено только **быстрое**

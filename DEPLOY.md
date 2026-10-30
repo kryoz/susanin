@@ -82,7 +82,8 @@ sh install.sh --yes
 
 `susanin.conf`, `vpn_always.txt`, `vpn_never.txt` при обновлении **не
 перезаписываются** (нужно перезаписать — `sh install.sh --force`); новые ключи и
-строки списков **дописываются**.
+строки списков **дописываются**. Чтобы списки не дописывались вообще —
+`--keep-lists` (см. ниже).
 
 ## Обновление
 
@@ -91,13 +92,20 @@ sh install.sh --yes
 opkg install /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
 
 # tar-архив:
-sh /opt/susanin/tools/susanin.sh update 0.4.1-oc     # или latest
+sh /opt/susanin/tools/susanin.sh update 0.4.2-oc     # или latest
+
+# без автодополнения списков (vpn_always.txt / vpn_never.txt не трогаются):
+sh /opt/susanin/tools/susanin.sh update 0.4.2 --keep-lists
 ```
 
 `susanin.sh update` определяет установленную версию и архитектуру, скачивает
 deploy-архив из Releases, сохраняет конфиг/списки/состояние, дописывает новые
 ключи и перезапускает службу. Перед обновлением полезно сохранить копию:
 `cp -a /opt/susanin/etc /opt/susanin/etc.bak-$(date +%F-%H%M)`.
+
+`--keep-lists` (синоним `--no-lists`) выключает только merge списков: оба файла
+остаются байт в байт, всё остальное (бинарь, `tools/`, `www/`, новые ключи
+конфига) обновляется как обычно. Обратный флаг — `--lists`.
 
 ## Что и куда ставится
 

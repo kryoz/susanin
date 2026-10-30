@@ -112,7 +112,8 @@ usage() {
 Опции, которые передаются в install.sh:
   --yes|-y, --force, --no-start, --deps, --with-xray-tproxy,
   --egress IF, --lan IF[,IF], --subnets CIDR[,CIDR],
-  --prefix DIR, --disk-mode normal|soft
+  --prefix DIR, --disk-mode normal|soft,
+  --keep-lists (не трогать существующие vpn_always.txt / vpn_never.txt)
 
 Дополнительные пакеты Entware (если ставите впервые):
   opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
@@ -148,6 +149,7 @@ while [ $# -gt 0 ]; do
         --deps) INSTALL_ARGS="$INSTALL_ARGS --deps" ;;
         --with-xray-tproxy) INSTALL_ARGS="$INSTALL_ARGS --with-xray-tproxy" ;;
         --with-oc) INSTALL_ARGS="$INSTALL_ARGS --with-oc" ;;
+        --keep-lists|--no-lists) INSTALL_ARGS="$INSTALL_ARGS --keep-lists" ;;
         --egress|--lan|--subnets|--prefix|--disk-mode)
             need_val $# "$1"; INSTALL_ARGS="$INSTALL_ARGS $1 $2"; shift ;;
         -h|--help) usage; exit 0 ;;

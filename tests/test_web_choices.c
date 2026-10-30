@@ -108,6 +108,10 @@ static void test_kinds(void)
     CHECK(strcmp(choice_iface_kind("nwg0"), "tunnel") == 0, "nwg0 -> tunnel");
     CHECK(strcmp(choice_iface_kind("wdtt0"), "tunnel") == 0, "wdtt0 -> tunnel");
     CHECK(strcmp(choice_iface_kind("wg1"), "tunnel") == 0, "wg1 -> tunnel");
+    /* AmneziaWG (userspace amneziawg-go или нативный awg-интерфейс) — тоже
+     * тоннель, иначе в панели он падал в группу «Физические». */
+    CHECK(strcmp(choice_iface_kind("awg0"), "tunnel") == 0, "awg0 -> tunnel");
+    CHECK(strcmp(choice_iface_kind("awg1"), "tunnel") == 0, "awg1 -> tunnel");
     CHECK(strcmp(choice_iface_kind("tun0"), "tunnel") == 0, "tun0 -> tunnel");
     CHECK(strcmp(choice_iface_kind("ppp0"), "tunnel") == 0, "ppp0 -> tunnel");
     CHECK(strcmp(choice_iface_kind("br0"), "bridge") == 0, "br0 -> bridge");
