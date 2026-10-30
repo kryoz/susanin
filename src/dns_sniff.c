@@ -194,12 +194,19 @@ static int sniff_bind(const char *name)
     idx = if_nametoindex(name);
     if (idx == 0)
         return -1;                  /* интерфейса сейчас нет */
-    fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+    /* SOCK_RAW + ETH_P_ALL, а не SOCK_DGRAM + ETH_P_IP: копии ИСХОДЯЩИХ пакетов
+     * (а DNS-ответ клиенту — это именно исходящий пакет) такому сокету не
+     * отдаются, и на Keenetic снифер видел только запросы: udp53=71, из них
+     * query=71, ans=0, при том что tcpdump показывал ответы на том же br0.
+     * Ответы — это и есть единственный источник связи домен->IP, поэтому без
+     * этого dns_sniff не работал целиком (пины vpn_always/vpn_never по
+     * поддоменам не появлялись никогда). L2 разбираем сами — см. l2_ipv4. */
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd < 0)
         return -1;
     memset(&sll, 0, sizeof(sll));
     sll.sll_family = AF_PACKET;
-    sll.sll_protocol = htons(ETH_P_IP);
+    sll.sll_protocol = htons(ETH_P_ALL);
     sll.sll_ifindex = (int)idx;
     if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) != 0) {
         slogf(SL_WARN, "dns_sniff: не привязаться к %s — пропускаю", name);
@@ -342,6 +349,30 @@ void dns_sniff_stop(void)
     }
 }
 
+/* Смещение IP-заголовка в кадре: ethertype + цепочка тегов 802.1Q/802.1ad
+ * (LAN-порты Keenetic — VLAN-сабы вроде eth2.1/ra7.1, так что смещение 12 не
+ * гарантировано). 1 = IPv4, *l2 — начало IP-заголовка; длину самого IP-пакета
+ * проверяет вызывающий. Кадр приходит из сети, поэтому граница — на каждом
+ * шаге разбора тегов. */
+static int l2_ipv4(const uint8_t *p, ssize_t len, unsigned *l2)
+{
+    unsigned etype, h = 14;
+
+    if (len < 14)
+        return 0;
+    etype = (unsigned)((p[12] << 8) | p[13]);
+    while (etype == 0x8100 || etype == 0x88a8) {
+        if ((ssize_t)(h + 4) > len)
+            return 0;
+        etype = (unsigned)((p[h + 2] << 8) | p[h + 3]);
+        h += 4;
+    }
+    if (etype != 0x0800)
+        return 0;
+    *l2 = h;
+    return 1;
+}
+
 void dns_sniff_poll(void)
 {
     uint8_t buf[2048];
@@ -365,19 +396,25 @@ void dns_sniff_poll(void)
                 }
                 break;
             }
-            if (r < 20)
-                continue;
-            ihl = (unsigned)(buf[0] & 0x0f) * 4;
-            if (ihl < 20 || (ssize_t)ihl + 8 > r || buf[9] != 17)
+            if (r < 42)   /* eth(14) + ip(20) + udp(8) */
                 continue;
             {
-                const uint8_t *udp = buf + ihl;
-                uint16_t sp = (uint16_t)((udp[0] << 8) | udp[1]);
-                uint16_t dp = (uint16_t)((udp[2] << 8) | udp[3]);
+                const uint8_t *ip, *udp;
+                unsigned l2 = 0;
+                uint16_t sp, dp;
+                if (!l2_ipv4(buf, r, &l2) || r - (ssize_t)l2 < 28)
+                    continue;       /* не IPv4, или не хватает на IP+UDP */
+                ip = buf + l2;
+                ihl = (unsigned)(ip[0] & 0x0f) * 4;
+                if (ihl < 20 || (ssize_t)(l2 + ihl + 8) > r || ip[9] != 17)
+                    continue;
+                udp = ip + ihl;
+                sp = (uint16_t)((udp[0] << 8) | udp[1]);
+                dp = (uint16_t)((udp[2] << 8) | udp[3]);
                 if (sp != 53 && dp != 53)
                     continue;
                 ulen = (unsigned)((udp[4] << 8) | udp[5]);
-                if (ulen < 8 || ihl + ulen > (unsigned)r)
+                if (ulen < 8 || ihl + ulen > (unsigned)(r - (ssize_t)l2))
                     continue;
                 dns_parse(udp + 8, (int)(ulen - 8));
             }
