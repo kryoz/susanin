@@ -34,3 +34,6 @@ susanin-agent
 Thumbs.db
 .idea/
 .vscode/
+
+# dev-инструменты (tools/*.py)
+__pycache__/
