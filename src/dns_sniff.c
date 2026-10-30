@@ -216,9 +216,15 @@ static int sniff_bind(const char *name)
 
     if (g_nfd >= DNS_MAX_IFACES)
         return -1;
-    idx = if_nametoindex(name);
-    if (idx == 0)
-        return -1;                  /* интерфейса сейчас нет */
+    /* "any" (ifindex 0) — диагностика: на каком именно интерфейсе живут те
+     * пакеты, которых нет на LAN-списке (например, upstream-ответы резолвера). */
+    if (!strcmp(name, "any")) {
+        idx = 0;
+    } else {
+        idx = if_nametoindex(name);
+        if (idx == 0)
+            return -1;              /* интерфейса сейчас нет */
+    }
     fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
     if (fd < 0)
         return -1;
@@ -279,7 +285,7 @@ static void sniff_try_name(const char *name)
     }
     if (sniff_is_open(name))
         return;
-    if (if_nametoindex(name) == 0) {
+    if (strcmp(name, "any") != 0 && if_nametoindex(name) == 0) {
         slogf(SL_DEBUG, "dns_sniff: %s сейчас нет — пропускаю", name);
         return;
     }
@@ -403,7 +409,10 @@ void dns_sniff_poll(void)
     for (f = 0; f < g_nfd; ) {
         int guard = 0, dropped = 0;
         while (guard++ < 128) {
-            ssize_t r = recv(g_fds[f], buf, sizeof(buf), 0);
+            struct sockaddr_ll sll;
+            socklen_t alen = sizeof(sll);
+            ssize_t r = recvfrom(g_fds[f], buf, sizeof(buf), 0,
+                                 (struct sockaddr *)&sll, &alen);
             unsigned ihl, ulen;
             if (r == 0)
                 break;
@@ -449,8 +458,9 @@ void dns_sniff_poll(void)
                         snprintf(b, sizeof(b), "%02x ", udp[8 + k]);
                         strncat(hx, b, sizeof(hx) - strlen(hx) - 1);
                     }
-                    slogf(SL_DEBUG, "dns_sniff: udp53 ulen=%u r=%zd ihl=%u %s",
-                          ulen, r, ihl, hx);
+                    slogf(SL_DEBUG,
+                          "dns_sniff: udp53 if=%u ulen=%u r=%zd ihl=%u %s",
+                          (unsigned)sll.sll_ifindex, ulen, r, ihl, hx);
                 }
                 if (ulen < 8 || ihl + ulen > (unsigned)r) {
                     g_c_bad++;
