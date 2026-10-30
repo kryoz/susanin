@@ -377,6 +377,29 @@ void dns_sniff_stop(void)
     }
 }
 
+/* Смещение IP-заголовка в кадре: ethertype + цепочка тегов 802.1Q/802.1ad
+ * (LAN-порты этой коробки — VLAN-сабы eth2.1/ra7.1, так что смещение 12 не
+ * гарантировано). 1 = IPv4, *l2 — начало IP-заголовка; длину самого IP-пакета
+ * проверяет вызывающий. Граница — на каждом шаге, кадр идёт из сети. */
+static int l2_ipv4(const uint8_t *p, ssize_t len, unsigned *l2)
+{
+    unsigned etype, h = 14;
+
+    if (len < 14)
+        return 0;
+    etype = (unsigned)((p[12] << 8) | p[13]);
+    while (etype == 0x8100 || etype == 0x88a8) {
+        if ((ssize_t)(h + 4) > len)
+            return 0;
+        etype = (unsigned)((p[h + 2] << 8) | p[h + 3]);
+        h += 4;
+    }
+    if (etype != 0x0800)
+        return 0;
+    *l2 = h;
+    return 1;
+}
+
 void dns_sniff_poll(void)
 {
     uint8_t buf[2048];
@@ -408,17 +431,9 @@ void dns_sniff_poll(void)
             g_c_read++;
             {
                 const uint8_t *ip, *udp;
-                unsigned l2 = 14, etype;
+                unsigned l2 = 0;
                 uint16_t sp, dp;
-                etype = (unsigned)((buf[12] << 8) | buf[13]);
-                /* 802.1Q/802.1ad: LAN-порты этой коробки — VLAN-сабы (eth2.1,
-                 * ra7.1), так что ethertype может лежать не по смещению 12. */
-                while ((etype == 0x8100 || etype == 0x88a8) &&
-                       (ssize_t)(l2 + 4) <= r) {
-                    etype = (unsigned)((buf[l2 + 2] << 8) | buf[l2 + 3]);
-                    l2 += 4;
-                }
-                if (etype != 0x0800 || r - (ssize_t)l2 < 28)
+                if (!l2_ipv4(buf, r, &l2) || r - (ssize_t)l2 < 28)
                     continue;       /* не IPv4, или не хватает на IP+UDP */
                 ip = buf + l2;
                 ihl = (unsigned)(ip[0] & 0x0f) * 4;
