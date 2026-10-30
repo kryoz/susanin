@@ -225,12 +225,16 @@ static int sniff_bind(const char *name)
         if (idx == 0)
             return -1;              /* интерфейса сейчас нет */
     }
-    fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+    /* SOCK_RAW + ETH_P_ALL, а не SOCK_DGRAM + ETH_P_IP: tcpdump на той же
+     * коробке видит ответы на br0, а DGRAM/IP-сокет — только запросы (замер:
+     * udp53=71, из них query=71, ans=0). Копии исходящих пакетов ядро отдаёт
+     * такому сокету, а L2 теперь разбираем сами (см. dns_sniff_poll). */
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd < 0)
         return -1;
     memset(&sll, 0, sizeof(sll));
     sll.sll_family = AF_PACKET;
-    sll.sll_protocol = htons(ETH_P_IP);
+    sll.sll_protocol = htons(ETH_P_ALL);
     sll.sll_ifindex = (int)idx;
     if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) != 0) {
         slogf(SL_WARN, "dns_sniff: не привязаться к %s — пропускаю", name);
@@ -425,16 +429,30 @@ void dns_sniff_poll(void)
                 }
                 break;
             }
-            if (r < 20)
+            if (r < 42)   /* eth(14) + ip(20) + udp(8) */
                 continue;
             g_c_read++;
-            ihl = (unsigned)(buf[0] & 0x0f) * 4;
-            if (ihl < 20 || (ssize_t)ihl + 8 > r || buf[9] != 17)
-                continue;
             {
-                const uint8_t *udp = buf + ihl;
-                uint16_t sp = (uint16_t)((udp[0] << 8) | udp[1]);
-                uint16_t dp = (uint16_t)((udp[2] << 8) | udp[3]);
+                const uint8_t *ip, *udp;
+                unsigned l2 = 14, etype;
+                uint16_t sp, dp;
+                etype = (unsigned)((buf[12] << 8) | buf[13]);
+                /* 802.1Q/802.1ad: LAN-порты этой коробки — VLAN-сабы (eth2.1,
+                 * ra7.1), так что ethertype может лежать не по смещению 12. */
+                while ((etype == 0x8100 || etype == 0x88a8) &&
+                       (ssize_t)(l2 + 4) <= r) {
+                    etype = (unsigned)((buf[l2 + 2] << 8) | buf[l2 + 3]);
+                    l2 += 4;
+                }
+                if (etype != 0x0800 || r - (ssize_t)l2 < 28)
+                    continue;       /* не IPv4, или не хватает на IP+UDP */
+                ip = buf + l2;
+                ihl = (unsigned)(ip[0] & 0x0f) * 4;
+                if (ihl < 20 || (ssize_t)(l2 + ihl + 8) > r || ip[9] != 17)
+                    continue;
+                udp = ip + ihl;
+                sp = (uint16_t)((udp[0] << 8) | udp[1]);
+                dp = (uint16_t)((udp[2] << 8) | udp[3]);
                 if (sp != 53 && dp != 53)
                     continue;
                 g_c_udp53++;
@@ -444,7 +462,8 @@ void dns_sniff_poll(void)
                      * ответ, счётчики RR и не съехал ли заголовок. До
                      * фильтров, чтобы увидеть и отбракованные пакеты. */
                     char hx[3 * 32 + 1];
-                    int k, m = (int)ulen - 8, avail = (int)(r - (ssize_t)ihl) - 8;
+                    int k, m = (int)ulen - 8;
+                    int avail = (int)(r - (ssize_t)l2 - (ssize_t)ihl) - 8;
                     g_dumped = 1;
                     if (m > avail)
                         m = avail;
@@ -459,10 +478,11 @@ void dns_sniff_poll(void)
                         strncat(hx, b, sizeof(hx) - strlen(hx) - 1);
                     }
                     slogf(SL_DEBUG,
-                          "dns_sniff: udp53 if=%u ulen=%u r=%zd ihl=%u %s",
-                          (unsigned)sll.sll_ifindex, ulen, r, ihl, hx);
+                          "dns_sniff: udp53 if=%u ulen=%u r=%zd l2=%u ihl=%u %s",
+                          (unsigned)sll.sll_ifindex, ulen, r, l2, ihl, hx);
                 }
-                if (ulen < 8 || ihl + ulen > (unsigned)r) {
+                if (ulen < 8 ||
+                    ihl + ulen > (unsigned)(r - (ssize_t)l2)) {
                     g_c_bad++;
                     continue;
                 }
