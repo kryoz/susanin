@@ -90,8 +90,17 @@ int main(void)
         state_key(k2, sizeof(k2), "192.0.2.1", 0);
         state_add(&e.cooldown_tcp, k2, now - 100, 10, 0);
         CHECK(e.cooldown_tcp.n == 2, "две записи добавлены");
-        state_expire(&e.cooldown_tcp, now);
+        CHECK(state_expire(&e.cooldown_tcp, now) == 2,
+              "GC возвращает число удалённых — это вердикт «проба истекла»");
         CHECK(e.cooldown_tcp.n == 0, "GC удалил и пару, и обычную запись");
+        /* Смешанный набор (двиок считает по нему TEST-TIMEOUT): удалёнными
+         * должны считаться только протухшие. */
+        state_add(&e.test_tcp, "192.0.2.10", now, 60, 0);
+        state_add(&e.test_tcp, "192.0.2.11", now - 100, 10, 0);
+        state_add(&e.test_tcp, "192.0.2.12", now - 1, 1, 0);
+        CHECK(state_expire(&e.test_tcp, now) == 2, "из трёх удалены ровно протухшие");
+        CHECK(state_has(&e.test_tcp, "192.0.2.10", now) == 1, "живая запись осталась");
+        CHECK(state_expire(&e.test_tcp, now) == 0, "повторный GC считает ноль");
         state_free(&e);
     }
 

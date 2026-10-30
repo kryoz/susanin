@@ -854,6 +854,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     dns_sniff_set_state(&st);   /* пины dns_sniff переживают re-provision/рестарт */
     ctx.cfg = cfg;
     ctx.st = &st;
+    ctx.tunnel_down_at = 0;
     memset(&L, 0, sizeof(L));
 
     {
@@ -1080,6 +1081,8 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                     all_down_since = now;
                 if (tunnel_up) {
                     tunnel_up = 0;
+                    /* Окно для снятия грязных меток автообучения (clr_judge). */
+                    ctx.tunnel_down_at = now;
                     slogf(SL_ERROR, "all egress DOWN, fail-open DIRECT");
                     backend_ipset_flush(cfg);
                     /* Помеченные потоки (MARK_OK) иначе продолжат идти в мёртвый
@@ -1224,16 +1227,23 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         }
 
         if (now - last_trim >= 30) {
-            int udp;
+            int udp, tmo[2] = { 0, 0 };
             last_trim = now;
             trim_ok(cfg, &st);
             /* Протухшие записи не должны копиться: state_expire() не вызывался. */
             for (udp = 0; udp < 2; udp++) {
-                state_expire(st_test(&st, udp), now);
+                /* Test-запись, истёкшая без CONFIRMED и без COOLDOWN, — третий
+                 * класс исхода пробы («ни подтвердили, ни отклонили»). Раньше он
+                 * молча терялся: по логу было видно меньше половины промоушенов,
+                 * и любая оценка точности автообучения смещена. */
+                tmo[udp] = state_expire(st_test(&st, udp), now);
                 state_expire(st_ok(&st, udp), now);
                 state_expire(st_watch(&st, udp), now);
                 state_expire(st_cool(&st, udp), now);
             }
+            if (tmo[0] || tmo[1])
+                slogf(SL_INFO, "AUTO-SUSANIN: TEST-TIMEOUT tcp=%d udp=%d",
+                      tmo[0], tmo[1]);
             state_expire(&st.net, now);
             state_expire(&st.direct, now);
             /* Пины DNS-снифинга в «никогда»: чистим по TTL и держим лимит,

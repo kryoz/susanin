@@ -9,11 +9,21 @@
 typedef struct {
     const susanin_config *cfg;
     susanin_state *st;
+    /* Когда туннель в последний раз падал (0 = не падал с запуска). Вердикт
+     * judge, взятый в окне test_ttl после падения, не отличает «адрес не
+     * блокируется» от «туннель умер во время пробы» — такая метка помечается
+     * weak и в обучение не попадает. */
+    time_t tunnel_down_at;
 } classifier_ctx;
 
 void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now);
 void clr_soft(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now);
 void clr_judge(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now);
+
+/* Строка признаков промоушена/отказа для датасета (см. classifier.c). Вызывается
+ * только при включённом трассировщике; вынесена в экспорт ради теста. */
+void clf_trace_line(char *dst, size_t n, const ct_flow *f, const char *stage,
+                    const char *reason, const char *domain);
 
 /* Чистые фильтры обучения (без форков) — нужны движку в sweep_direct(). */
 int clf_service_port(unsigned port);

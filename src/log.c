@@ -29,7 +29,7 @@ void slogf(int lvl, const char *fmt, ...)
 {
     va_list ap;
     const char *tag;
-    char ts[16];
+    char ts[24];
     time_t now;
     struct tm tmv;
     if (!slog_enabled(lvl))
@@ -40,7 +40,10 @@ void slogf(int lvl, const char *fmt, ...)
     else tag = "DBG";
     now = time(NULL);
     localtime_r(&now, &tmv);
-    strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+    /* Дата обязательна: без неё строки за несколько суток нерасшифровываемы —
+     * по логу собираётся датасет автообучения (события промоушена и вердикты
+     * разъезжаются по дням). */
+    strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
     fprintf(stdout, "%s %s: ", ts, tag);
     va_start(ap, fmt);
     vfprintf(stdout, fmt, ap);

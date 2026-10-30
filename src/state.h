@@ -25,7 +25,10 @@ typedef struct {
 
 void state_init(susanin_state *s);
 void state_free(susanin_state *s);
-void state_expire(state_set *st, time_t now);
+/* Убирает протухшие записи; возвращает сколько. Для test-набора это вердикт
+ * «проба истекла без подтверждения и без кулдауна» — третий класс исхода
+ * автообучения, раньше он молча терялся. */
+int state_expire(state_set *st, time_t now);
 int state_has(const state_set *st, const char *addr, time_t now);
 int state_add(state_set *st, const char *addr, time_t now, int ttl, int refresh);
 /* Создать запись или продлить существующую (см. пояснение в state.c). */

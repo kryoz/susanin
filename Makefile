@@ -13,7 +13,7 @@ SRCS = src/main.c src/config.c src/discover.c src/conntrack.c src/state.c \
 OBJS = $(SRCS:.c=.o)
 
 TARGET = susanin-agent
-TESTS = tests/test_conntrack tests/test_config tests/test_ops tests/test_web_list tests/test_web_choices tests/test_state tests/test_backend_value tests/test_backend_lock tests/test_classifier_key tests/test_classifier_media tests/test_web_token tests/test_release
+TESTS = tests/test_conntrack tests/test_config tests/test_ops tests/test_web_list tests/test_web_choices tests/test_state tests/test_backend_value tests/test_backend_lock tests/test_classifier_key tests/test_classifier_media tests/test_trace_line tests/test_web_token tests/test_release
 SAMPLES = testdata/nf_conntrack.samples
 # Объекты для тестов, которые включают .c-файл в свой TU (тогда его .o линковать нельзя).
 TEST_OBJS = $(filter-out src/main.o,$(OBJS))
@@ -43,6 +43,7 @@ test: $(TESTS)
 	./tests/test_backend_lock
 	./tests/test_classifier_key
 	./tests/test_classifier_media
+	./tests/test_trace_line
 	./tests/test_web_token
 	./tests/test_release
 	sh tests/test-egress-failover.sh
@@ -71,6 +72,11 @@ tests/test_classifier_key: tests/test_classifier_key.c src/classifier.c $(TEST_O
 # media_port / ip_in_cidr) — .o классификатора исключаем, как выше.
 tests/test_classifier_media: tests/test_classifier_media.c src/classifier.c src/classifier.h $(TEST_OBJS)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_classifier_media.c $(filter-out src/classifier.o,$(TEST_OBJS))
+
+# test_trace_line тоже включает src/classifier.c (static trace_domain) и линкует
+# dns_sniff.o: clf_trace_line вызывает его только из вызывающего кода.
+tests/test_trace_line: tests/test_trace_line.c src/classifier.c src/classifier.h $(TEST_OBJS)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_trace_line.c $(filter-out src/classifier.o,$(TEST_OBJS))
 
 tests/test_conntrack: tests/test_conntrack.c src/conntrack.c src/conntrack.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_conntrack.c src/conntrack.c

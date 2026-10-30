@@ -4,6 +4,7 @@
 #include "cdn.h"
 #include "health.h"
 #include "profiles.h"
+#include "dns_sniff.h"
 #include "vpn_never.h"
 #include "log.h"
 
@@ -14,6 +15,79 @@
 #include <string.h>
 
 static int is_udp(const ct_flow *f) { return f->l4proto == 17; }
+
+/* ─── Сбор датасета автообучения (этап 0) ──────────────────────────────────
+ * Правила ниже решают «заворачивать или нет», но по логу были видны только
+ * принятые решения (96 % подтверждений, ложная негативная не видна вовсе).
+ * Здесь — строка признаков в момент решения и счётчики отказанных промоушенов;
+ * третий класс исхода («test протух без вердикта») считает engine.c. */
+
+/* Домен приходит из DNS-ответа, то есть из сети: в лог пишется только
+ * разрешённый набор символов, иначе чужой ответ подмешает в строку перевода
+ * строки или управляющую последовательность. */
+static void trace_domain(char *dst, size_t n, const char *src)
+{
+    size_t i = 0;
+    if (!n)
+        return;
+    dst[0] = '\0';
+    if (!src)
+        return;
+    while (src[i] && i + 1 < n) {
+        char c = src[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_'))
+            c = '?';
+        dst[i] = c;
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+/* Строка признаков одного промоушена. Функция чистая — чтобы её можно было
+ * проверить тестом; источник домена (dns_sniff) остаётся у вызывающего. */
+void clf_trace_line(char *dst, size_t n, const ct_flow *f, const char *stage,
+                    const char *reason, const char *domain)
+{
+    char dom[128];
+    trace_domain(dom, sizeof(dom), domain);
+    snprintf(dst, n,
+             "TRC sig=%s/%s pr=%s st=%s dp=%u sp=%u op=%lu ob=%lu rp=%lu "
+             "rb=%lu hr=%d fn=%d dom=%s",
+             stage, reason, f->proto, f->tcp_state, f->dport, f->sport,
+             f->op, f->ob, f->rp, f->rb, f->has_reply, f->fastnat,
+             dom[0] ? dom : "-");
+}
+
+/* Отказ промоушена — единственный доступный сурогат ложной негативной: поток
+ * похож на блокировку, а мы сами его не завернули (негативный кэш прямой пробы,
+ * лимит проб, vpn_never). Считаются СОБЫТИЯ, а не адреса (горячий адрес
+ * отказывается каждый проход): адреса дедуплицируются по TRC-строкам. Лимит
+ * promo_per_min и лимит «не более 2 в секунду» не считаем — это повтор, а не
+ * отказ: кандидат останется в conntrack и будет взят в следующий проход. */
+enum { NM_NEVER, NM_RECENT, NM_DOK, NM_DIRECT, NM_BUDGET, NM_GIVEUP, NM_N };
+static unsigned long nm_cnt[NM_N];
+static time_t nm_last = 0;
+
+/* Сводка раз в 5 минут (как OK-CHURN): на каждый отказ строка раздула бы лог
+ * на мегабайты. Пишется и при отсутствии новых отказов, иначе последний слот
+ * окна теряется. */
+static void nm_summary(time_t now)
+{
+    if (!nm_last) {
+        nm_last = now;
+        return;
+    }
+    if (now - nm_last < 300)
+        return;
+    slogf(SL_INFO,
+          "AUTO-SUSANIN: NEAR-MISS: never=%lu recent=%lu dok=%lu direct=%lu "
+          "budget=%lu giveup=%lu", nm_cnt[NM_NEVER], nm_cnt[NM_RECENT],
+          nm_cnt[NM_DOK], nm_cnt[NM_DIRECT], nm_cnt[NM_BUDGET],
+          nm_cnt[NM_GIVEUP]);
+    memset(nm_cnt, 0, sizeof(nm_cnt));
+    nm_last = now;
+}
 
 /* Порты из learn_exclude_ports не участвуют в автообучении (типовой скан-шум
  * на 22/23/445/554 и т.п.): такие потоки пропускаем целиком. */
@@ -631,6 +705,22 @@ static const char *pair_key(char *buf, size_t n, const susanin_config *cfg,
     return buf;
 }
 
+/* Строка признаков отказанного кандидата: тот же вектор, что у промоушена,
+ * только с ref=<причина>. Это контрфактический срез («на блокировку похоже, а
+ * мы отказались») — именно на нём измеряется recall. Только под SL_TRACE:
+ * счётчики ниже дают меру и без включённого трассировщика. */
+static void trace_refused(const ct_flow *f, const char *stage,
+                          const char *reason, const char *cause)
+{
+    char dom[128], tr[320];
+    if (!slog_enabled(SL_TRACE))
+        return;
+    dom[0] = '\0';
+    dns_sniff_domain_of(f->dst, dom, sizeof(dom));
+    clf_trace_line(tr, sizeof(tr), f, stage, reason, dom);
+    slogf(SL_TRACE, "%s ref=%s", tr, cause);
+}
+
 static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
                          const char *stage, const char *reason)
 {
@@ -643,12 +733,16 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
      * vn_refresh/ipset и наш state расходятся, и sweep_direct рвёт его потоки).
      * Учитываем и список vpn_never, и пины DNS-снифинга (st.never). */
     if (vn_has(f->dst) || state_has(&ctx->st->never, f->dst, now)) {
+        nm_cnt[NM_NEVER]++;
+        trace_refused(f, stage, reason, "never");
         slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (vpn_never)", f->dst, f->dport);
         return;
     }
     /* Не учим в VPN адрес, недавно бывший в vpn_never: он должен идти напрямую,
      * иначе возможен «прыжок» direct <-> VPN (план п.8.3). */
     if (vn_is_recently_never(f->dst, now)) {
+        nm_cnt[NM_RECENT]++;
+        trace_refused(f, stage, reason, "recent");
         slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (recently vpn_never)",
               f->dst, f->dport);
         return;
@@ -661,6 +755,8 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
      * запрещать обучение по сигналам SNI (DPI-RST/CLOSE). */
     if (f->l4proto == 6 && f->dport > 0 && syn) {
         if (dok_has(f->dst, now)) {
+            nm_cnt[NM_DOK]++;
+            trace_refused(f, stage, reason, "dok");
             slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (недавно проверено: прямой жив)",
                   f->dst, f->dport);
             return;
@@ -669,6 +765,8 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
             /* Бюджет проб исчерпан: осознанно НЕ заворачиваем (короткая отметка),
              * иначе защита отключалась бы ровно под нагрузкой. */
             dok_add(f->dst, now, DOK_TTL_BUDGET);
+            nm_cnt[NM_BUDGET]++;
+            trace_refused(f, stage, reason, "budget");
             slogf(SL_DEBUG, "AUTO-SUSANIN: %s skip %s:%u (бюджет проб исчерпан)",
                   stage, f->dst, f->dport);
             return;
@@ -676,7 +774,11 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
         if (!direct_probe_sec_ok(now))
             return;   /* лимит на секунду: решим в следующий проход, не заворачиваем */
         if (health_probe_tcp_direct(f->dst, f->dport, DIRECT_PROBE_MS)) {
+            /* Отказ по «прямой жив» — самый дешёвый пропуск блокировки: TCP
+             * рукопожатие проходит и при DPI-блокировке по SNI. */
             dok_add(f->dst, now, DOK_TTL_OK);
+            nm_cnt[NM_DIRECT]++;
+            trace_refused(f, stage, reason, "direct");
             slogf(SL_INFO, "AUTO-SUSANIN: %s skip %s:%u (прямой путь отвечает)",
                   stage, f->dst, f->dport);
             return;
@@ -692,6 +794,16 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
     state_remove(st_watch(ctx->st, udp), kf);
     backend_ipset_add_port(cfg, udp, 0, f->dst, flow_port(cfg, f), cfg->test_ttl);
     slogf(SL_INFO, "AUTO-SUSANIN: %s %s %s:%u", stage, reason, f->dst, f->dport);
+    /* Вектор признаков решения: без него в датасете есть только вердикт.
+     * Lookup домена — проход по таблице dns_sniff, поэтому только под
+     * включённым трассировщиком. */
+    if (slog_enabled(SL_TRACE)) {
+        char dom[128], tr[320];
+        dom[0] = '\0';
+        dns_sniff_domain_of(f->dst, dom, sizeof(dom));
+        clf_trace_line(tr, sizeof(tr), f, stage, reason, dom);
+        slogf(SL_TRACE, "%s ref=-", tr);
+    }
     backend_ct_delete(f);
 }
 
@@ -716,7 +828,22 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
         if (!from_lan(cfg, f->src)) continue;
         if (is_private_dst(f->dst, NULL)) continue;
         if (port_excluded(cfg, f->dport) || port_excluded(cfg, f->sport)) continue;
-        if (!candidate_ok(ctx, f, now)) continue;
+        if (!candidate_ok(ctx, f, now)) {
+            /* Near-miss «сдались, а трафик так и не пошёл»: SYN без ответа по
+             * адресу, уже сидящему в cooldown, — туннель пробовали и отступились.
+             * Единственная в коде метка «пользователю всё ещё не работает»: без
+             * неё ложная негативная вообще не наблюдается. */
+            if (f->l4proto == 6 && strcmp(f->tcp_state, "SYN_SENT") == 0 &&
+                f->op >= (unsigned long)cfg->fast_syn_min_op && f->rp == 0) {
+                char gk[64];
+                pair_key(gk, sizeof(gk), cfg, f);
+                if (state_has(st_cool(ctx->st, is_udp(f)), gk, now)) {
+                    nm_cnt[NM_GIVEUP]++;
+                    trace_refused(f, "FAST", "TCP-SYN", "giveup");
+                }
+            }
+            continue;
+        }
 
         if (f->l4proto == 6) {
             if (strcmp(f->tcp_state, "SYN_SENT") == 0 && f->op >= (unsigned long)cfg->fast_syn_min_op && f->rp == 0)
@@ -743,6 +870,7 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                 promote_test(ctx, f, now, "FAST", "QUIC");
         }
     }
+    nm_summary(now);
 }
 
 void clr_soft(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
@@ -841,7 +969,13 @@ void clr_soft(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
 void clr_judge(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
 {
     const susanin_config *cfg = ctx->cfg;
+    const char *lbl;
     int i;
+    /* Вердикт в окне test_ttl после падения туннеля не отличает «адрес не
+     * блокируется» от «туннель умер во время пробы». Такую метку помечаем weak —
+     * иначе по ней выучится «все адреса в момент деградации не блокируются». */
+    lbl = (ctx->tunnel_down_at &&
+           (int)(now - ctx->tunnel_down_at) <= cfg->test_ttl) ? "weak" : "clean";
     for (i = 0; i < n; i++) {
         const ct_flow *f = &flows[i];
         int udp;
@@ -900,7 +1034,8 @@ void clr_judge(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                 state_remove(st_cool(ctx->st, udp), kf);
                 backend_ipset_add_port(cfg, udp, 1, f->dst, flow_port(cfg, f), cfg->ok_ttl);
                 backend_ipset_del_port(cfg, udp, 0, f->dst, flow_port(cfg, f));
-                slogf(SL_INFO, "AUTO-SUSANIN: CONFIRMED %s:%u", f->dst, f->dport);
+                slogf(SL_INFO, "AUTO-SUSANIN: CONFIRMED %s:%u label=%s",
+                      f->dst, f->dport, lbl);
                 cdn_aggregate(ctx, f);
                 profile_auto_learn(ctx->cfg, f->dst);
             } else if (failed) {
@@ -908,7 +1043,8 @@ void clr_judge(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                 state_remove(st_watch(ctx->st, udp), kf);
                 state_add(st_cool(ctx->st, udp), kf, now, cfg->cooldown_ttl, 0);
                 backend_ipset_del_port(cfg, udp, 0, f->dst, flow_port(cfg, f));
-                slogf(SL_INFO, "AUTO-SUSANIN: COOLDOWN %s:%u", f->dst, f->dport);
+                slogf(SL_INFO, "AUTO-SUSANIN: COOLDOWN %s:%u label=%s",
+                      f->dst, f->dport, lbl);
                 backend_ct_delete(f);
             }
         } else if ((f->ctmark & cfg->mark_mask) == cfg->mark_ok) {

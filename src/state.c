@@ -91,14 +91,16 @@ void state_key_split(const char *key, char *ip, size_t ipn, int *port)
     snprintf(ip, ipn, "%s", key);
 }
 
-void state_expire(state_set *st, time_t now)
+int state_expire(state_set *st, time_t now)
 {
-    int i, w = 0;
+    int i, w = 0, dropped;
     for (i = 0; i < st->n; i++) {
         if (st->v[i].expire > now)
             st->v[w++] = st->v[i];
     }
+    dropped = st->n - w;
     st->n = w;
+    return dropped;
 }
 
 int state_has(const state_set *st, const char *addr, time_t now)
