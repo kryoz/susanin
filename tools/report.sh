@@ -3,7 +3,7 @@
 #
 # Usage:
 #   sh /opt/susanin/tools/report.sh [--out FILE]
-#   wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/tools/report.sh | sh
+#   wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/tools/report.sh | sh
 #
 # Prints the report and saves it to /opt/susanin/var/report.txt (override with --out).
 # Run it while the problem is reproducible. The report contains IP addresses.

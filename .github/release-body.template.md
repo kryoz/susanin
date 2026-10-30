@@ -3,7 +3,7 @@ Susanin.Keenetic {{TAG}}
 ### Установка (первый раз)
 ```sh
 opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh
 ```
 Установщик скачивает готовый архив под вашу архитектуру, определяет LAN/VPN и
 (при наличии) OpenConnect, запрашивает подтверждение и запускает демон.
@@ -15,15 +15,15 @@ wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.s
 установщику скачать пакет под вашу архитектуру и сверить SHA256:
 ```sh
 opkg update && opkg install ca-certificates wget-ssl
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 ```
 Вручную: в Assets лежат пакеты `susanin-keenetic_{{VER}}_<arch>.ipk` и общий
 `SHA256SUMS`. Свою архитектуру показывает `opkg print-architecture`
 (например, `mipsel-3.4`). Скачать, сверить сумму и поставить:
 ```sh
 cd /opt/tmp
-wget https://github.com/R17a/Susanin.Keenetic/releases/download/{{TAG}}/susanin-keenetic_{{VER}}_mipsel-3.4.ipk
-wget https://github.com/R17a/Susanin.Keenetic/releases/download/{{TAG}}/SHA256SUMS
+wget https://github.com/kryoz/susanin/releases/download/{{TAG}}/susanin-keenetic_{{VER}}_mipsel-3.4.ipk
+wget https://github.com/kryoz/susanin/releases/download/{{TAG}}/SHA256SUMS
 sha256sum -c SHA256SUMS 2>/dev/null | grep mipsel-3.4   # ожидаем: ...: OK
 opkg install susanin-keenetic_{{VER}}_mipsel-3.4.ipk
 ```
@@ -66,7 +66,7 @@ sh /opt/susanin/tools/diagnose.sh
 ```sh
 sh /opt/susanin/tools/report.sh
 # или без установки:
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/{{TAG}}/tools/report.sh | sh
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/{{TAG}}/tools/report.sh | sh
 ```
 Отчёт сохраняется в `/opt/susanin/var/report.txt`.
 

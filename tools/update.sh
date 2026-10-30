@@ -7,7 +7,7 @@ set -eu
 
 # Репозиторий-источник релизов: у форков/зеркал свои релизы, поэтому он
 # переопределяется SUSANIN_REPO. Без переопределения поведение не меняется.
-REPO="${SUSANIN_REPO:-R17a/Susanin.Keenetic}"
+REPO="${SUSANIN_REPO:-kryoz/susanin}"
 PREFIX=/opt/susanin
 ARCH=""
 VERSION="latest"

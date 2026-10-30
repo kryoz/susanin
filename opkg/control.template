@@ -5,7 +5,7 @@ Section: net
 Architecture: {{ARCH}}
 Installed-Size: {{SIZE}}
 Maintainer: R17a <https://github.com/R17a/Susanin.Keenetic>
-Source: https://github.com/R17a/Susanin.Keenetic
+Source: https://github.com/kryoz/susanin
 Description: Адаптивная маршрутизация через VPN для Keenetic (Entware)
  Автоматически находит заблокированные направления по поведению соединений
  (conntrack) и уводит их в VPN-туннель, при падении туннеля — fail-open DIRECT.

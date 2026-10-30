@@ -1,10 +1,10 @@
 #!/bin/sh
 # Susanin.Keenetic installer.
 # Online (default): downloads the per-arch archive from GitHub Releases.
-#   curl -fsSL https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
 #     | sh -s -- [--arch mipsel] [--version vX.Y.Z] [--yes]
 # Пакетом Entware (.ipk) из релиза, с автоопределением архитектуры:
-#   curl -fsSL https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
 #     | sh -s -- --ipk [--version vX.Y.Z] [--yes]
 # Offline/local: run from an extracted archive (susanin-agent is next to this script):
 #   sh install.sh [--yes]
@@ -14,10 +14,10 @@ set -eu
 
 # Репозиторий-источник релизов: у форков/зеркал свои релизы, поэтому он
 # переопределяется SUSANIN_REPO. Без переопределения поведение не меняется.
-REPO="${SUSANIN_REPO:-R17a/Susanin.Keenetic}"
-# Ветка, откуда берётся Xray (xray/). Обычно main; переопределяется
-# SUSANIN_BRANCH для своих форков/зеркал.
-BRANCH="${SUSANIN_BRANCH:-main}"
+REPO="${SUSANIN_REPO:-kryoz/susanin}"
+# Ветка, откуда берётся Xray (xray/): Keenetic-мейнлайн этого форка.
+# Переопределяется SUSANIN_BRANCH для своих зеркал.
+BRANCH="${SUSANIN_BRANCH:-fix/oc-connector-egress}"
 PREFIX=/opt/susanin
 INITD=/opt/etc/init.d
 ARCH=""

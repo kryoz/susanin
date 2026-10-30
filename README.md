@@ -6,51 +6,20 @@
 авторами упомянутых сторонних проектов. Используйте на свой страх и риск —
 сделайте резервную копию конфигурации роутера.
 
-## Зачем этот порт
+## Зачем этот форк
 
-Расчёт сделан на владельца Keenetic с Entware: туннель поднимает Keenetic, а Susanin
-разбирается, какие направления не работают из-за блокировок. Перенести оригинальный
-Susanin (MikroTik RouterOS) «как есть» на KeeneticOS нельзя — датаплейн и часть
-логики переписаны под реалии этой прошивки:
+Основное и оригинальное решение позаимствовано из [R17a/Susanin.Keenetic](https://github.com/R17a/Susanin.Keenetic). Если у вас он работает - значит вам мой форк не нужен.
+Данное решение рассчитано на владельца Keenetic с Entware, у которого egress коннектор - **OpenConnect**, поддержки которого в апстриме нет.
 
-- **nftables на этом ядре нет** (4.9-ndm-5) — правила строятся на `iptables`
-  (legacy) + `ipset`, поэтому нужны свои цепочка `SUSANIN`, таблицы и наборы, а не
-  выгрузка правил одним списком;
-- **правила на Keenetic живут недолго**: NDM перекладывает `ip rule`, маршруты и
-  цепочки после изменений в веб-интерфейсе, после ребута и при пере-резолве
-  «маршрутизации по доменам» (`object-group fqdn`). Агент сверяет датаплейн каждые
-  5 с и восстанавливает его сам (`reconcile`) — разово выставленные правила на
-  Keenetic обязательно бы разъехались;
-- **туннель — зона ответственности Keenetic**: «Другие подключения» →
-  WireGuard/AmneziaWG (`nwg*`), OpenConnect-коннектор (`nocliN`), OpenVPN (`ovpn*`)
-  или отдельный Xray (`egress_type=tproxy`). Сам Susanin VPN-клиентом не является и
-  адрес туннеля не запрашивает;
-- **политика Keenetic — `filter/FORWARD` DROP**, а SNAT (MASQUERADE) и клампинг MSS
-  делает сама прошивка: поэтому агент добавляет ACCEPT по своей метке и не лезет в
-  NAT, а `mark_mask` оставляет в покое чужие биты (метки NDM и qWDTT);
-- **всё только в Entware**: `busybox ash`, `iptables` 1.4.21 (знает только голый
-  `-w`), busybox-`ip` (потому номер таблицы маленький), статические бинарники под
-  5 архитектур, только IPv4.
+## Что делает Susanin?
 
-## Только Keenetic/Entware
-
-> Этот репозиторий — порт Susanin на роутеры Keenetic
-> (KeeneticOS + Entware), и вся документация ниже — только про них. Для **других
-> платформ** предназначен оригинальный проект:
-> **[Fiark/susanin](https://github.com/Fiark/susanin)** — адаптивная
-> VPN-маршрутизация для MikroTik RouterOS.
-
-Адаптивная маршрутизация - программа смотрит, какие соединения «не работают» из-за
-блокировок, пробует их через VPN, запоминает рабочие и дальше держит их в VPN.
+Главная задача - адаптивная маршрутизация. Программа смотрит, какие соединения «не работают» из-за блокировок, пробирует их через VPN, запоминает рабочие и дальше держит их в VPN.
 Если VPN недоступен — всё идёт напрямую. Есть и простой список доменов, которые
 должны идти через VPN **всегда** (без ручных списков IP — только имена, как в
 Keenetic).
 
 > **Статус: релиз 0.4.1-oc** Проверено на Keenetic Viva (MT7621, MIPS) и Keenetic
-> Giga (KN-1012, aarch64), KeeneticOS 5.1.4–5.1.6, Entware; egress —
-> WireGuard/AmneziaWG (`nwg0`/`nwg1`), клиентский OpenConnect-коннектор Keenetic
-> (`nocliN`) и Xray VLESS+REALITY (`egress_type=tproxy`). Работает на старых
-> правилах iptables + ipset (nftables на этом ядре нет). Только IPv4.
+> Giga (KN-1012, aarch64), KeeneticOS 5.1.4–5.1.6, Entware; клиентский OpenConnect-коннектор Keenetic  (`nocliN`). Только IPv4.
 
 ## Требования
 
@@ -58,11 +27,8 @@ Keenetic).
 - пакеты Entware: `ipset`, `conntrack`, busybox, `iptables` (legacy);
   для скачивания релизов по HTTPS — `ca-certificates` + `wget-ssl` (у BusyBox
   `wget` нет HTTPS);
-- работающий VPN-туннель — «Другое подключение» в Keenetic: WireGuard/AmneziaWG
-  (`nwg*`) или клиентский OpenConnect-коннектор (`nocliN`); его интерфейс и будет
-  egress. Альтернатива — Xray/VLESS+REALITY (`egress_type=tproxy`, Xray ставится
-  отдельно);
-- LAN-интерфейсы (обычно `br0`, `br1`);
+- работающий VPN-туннель — «Другое подключение» в Keenetic: клиентский OpenConnect-коннектор (`nocliN`); его интерфейс и будет egress. 
+- LAN-интерфейсы (обычно `br0`);
 - в Keenetic **выключена «Маршрутизация DNS»** (доменные маршруты, которые
   уводят домены в туннель) — иначе Keenetic и Susanin.Keenetic мешают друг другу;
 
@@ -681,7 +647,7 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 # tar-архив + Xray:  sh -s -- --yes --with-xray
 ```
 По умолчанию берётся **последний релиз** (`--channel stable`), сейчас это
-`v0.4.0`; конкретную версию задаёт `--version v0.4.0`. dev-канал отключён —
+`v0.4.1-oc`; конкретную версию задаёт `--version v0.4.1-oc`. dev-канал отключён —
 тестовые архивы больше не публикуются.
 
 Флаги: `--channel stable|dev`, `--version`, `--file`, `--url`, `--check`,
@@ -704,10 +670,10 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 
 ```sh
 # пакетом (если ставили .ipk):
-opkg install /opt/tmp/susanin-keenetic_0.4.0_mipsel-3.4.ipk   # или opkg upgrade при включённом фиде
+opkg install /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk   # или opkg upgrade при включённом фиде
 
 # скриптом (tar-архив):
-sh /opt/susanin/tools/susanin.sh update 0.4.0    # или `susanin update 0.4.0`; latest = последний релиз
+sh /opt/susanin/tools/susanin.sh update 0.4.1-oc    # или `susanin update 0.4.1-oc`; latest = последний релиз
 ```
 
 > `susanin.sh update` сам определяет установленную версию и архитектуру, скачивает
@@ -747,7 +713,7 @@ sh /opt/susanin/tools/susanin.sh install    # datapath up + setup
 | Версия | `sh /opt/susanin/tools/susanin.sh version` (то же, что `susanin-agent version`) |
 | Снять правила | `sh /opt/susanin/tools/susanin.sh down` |
 | Убрать IP/домен из кэша | `sh /opt/susanin/tools/susanin.sh reset <ip|домен>` (синоним `forget`) |
-| Обновление | `sh /opt/susanin/tools/susanin.sh update 0.4.0` (или `latest`) |
+| Обновление | `sh /opt/susanin/tools/susanin.sh update 0.4.1-oc` (или `latest`) |
 | Удаление | `sh /opt/susanin/tools/susanin.sh uninstall [--purge]` |
 | Добавить IP в VPN вручную | `sh /opt/susanin/tools/susanin.sh add <ip> tcp test` |
 
