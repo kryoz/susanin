@@ -286,6 +286,30 @@ static void sniff_try_name(const char *name)
     sniff_bind(name);
 }
 
+/* NDM отдаёт DNS-ответ клиенту напрямую с порта моста: на самом br0 видны
+ * ТОЛЬКО запросы (замер KN-1012: udp53=109, из них query=109, ans=0). Без
+ * портов моста снифер никогда не видит ответ, и связь домен->IP не появляется
+ * вовсе — выглядит это как «dns_sniff работает, но dom= пустой». */
+static void sniff_bridge_ports(const char *name)
+{
+    char path[128];
+    DIR *d;
+    struct dirent *de;
+
+    if (strpbrk(name, "+*") != NULL)
+        return;                     /* шаблон: свой путь раскрытия */
+    snprintf(path, sizeof(path), "/sys/class/net/%s/brif", name);
+    d = opendir(path);
+    if (!d)
+        return;                     /* это не мост */
+    while ((de = readdir(d)) != NULL && g_nfd < DNS_MAX_IFACES) {
+        if (de->d_name[0] == '.' || sniff_is_open(de->d_name))
+            continue;
+        sniff_bind(de->d_name);
+    }
+    closedir(d);
+}
+
 /* Пройтись по списку интерфейсов из конфига и дооткрыть недостающие. */
 static void sniff_sync(const susanin_config *cfg)
 {
@@ -308,8 +332,10 @@ static void sniff_sync(const susanin_config *cfg)
                l < sizeof(name) - 1)
             name[l++] = *p++;
         name[l] = '\0';
-        if (name[0])
+        if (name[0]) {
             sniff_try_name(name);
+            sniff_bridge_ports(name);
+        }
     }
 }
 
