@@ -197,7 +197,10 @@ static int has_prefix(const char *name, const char *pfx)
 
 const char *choice_iface_kind(const char *name)
 {
-    static const char *tun[] = { "nwg", "wdtt", "wg", "tun", "ppp" };
+    /* «awg» — AmneziaWG (userspace amneziawg-go поднимает awg0/wg0): для панели
+     * это такой же тоннель, иначе он попадал в группу «Физические» и терялся
+     * среди eth/ra/lo. Ставим ДО «wg», чтобы правило читалось по порядку. */
+    static const char *tun[] = { "nwg", "wdtt", "awg", "wg", "tun", "ppp" };
     size_t i;
 
     if (!name || !name[0])

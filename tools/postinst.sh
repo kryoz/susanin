@@ -16,7 +16,8 @@
 # Переменные окружения (нужны install.sh, opkg их не задаёт):
 #   SUSANIN_PREFIX      — префикс вместо /opt/susanin (тесты, нестандартный Entware);
 #   SUSANIN_EGRESS/LAN/SUBNETS — значения, уже определённые установщиком;
-#   SUSANIN_DISK_MODE   — disk_mode, посчитанный установщиком.
+#   SUSANIN_DISK_MODE   — disk_mode, посчитанный установщиком;
+#   SUSANIN_KEEP_LISTS  — 1 (--keep-lists): существующие списки не трогаем вовсе.
 set -u
 
 PREFIX="${SUSANIN_PREFIX:-/opt/susanin}"
@@ -319,6 +320,10 @@ merge_list() { # merge_list <файл пользователя> <файл пак
 		rm -f "$_tmp"
 	 fi
 }
+# --keep-lists (установщик): существующие списки не трогаем вовсе, merge не делаем.
+if [ "${SUSANIN_KEEP_LISTS:-0}" = 1 ]; then
+	say "--keep-lists: списки vpn_always/vpn_never не трогаем"
+fi
 for _l in vpn_always vpn_never; do
 	if [ ! -f "$PREFIX/etc/$_l.txt" ]; then
 		if [ -f "$SHARE/$_l.txt" ]; then
@@ -328,6 +333,7 @@ for _l in vpn_always vpn_never; do
 			: >"$PREFIX/etc/$_l.txt"
 		fi
 	fi
+	[ "${SUSANIN_KEEP_LISTS:-0}" = 1 ] && continue
 	merge_list "$PREFIX/etc/$_l.txt" "$SHARE/$_l.txt" "$_l"
 done
 rm -f "$PREFIX/etc/vpn_always.txt".merge.* "$PREFIX/etc/vpn_never.txt".merge.* 2>/dev/null || true

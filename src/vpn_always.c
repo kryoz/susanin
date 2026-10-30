@@ -20,7 +20,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VA_MAXDOM 256
+/* Сколько строк файла vpn_always.txt вообще учитывается. Было 256 — и всё,
+ * что ниже лимита, тихо игнорировалось: список из 265 записей работал как
+ * список из 256, а хвост (медиа Telegram, CDN-диапазоны X/Fastly) не пиннился
+ * вообще и молча уходил напрямую. 512 записей — это +~200 КБ кучи при старте
+ * (va_dom ≈ 800 байт), на роутере с 128 МБ RAM это приемлемо. */
+#define VA_MAXDOM 512
 #define VA_MAXIP  32
 #define VA_TRACK  4096
 #define VA_LINE   320
@@ -169,8 +174,23 @@ static int file_load(const char *path, char names[][256], int wilds[],
         lower_str((char *)p);
         if (!valid_name(p, buf, sizeof(buf)))
             continue;
-        if (n >= maxnames)
+        if (n >= maxnames) {
+            /* Раньше здесь был просто break: список молча обрезался, и записи из
+             * хвоста файла не пиннились никогда — со стороны это выглядело как
+             * «домен в списке есть, а трафик всё равно идёт напрямую». */
+            int skipped = 0;
+            while (fgets(line, sizeof(line), fp)) {
+                trim_line(line);
+                if (line[0] == '\0' || line[0] == '#')
+                    continue;
+                skipped++;
+            }
+            slogf(SL_WARN,
+                  "vpn_always: список обрезан — учтено %d записей, ещё %d "
+                  "проигнорировано (лимит VA_MAXDOM); важные записи держите "
+                  "в начале файла", n, skipped);
             break;
+        }
         for (i = 0; i < n; i++)
             if (strcmp(names[i], buf) == 0 && wilds[i] == wild)
                 break;
@@ -201,8 +221,12 @@ static va_dom *dom_find(vpn_always *v, const char *name)
  * удалённые выкидываются вместе с их IP. */
 static void doms_reconcile(vpn_always *v, char names[][256], int wilds[], int n)
 {
-    va_dom keep[VA_MAXDOM];
+    /* VA_MAXDOM × sizeof(va_dom) = 400 КБ при лимите 512 — держим в куче, а не
+     * на стеке: на роутере с 128 МБ RAM такой стек ни к чему. */
+    va_dom *keep = calloc(VA_MAXDOM, sizeof(*keep));
     int nk = 0, i;
+    if (!keep)
+        return;                 /* нет памяти — оставляем список как был */
     for (i = 0; i < n && i < VA_MAXDOM; i++) {
         va_dom *old = dom_find(v, names[i]);
         va_dom *d = &keep[nk++];
@@ -223,6 +247,7 @@ static void doms_reconcile(vpn_always *v, char names[][256], int wilds[], int n)
     }
     memcpy(v->dom, keep, (size_t)nk * sizeof(va_dom));
     v->nd = nk;
+    free(keep);
 }
 
 /* ---------------- DNS (A-запрос) ---------------- */
@@ -770,8 +795,10 @@ static int resolve_dom(const char *server, va_dom *d, int timeout)
 
 int va_refresh(vpn_always *v, const susanin_config *cfg)
 {
-    char names[VA_MAXDOM][256];
-    int wilds[VA_MAXDOM] = { 0 };
+    /* Раньше это были массивы на стеке (VA_MAXDOM × 256 Б). При лимите 512 это
+     * 131 КБ постоянного стека + 400 КБ в doms_reconcile — на роутере с 128 МБ
+     * RAM лишний риск, поэтому буферы живут в куче и только на время чтения
+     * файла (см. блок ниже). */
     char server[64];
     struct stat st;
     time_t now = time(NULL);
@@ -824,9 +851,15 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
     v->warned = 0;
     if (!v->seen_mtime || v->seen_mtime != st.st_mtime ||
         v->seen_size != st.st_size) {
-        int nf = file_load(cfg->vpn_always_file, names, wilds, VA_MAXDOM);
-        if (nf >= 0)
-            doms_reconcile(v, names, wilds, nf);
+        char (*names)[256] = calloc(VA_MAXDOM, sizeof(*names));
+        int *wilds = calloc(VA_MAXDOM, sizeof(*wilds));
+        if (names && wilds) {
+            int nf = file_load(cfg->vpn_always_file, names, wilds, VA_MAXDOM);
+            if (nf >= 0)
+                doms_reconcile(v, names, wilds, nf);
+        }
+        free(names);
+        free(wilds);
         v->seen_mtime = st.st_mtime;
         v->seen_size = st.st_size;
         /* Файл изменился: снимаем устаревшие пины СРАЗУ (dirty обходит

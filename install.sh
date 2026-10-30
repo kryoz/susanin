@@ -31,6 +31,8 @@ EXCL_RE=$(printf '%s' "$DISCOVER_EXCLUDE" | tr ',' '|' | tr -d ' \t')
 YES=0
 FORCE=0
 NO_START=0
+# 1 = не трогать существующие vpn_always.txt/vpn_never.txt (флаг --keep-lists).
+KEEP_LISTS=0
 DISK_MODE=""
 DEPS=0
 XRAYTUN=0
@@ -212,6 +214,7 @@ while [ $# -gt 0 ]; do
 	--yes | -y) YES=1 ;;
 	--force) FORCE=1 ;;
 	--no-start) NO_START=1 ;;
+	--keep-lists | --no-lists) KEEP_LISTS=1 ;;
 	-h | --help)
 		echo "usage: $0 [--arch mipsel|mips|aarch64|armv7|x86_64] [--version latest|vX.Y.Z]"
 		echo "          [--ipk] [--egress IF] [--lan IF,IF] [--subnets CIDR,CIDR] [--prefix DIR]"
@@ -878,6 +881,7 @@ fi
 # перезапускает веб-панель после подмены бинаря).
 SUSANIN_PREFIX="$PREFIX" SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNETS="$_SS" \
 	SUSANIN_DISK_MODE="$DISK_MODE" SUSANIN_NO_START="$NO_START" \
+	SUSANIN_KEEP_LISTS="$KEEP_LISTS" \
 	sh "$PREFIX/tools/postinst.sh"
 say "installed to $PREFIX (run: sh $PREFIX/tools/susanin.sh status)"
 

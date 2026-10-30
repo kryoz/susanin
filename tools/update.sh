@@ -3,6 +3,7 @@
 # Списки vpn_always.txt / vpn_never.txt НЕ перезаписываются: существующие строки
 # сохраняются, новые строки из пакета ДОПОЛНЯЮТСЯ (идемпотентно).
 #   sh update.sh [--arch mipsel] [--version latest|vX.Y.Z] [--prefix /opt/susanin]
+#                 [--keep-lists]   # не дополнять vpn_always.txt/vpn_never.txt
 set -eu
 
 # Репозиторий-источник релизов: у форков/зеркал свои релизы, поэтому он
@@ -11,6 +12,8 @@ REPO="${SUSANIN_REPO:-kryoz/susanin}"
 PREFIX=/opt/susanin
 ARCH=""
 VERSION="latest"
+# 0 — дополнять списки из сборки (по умолчанию), 1 — не трогать vpn_always/vpn_never.
+KEEP_LISTS=0
 
 say() { echo "[susanin] $*"; }
 die() { echo "[susanin] ERROR: $*" >&2; exit 1; }
@@ -67,7 +70,9 @@ while [ $# -gt 0 ]; do
         v[0-9]*) VERSION="$1" ;;
         [0-9]*) VERSION="v$1" ;;
         --prefix) PREFIX="$2"; shift ;;
-        -h|--help) echo "usage: $0 [--arch ARCH] [--version latest|vX.Y.Z] [--prefix DIR]"; exit 0 ;;
+        --keep-lists|--no-lists) KEEP_LISTS=1 ;;
+        --lists) KEEP_LISTS=0 ;;
+        -h|--help) echo "usage: $0 [--arch ARCH] [--version latest|vX.Y.Z] [--prefix DIR] [--keep-lists]"; exit 0 ;;
         *) die "unknown arg: $1" ;;
     esac
     shift
@@ -183,16 +188,22 @@ fi
 # Дополнить существующие списки новыми строками из пакета (идемпотентно).
 # Существующие строки не трогаем: пользовательские правки сохраняются.
 # Если файла списка нет вовсе — ставим его из пакета.
-for _l in vpn_always vpn_never; do
-    if _pf=$(pkg_file "$_l.txt"); then
-        if [ ! -f "$PREFIX/etc/$_l.txt" ]; then
-            cp "$_pf" "$PREFIX/etc/$_l.txt"
-            say "$_l list installed: $PREFIX/etc/$_l.txt"
-        else
-            merge_list "$PREFIX/etc/$_l.txt" "$_pf" "$_l"
+# Флаг запуска --keep-lists (он же --no-lists) выключает операцию целиком:
+# оба файла остаются ровно такими, какие они есть.
+if [ "$KEEP_LISTS" = "1" ]; then
+    say "--keep-lists: списки vpn_always/vpn_never не трогаем"
+else
+    for _l in vpn_always vpn_never; do
+        if _pf=$(pkg_file "$_l.txt"); then
+            if [ ! -f "$PREFIX/etc/$_l.txt" ]; then
+                cp "$_pf" "$PREFIX/etc/$_l.txt"
+                say "$_l list installed: $PREFIX/etc/$_l.txt"
+            else
+                merge_list "$PREFIX/etc/$_l.txt" "$_pf" "$_l"
+            fi
         fi
-    fi
-done
+    done
+fi
 
 # Одноразовая уборка накопленных бэкапов списков старого формата
 # (<список>.bak-ГГГГММДД-ЧЧММСС) — теперь бэкап один: <список>.bak.
