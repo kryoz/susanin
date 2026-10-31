@@ -57,6 +57,31 @@ int main(void)
           !clf_is_private_dst("172.32.0.1") && !clf_is_private_dst("100.128.0.1"),
           "публичные и адреса сразу за границами диапазонов — не приватные");
 
+    printf("=== quic_block=1: QUIC-кандидатов не заводим ===\n");
+    {
+        susanin_state st;
+        classifier_ctx c;
+        ct_flow q;
+        config_set_defaults(&cfg);
+        snprintf(cfg.lan_subnets, sizeof(cfg.lan_subnets), "%s", "192.168.0.0/24");
+        state_init(&st);
+        c.cfg = &cfg;
+        c.st = &st;
+        c.tunnel_down_at = 0;
+        memset(&q, 0, sizeof(q));
+        q.l4proto = 17;
+        snprintf(q.proto, sizeof(q.proto), "%s", "udp");
+        snprintf(q.src, sizeof(q.src), "%s", "192.168.0.50");
+        snprintf(q.dst, sizeof(q.dst), "%s", "203.0.113.20");
+        q.dport = 443;
+        q.op = 10;                    /* выше порога FAST/QUIC */
+        cfg.quic_block = 1;
+        clr_fast(&c, &q, 1, 1000);
+        CHECK(!state_has(st_test(&st, 1), "203.0.113.20", 1000),
+              "UDP/443 не уходит в test: пакеты дропаются до наших меток");
+        state_free(&st);
+    }
+
     printf("\n%s\n", failures ? "ЕСТЬ ОШИБКИ" : "все проверки пройдены");
     return failures ? 1 : 0;
 }

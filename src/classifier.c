@@ -729,6 +729,16 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
     char kf[64];
     pair_key(kf, sizeof(kf), cfg, f);
     int syn = !strcmp(reason, "TCP-SYN");
+    /* quic_block=1 дропает UDP/443 из LAN в mangle PREROUTING ПЕРВЫМ правилом,
+     * до наших меток: проба QUIC-кандидата не может удаться в принципе —
+     * пакеты не доходят ни до туннеля, ни до ответа. Каждое такое продвижение
+     * — зря списанный промоушен и снос живого потока (замер суток на OC-коннекторе:
+     * FAST/QUIC и QUIC-LATE-STALL — 0 вердиктов из 23 проб). */
+    if (cfg->quic_block && f->l4proto == 17 && f->dport == 443) {
+        slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (quic_block: UDP/443 дропается)",
+              f->dst, f->dport);
+        return;
+    }
     /* Адрес СЕЙЧАС в vpn_never — он должен идти напрямую: не учим (иначе
      * vn_refresh/ipset и наш state расходятся, и sweep_direct рвёт его потоки).
      * Учитываем и список vpn_never, и пины DNS-снифинга (st.never). */

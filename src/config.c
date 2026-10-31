@@ -184,7 +184,11 @@ void config_set_defaults(susanin_config *c)
     c->egress_failback = 1;
     c->egress_failback_debounce = 30;
     c->dns_sniff = 0;
-    c->dns_sniff_ttl = 300;
+    /* 900 с: при 300 связка домен->IP протухала раньше, чем адрес снова
+     * попадал в пробу (повторные заходы без нового резолва), и домен был
+     * известен лишь в 17% строк датасета. Таблица фиксированная — роста
+     * памяти нет, вытеснение по-прежнему по времени. */
+    c->dns_sniff_ttl = 900;
     c->dns_hijack = 0;
     c->vpn_always_cdn_prefix = 0;
     c->pin_reassert = 1;
