@@ -111,13 +111,26 @@ def collect(paths):
 
 
 def join(promos, verdicts, window, dedupe):
-    """К каждому промоушену — первый вердикт по тому же ключу в окне."""
+    """К каждому промоушену — свой вердикт: строка вердикта расходуется один раз
+    и достаётся ближайшему предшествующему промоушену того же ключа (иначе один
+    CONFIRMED подписывает все повторные пробы адреса, и «точность» на этом
+    датасете получается нарисованной)."""
+    promos = sorted(promos, key=lambda x: x["ts"])
     by_key = {}
-    for ts, key, kind, label in verdicts:
-        by_key.setdefault(key, []).append((ts, kind, label))
+    for p in promos:
+        p["outcome"], p["label"], p["lag"] = "TIMEOUT", "", ""
+        by_key.setdefault(p["key"], []).append(p)
     rows, seen = [], {}
     stats = Counter()
-    for p in sorted(promos, key=lambda x: x["ts"]):
+    for ts, key, kind, label in sorted(verdicts, key=lambda v: v[0]):
+        for p in reversed(by_key.get(key, [])):
+            if p["outcome"] != "TIMEOUT":
+                continue
+            dt = (ts - p["ts"]).total_seconds()
+            if 0 <= dt <= window:
+                p["outcome"], p["label"], p["lag"] = kind, label, int(dt)
+                break
+    for p in promos:
         ref = p.get("ref") or "-"
         if ref != "-" and dedupe:
             prev = seen.get((p["key"], ref))
@@ -126,13 +139,7 @@ def join(promos, verdicts, window, dedupe):
                 stats["collapsed"] += 1
                 continue
             seen[(p["key"], ref)] = p["ts"]
-        outcome, label, lag = "TIMEOUT", "", ""
-        for ts, kind, lbl in by_key.get(p["key"], []):
-            dt = (ts - p["ts"]).total_seconds()
-            if 0 <= dt <= window:
-                outcome, label, lag = kind, lbl, int(dt)
-                break
-        stats["outcome:" + outcome] += 1
+        stats["outcome:" + p["outcome"]] += 1
         if ref == "-":
             stats["promoted"] += 1
         else:
@@ -148,7 +155,7 @@ def join(promos, verdicts, window, dedupe):
             "dom": p["dom"], "pr": p["pr"], "st": p["st"], "dp": p["dp"],
             "sp": p["sp"], "op": p["op"], "ob": p["ob"], "rp": p["rp"],
             "rb": p["rb"], "hr": p["hr"], "fn": p["fn"], "ref": ref,
-            "outcome": outcome, "label": label, "lag_s": lag,
+            "outcome": p["outcome"], "label": p["label"], "lag_s": p["lag"],
         })
     return rows, stats
 
@@ -162,6 +169,9 @@ def selftest():
 10-30 10:01:00 DBG: TRC sig=FAST/TCP-SYN dst=2.2.2.2 pr=tcp st=SYN_SENT dp=443 sp=11 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=direct
 10-30 10:01:01 DBG: TRC sig=FAST/TCP-SYN dst=2.2.2.2 pr=tcp st=SYN_SENT dp=443 sp=12 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=direct
 10-30 10:02:00 DBG: TRC sig=SOFT/UDP dst=3.3.3.3 pr=udp st= dp=443 sp=13 op=9 ob=900 rp=0 rb=0 hr=0 fn=0 dom=- ref=-
+10-30 10:03:00 DBG: TRC sig=FAST/TCP-SYN dst=4.4.4.4 pr=tcp st=SYN_SENT dp=443 sp=14 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=-
+10-30 10:03:40 DBG: TRC sig=FAST/TCP-SYN dst=4.4.4.4 pr=tcp st=SYN_SENT dp=443 sp=15 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=-
+10-30 10:03:50 INFO: AUTO-SUSANIN: CONFIRMED 4.4.4.4:443 label=clean
 10-30 10:40:00 INFO: AUTO-SUSANIN: COOLDOWN 9.9.9.9:443 label=weak
 09:00:00 INFO: строка старого формата, без даты
 """
@@ -170,19 +180,23 @@ def selftest():
         fh.write(log)
     promos, verdicts, skipped = collect([path])
     rows, stats = join(promos, verdicts, window=90, dedupe=60)
-    by = {r["key"]: r for r in rows}
+    by = {(r["key"], r["time"]): r for r in rows}
     checks = [
         (skipped == 1, "строка без даты отброшена и посчитана"),
-        (len(rows) == 4, "четыре события (повтор отказа свёрнут), а не пять"),
-        (by["1.1.1.1:443"]["outcome"] == "CONFIRMED" and
-         by["1.1.1.1:443"]["lag_s"] == 20, " CONFIRMED склеен по ключу"),
-        (by["8.8.8.8:443"]["outcome"] == "CONFIRMED" and
-         by["8.8.8.8:443"]["label"] == "",
+        (len(rows) == 6, "шесть событий (повтор отказа свёрнут), а не семь"),
+        (by[("1.1.1.1:443", "10:00:00")]["outcome"] == "CONFIRMED" and
+         by[("1.1.1.1:443", "10:00:00")]["lag_s"] == 20, " CONFIRMED склеен по ключу"),
+        (by[("8.8.8.8:443", "10:00:30")]["outcome"] == "CONFIRMED" and
+         by[("8.8.8.8:443", "10:00:30")]["label"] == "",
          "промоушен без TRC + вердикт без label (формат до правки) склеены"),
-        (by["2.2.2.2:443"]["outcome"] == "TIMEOUT" and
-         by["2.2.2.2:443"]["ref"] == "direct", "отказ остался без вердикта"),
-        (by["3.3.3.3:443"]["outcome"] == "TIMEOUT",
+        (by[("2.2.2.2:443", "10:01:00")]["outcome"] == "TIMEOUT" and
+         by[("2.2.2.2:443", "10:01:00")]["ref"] == "direct",
+         "отказ остался без вердикта"),
+        (by[("3.3.3.3:443", "10:02:00")]["outcome"] == "TIMEOUT",
          "нет вердикта в окне -> TIMEOUT"),
+        (by[("4.4.4.4:443", "10:03:40")]["outcome"] == "CONFIRMED" and
+         by[("4.4.4.4:443", "10:03:00")]["outcome"] == "TIMEOUT",
+         "одна строка вердикта подписывает только ближайшую пробу"),
         (stats["collapsed"] == 1, "повторы отказа посчитаны"),
         (stats["with_domain"] == 1, "домен прокинут в ряд"),
     ]
