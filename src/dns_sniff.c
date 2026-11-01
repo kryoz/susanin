@@ -94,6 +94,12 @@ static void dns_store(const char *domain, const char *ip, int ttl)
             !strcasecmp(e->domain, domain)) {
             snprintf(e->ip, sizeof(e->ip), "%s", ip);
             e->expire = now + ttl;
+            /* История «домен -> IP»: домен известен у ГОРЯЧИХ адресов (их
+             * постоянно резолвят), а у новых кандидатов — почти никогда
+             * (замер: 89 доменов на 2054 промоушена, 0 у подтверждённых).
+             * Приор по доменам строится офлайн-склейкой по IP — ей нужен этот
+             * журнал. Только DEBUG: в обычном режиме цены нет. */
+            slogf(SL_DEBUG, "dns-map: %s -> %s", domain, ip);
             return;
         }
         if (!e->domain[0] || e->expire <= now) {
@@ -102,6 +108,7 @@ static void dns_store(const char *domain, const char *ip, int ttl)
             e->expire = now + ttl;
             e->pinned = 0;
             e->pinned_never = 0;
+            slogf(SL_DEBUG, "dns-map: %s -> %s", domain, ip);
             return;
         }
     }
