@@ -107,6 +107,15 @@ def collect(paths):
                                    "op": "", "ob": "", "rp": "", "rb": "",
                                    "hr": "", "fn": ""})
     verdicts.sort(key=lambda v: v[0])
+
+    # Промоушен пишется дважды: INFO-строкой и TRC (если трассировка включена).
+    # INFO-вариант без признаков нужен только для логов до появления TRC —
+    # иначе каждый промоушен считается дважды (замер: promoted 56 при 28 TRC).
+    trc_keys = {(p["key"], p["ts"]) for p in promos if p["op"] != ""}
+    promos = [p for p in promos
+              if p["op"] != "" or
+              not any(p["key"] == k and abs((p["ts"] - t).total_seconds()) <= 5
+                      for k, t in trc_keys)]
     return promos, verdicts, skipped
 
 
@@ -172,6 +181,8 @@ def selftest():
 10-30 10:03:00 DBG: TRC sig=FAST/TCP-SYN dst=4.4.4.4 pr=tcp st=SYN_SENT dp=443 sp=14 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=-
 10-30 10:03:40 DBG: TRC sig=FAST/TCP-SYN dst=4.4.4.4 pr=tcp st=SYN_SENT dp=443 sp=15 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=-
 10-30 10:03:50 INFO: AUTO-SUSANIN: CONFIRMED 4.4.4.4:443 label=clean
+10-30 10:04:00 INFO: AUTO-SUSANIN: FAST TCP-SYN 5.5.5.5:443
+10-30 10:04:00 DBG: TRC sig=FAST/TCP-SYN dst=5.5.5.5 pr=tcp st=SYN_SENT dp=443 sp=16 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=- ref=-
 10-30 10:40:00 INFO: AUTO-SUSANIN: COOLDOWN 9.9.9.9:443 label=weak
 09:00:00 INFO: строка старого формата, без даты
 """
@@ -183,7 +194,12 @@ def selftest():
     by = {(r["key"], r["time"]): r for r in rows}
     checks = [
         (skipped == 1, "строка без даты отброшена и посчитана"),
-        (len(rows) == 6, "шесть событий (повтор отказа свёрнут), а не семь"),
+        (len(rows) == 7, "семь событий: двойная запись промоушена свёрнута"),
+        (sum(1 for r in rows if r["key"] == "5.5.5.5:443") == 1 and
+         by[("5.5.5.5:443", "10:04:00")]["op"] == "3",
+         "INFO+TRC одного промоушена — один ряд, с признаками"),
+        (by[("8.8.8.8:443", "10:00:30")]["op"] == "",
+         "INFO без парного TRC (формат до правки) не выбрасывается"),
         (by[("1.1.1.1:443", "10:00:00")]["outcome"] == "CONFIRMED" and
          by[("1.1.1.1:443", "10:00:00")]["lag_s"] == 20, " CONFIRMED склеен по ключу"),
         (by[("8.8.8.8:443", "10:00:30")]["outcome"] == "CONFIRMED" and
