@@ -60,11 +60,12 @@ void clf_trace_line(char *dst, size_t n, const ct_flow *f, const char *stage,
 }
 
 /* Отказ промоушена — единственный доступный сурогат ложной негативной: поток
- * похож на блокировку, а мы сами его не завернули (негативный кэш прямой пробы,
- * лимит проб, vpn_never). Считаются СОБЫТИЯ, а не адреса (горячий адрес
- * отказывается каждый проход): адреса дедуплицируются по TRC-строкам. Лимит
- * promo_per_min и лимит «не более 2 в секунду» не считаем — это повтор, а не
- * отказ: кандидат останется в conntrack и будет взят в следующий проход. */
+ * похож на блокировку, а мы сами его не завернули (негативный кэш прямой
+ * пробы, лимит проб, vpn_never). Считаются пары (адрес, причина) за окно
+ * RF_WINDOW_S — счётчик и TRC пишутся один раз на окно, повторы молчат.
+ * Лимит promo_per_min и лимит «не более 2 в секунду» не считаем — это
+ * повтор, а не отказ: кандидат останется в conntrack и будет взят в
+ * следующий проход. */
 enum { NM_NEVER, NM_RECENT, NM_DOK, NM_DIRECT, NM_BUDGET, NM_GIVEUP, NM_N };
 static unsigned long nm_cnt[NM_N];
 static time_t nm_last = 0;
@@ -87,6 +88,37 @@ static void nm_summary(time_t now)
           nm_cnt[NM_GIVEUP]);
     memset(nm_cnt, 0, sizeof(nm_cnt));
     nm_last = now;
+}
+
+/* Дедупликация отказов: горячий адрес отказывается каждый проход цикла (1 с),
+ * и без окна он пишет TRC и DEBUG-строку каждую секунду — замер: 236 тысяч TRC
+ * за 17 часов (60 МБ лога за 6 часов). Окно 300 с — как сводка NEAR-MISS. */
+#define RF_MAX 256
+#define RF_WINDOW_S 300
+typedef struct { char ip[64]; char cause[12]; time_t at; } rfslot;
+static rfslot rf[RF_MAX];
+static int rf_n = 0;
+
+/* 1 = этот (адрес, причина) уже записан в текущем окне. Таблица фиксированная
+ * — память не растёт; слот сначала ищется протухший, иначе самый старый. */
+static int rf_seen(const char *ip, const char *cause, time_t now)
+{
+    int i, oldest = 0;
+    time_t oldest_at = now + RF_WINDOW_S;
+    for (i = 0; i < rf_n; i++) {
+        if (rf[i].at + RF_WINDOW_S > now) {
+            if (!strcmp(rf[i].ip, ip) && !strcmp(rf[i].cause, cause))
+                return 1;
+        } else if (rf[i].at < oldest_at) {
+            oldest = i;
+            oldest_at = rf[i].at;
+        }
+    }
+    i = (rf_n < RF_MAX) ? rf_n++ : oldest;
+    snprintf(rf[i].ip, sizeof(rf[i].ip), "%s", ip);
+    snprintf(rf[i].cause, sizeof(rf[i].cause), "%s", cause);
+    rf[i].at = now;
+    return 0;
 }
 
 /* Порты из learn_exclude_ports не участвуют в автообучении (типовой скан-шум
@@ -743,18 +775,23 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
      * vn_refresh/ipset и наш state расходятся, и sweep_direct рвёт его потоки).
      * Учитываем и список vpn_never, и пины DNS-снифинга (st.never). */
     if (vn_has(f->dst) || state_has(&ctx->st->never, f->dst, now)) {
-        nm_cnt[NM_NEVER]++;
-        trace_refused(f, stage, reason, "never");
-        slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (vpn_never)", f->dst, f->dport);
+        if (!rf_seen(f->dst, "never", now)) {
+            nm_cnt[NM_NEVER]++;
+            trace_refused(f, stage, reason, "never");
+            slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (vpn_never)",
+                  f->dst, f->dport);
+        }
         return;
     }
     /* Не учим в VPN адрес, недавно бывший в vpn_never: он должен идти напрямую,
      * иначе возможен «прыжок» direct <-> VPN (план п.8.3). */
     if (vn_is_recently_never(f->dst, now)) {
-        nm_cnt[NM_RECENT]++;
-        trace_refused(f, stage, reason, "recent");
-        slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (recently vpn_never)",
-              f->dst, f->dport);
+        if (!rf_seen(f->dst, "recent", now)) {
+            nm_cnt[NM_RECENT]++;
+            trace_refused(f, stage, reason, "recent");
+            slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (recently vpn_never)",
+                  f->dst, f->dport);
+        }
         return;
     }
     /* Прямая проба — только для «SYN ушёл без ответа»: там свежий connect
@@ -765,20 +802,24 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
      * запрещать обучение по сигналам SNI (DPI-RST/CLOSE). */
     if (f->l4proto == 6 && f->dport > 0 && syn) {
         if (dok_has(f->dst, now)) {
-            nm_cnt[NM_DOK]++;
-            trace_refused(f, stage, reason, "dok");
-            slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (недавно проверено: прямой жив)",
-                  f->dst, f->dport);
+            if (!rf_seen(f->dst, "dok", now)) {
+                nm_cnt[NM_DOK]++;
+                trace_refused(f, stage, reason, "dok");
+                slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s:%u (недавно проверено: прямой жив)",
+                      f->dst, f->dport);
+            }
             return;
         }
         if (!direct_probe_budget_ok(now)) {
             /* Бюджет проб исчерпан: осознанно НЕ заворачиваем (короткая отметка),
              * иначе защита отключалась бы ровно под нагрузкой. */
             dok_add(f->dst, now, DOK_TTL_BUDGET);
-            nm_cnt[NM_BUDGET]++;
-            trace_refused(f, stage, reason, "budget");
-            slogf(SL_DEBUG, "AUTO-SUSANIN: %s skip %s:%u (бюджет проб исчерпан)",
-                  stage, f->dst, f->dport);
+            if (!rf_seen(f->dst, "budget", now)) {
+                nm_cnt[NM_BUDGET]++;
+                trace_refused(f, stage, reason, "budget");
+                slogf(SL_DEBUG, "AUTO-SUSANIN: %s skip %s:%u (бюджет проб исчерпан)",
+                      stage, f->dst, f->dport);
+            }
             return;
         }
         if (!direct_probe_sec_ok(now))
@@ -787,10 +828,12 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
             /* Отказ по «прямой жив» — самый дешёвый пропуск блокировки: TCP
              * рукопожатие проходит и при DPI-блокировке по SNI. */
             dok_add(f->dst, now, DOK_TTL_OK);
-            nm_cnt[NM_DIRECT]++;
-            trace_refused(f, stage, reason, "direct");
-            slogf(SL_INFO, "AUTO-SUSANIN: %s skip %s:%u (прямой путь отвечает)",
-                  stage, f->dst, f->dport);
+            if (!rf_seen(f->dst, "direct", now)) {
+                nm_cnt[NM_DIRECT]++;
+                trace_refused(f, stage, reason, "direct");
+                slogf(SL_INFO, "AUTO-SUSANIN: %s skip %s:%u (прямой путь отвечает)",
+                      stage, f->dst, f->dport);
+            }
             return;
         }
     }
@@ -847,7 +890,8 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                 f->op >= (unsigned long)cfg->fast_syn_min_op && f->rp == 0) {
                 char gk[64];
                 pair_key(gk, sizeof(gk), cfg, f);
-                if (state_has(st_cool(ctx->st, is_udp(f)), gk, now)) {
+                if (state_has(st_cool(ctx->st, is_udp(f)), gk, now) &&
+                    !rf_seen(f->dst, "giveup", now)) {
                     nm_cnt[NM_GIVEUP]++;
                     trace_refused(f, "FAST", "TCP-SYN", "giveup");
                 }
