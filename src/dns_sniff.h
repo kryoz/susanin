@@ -35,5 +35,7 @@ int  dns_sniff_count(void);
 void dns_sniff_diag(char *out, size_t n);
 /* 1 = нашли домен для IP; domain_out заполняется (может быть ""). */
 int  dns_sniff_domain_of(const char *ip, char *domain_out, unsigned n);
+/* 1 = IP принадлежит домену из domain_prior (история подтверждений). */
+int  dns_sniff_prior_of(const char *ip);
 
 #endif

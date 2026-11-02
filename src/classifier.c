@@ -841,8 +841,16 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
      * адресу уйти в VPN, когда прямой путь снова деградировал. */
     backend_set_del(cfg, "susanin_direct", f->dst);
     state_remove(&ctx->st->direct, f->dst);
-    if (!promo_ok(cfg, now))
-        return;
+    /* Этап 1 (доменный приор): домен с историей подтверждений идёт ВПЕРЁД
+     * лимита promo_per_min — меняется порядок продвижения, НЕ пороги
+     * сигналов и НЕ отказы. Lookup только на этом редком пути (не на поток):
+     * это линейный проход по таблице снифера. */
+    if (!promo_ok(cfg, now)) {
+        if (!dns_sniff_prior_of(f->dst))
+            return;
+        slogf(SL_DEBUG, "AUTO-SUSANIN: %s %s:%u вне лимита promo_per_min (domain_prior)",
+              stage, f->dst, f->dport);
+    }
     state_add(st_test(ctx->st, udp), kf, now, cfg->test_ttl, 0);
     state_remove(st_watch(ctx->st, udp), kf);
     backend_ipset_add_port(cfg, udp, 0, f->dst, flow_port(cfg, f), cfg->test_ttl);

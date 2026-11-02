@@ -29,6 +29,7 @@ typedef struct {
     time_t expire;
     int pinned;
     int pinned_never;
+    int prior;               /* домен в domain_prior: история подтверждений */
 } dns_entry;
 
 static dns_entry g_tab[DNS_MAX_ENTRIES];
@@ -43,14 +44,15 @@ static int g_started = 0;
 static const susanin_config *g_cfg = NULL;
 static susanin_state *g_state = NULL;   /* для персиста пинов (может быть NULL) */
 
-/* Кэш содержимого списка (vpn_always/vpn_never): файл перечитывается только при
- * смене mtime/размера, а не на каждую запись DNS-таблицы раз в 10 секунд. */
+/* Кэш содержимого списка (vpn_always/vpn_never/domain_prior): файл
+ * перечитывается только при смене mtime/размера, а не на каждую запись
+ * DNS-таблицы раз в 10 секунд. */
 typedef struct {
     char path[256];
     long long mtime, size;
     char *data;              /* домены через '\n' */
 } lcache;
-static lcache lc[2];
+static lcache lc[3];
 
 /* Счётчики цепочки: захват → фильтр 53 → разбор → сохранение → поиск. Пока
  * dom= пустой, по ним видно, на каком звене рвётся (и рвётся ли). */
@@ -108,6 +110,7 @@ static void dns_store(const char *domain, const char *ip, int ttl)
             e->expire = now + ttl;
             e->pinned = 0;
             e->pinned_never = 0;
+            e->prior = 0;
             slogf(SL_DEBUG, "dns-map: %s -> %s", domain, ip);
             return;
         }
@@ -525,7 +528,7 @@ static const char *list_cache(int slot, const char *file)
     char *buf;
     size_t cap = 2048, len = 0;
 
-    if (slot < 0 || slot > 1 || !file || !file[0])
+    if (slot < 0 || slot > 2 || !file || !file[0])
         return NULL;
     c = &lc[slot];
     if (c->data && !strcmp(c->path, file) && stat(file, &sb) == 0 &&
@@ -627,6 +630,28 @@ void dns_sniff_reset_pins(void)
         g_tab[i].pinned_never = 0;
     }
 }
+/* Этап 1: доменный приор. domain_prior.txt — eTLD+1 с историей подтверждений
+ * (строится офлайн tools/dataset.py --prior). Здесь только пометка записей:
+ * применение — порядок продвижения в classifier.c, НЕ пин и не пороги.
+ * Отдельная функция (а не кусок reconcile) — тестируется без сокетов. */
+static void prior_mark(const susanin_config *cfg)
+{
+    int i;
+    time_t now = time(NULL);
+    if (!cfg->domain_prior_file[0])
+        return;
+    for (i = 0; i < DNS_MAX_ENTRIES; i++) {
+        dns_entry *e = &g_tab[i];
+        if (!e->domain[0] || e->expire <= now || e->prior)
+            continue;
+        if (list_match(2, cfg->domain_prior_file, e->domain)) {
+            e->prior = 1;
+            slogf(SL_DEBUG, "dns-sniff: %s -> %s prior (domain_prior)",
+                  e->domain, e->ip);
+        }
+    }
+}
+
 
 void dns_sniff_reconcile(const susanin_config *cfg)
 {
@@ -638,6 +663,7 @@ void dns_sniff_reconcile(const susanin_config *cfg)
      * нельзя привязать напрямую (if_nametoindex("oc+") == 0): дооткрываем
      * появившиеся интерфейсы здесь, не дожидаясь перезапуска агента. */
     sniff_sync(cfg);
+    prior_mark(cfg);
     for (i = 0; i < DNS_MAX_ENTRIES; i++) {
         dns_entry *e = &g_tab[i];
         if (!e->domain[0] || e->expire <= now)
@@ -707,6 +733,20 @@ int dns_sniff_domain_of(const char *ip, char *domain_out, unsigned n)
                 snprintf(domain_out, n, "%s", e->domain);
             return 1;
         }
+    }
+    return 0;
+}
+
+int dns_sniff_prior_of(const char *ip)
+{
+    int i;
+    time_t now = time(NULL);
+    if (!ip)
+        return 0;
+    for (i = 0; i < DNS_MAX_ENTRIES; i++) {
+        dns_entry *e = &g_tab[i];
+        if (e->domain[0] && e->expire > now && !strcmp(e->ip, ip) && e->prior)
+            return 1;
     }
     return 0;
 }

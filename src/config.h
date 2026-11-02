@@ -48,6 +48,7 @@ typedef struct {
     char vpn_always_dns[CFG_PATH_MAX];
     int vpn_always_interval;
     char vpn_never_file[CFG_PATH_MAX];
+    char domain_prior_file[CFG_PATH_MAX];
     int vpn_never_interval;
     char log_level[16];
     char xray_loglevel[16]; /* уровень логов Xray (читает xray-egress.sh, не сам агент) */

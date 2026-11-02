@@ -131,6 +131,8 @@ void config_set_defaults(susanin_config *c)
     c->vpn_always_interval = 300;
     snprintf(c->vpn_never_file, sizeof(c->vpn_never_file), "%s",
              "/opt/susanin/etc/vpn_never.txt");
+    snprintf(c->domain_prior_file, sizeof(c->domain_prior_file), "%s",
+             "/opt/susanin/etc/domain_prior.txt");
     c->vpn_never_interval = 300;
     snprintf(c->log_level, sizeof(c->log_level), "%s", "info");
     snprintf(c->xray_loglevel, sizeof(c->xray_loglevel), "%s", "warning");
@@ -410,6 +412,8 @@ int config_load(const char *path, susanin_config *c)
             c->vpn_always_interval = parse_dur(val, U_SEC);
         else if (!strcmp(key, "vpn_never_file"))
             set_str(c->vpn_never_file, sizeof(c->vpn_never_file), val);
+        else if (!strcmp(key, "domain_prior_file"))
+            set_str(c->domain_prior_file, sizeof(c->domain_prior_file), val);
         else if (!strcmp(key, "vpn_never_interval"))
             c->vpn_never_interval = parse_dur(val, U_SEC);
             else if (!strcmp(key, "log_level"))
@@ -722,6 +726,7 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "vpn_always_interval=%d\n", out_dur(c->vpn_always_interval, U_SEC));
     fprintf(fp, "# Файл списка «всегда напрямую».\n");
     fprintf(fp, "vpn_never_file=%s\n", c->vpn_never_file);
+    fprintf(fp, "domain_prior_file=%s\n", c->domain_prior_file);
     fprintf(fp, "# Период обновления списка «всегда напрямую», сек.\n");
     fprintf(fp, "vpn_never_interval=%d\n", out_dur(c->vpn_never_interval, U_SEC));
     fprintf(fp, "# Уровень логов агента: quiet | error | warn | info | debug | trace.\n");
@@ -992,6 +997,7 @@ void config_print(const susanin_config *c)
     printf("vpn_always_dns=%s\n", c->vpn_always_dns);
     printf("vpn_always_interval=%d\n", out_dur(c->vpn_always_interval, U_SEC));
     printf("vpn_never_file=%s\n", c->vpn_never_file);
+    printf("domain_prior_file=%s\n", c->domain_prior_file);
     printf("vpn_never_interval=%d\n", out_dur(c->vpn_never_interval, U_SEC));
     printf("log_level=%s\n", c->log_level);
     printf("xray_loglevel=%s\n", c->xray_loglevel);
