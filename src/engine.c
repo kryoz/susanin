@@ -1274,7 +1274,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
          * Только при tunnel_up: пока живого egress нет (VPN отключили), маршрута
          * в таблице тоже нет, и проверка давала бы ложное «data plane missing»
          * с перепровижном каждые 5 c и падением dp_ok на 60 c. */
-        if (dp_ok && tunnel_up && now - last_dpfast >= 5) {
+        if (dp_ok && tunnel_up && now - last_dpfast >= 1) {
             last_dpfast = now;
             if (!backend_ready(cfg)) {
                 slogf(SL_WARN, "data plane missing (fast check), re-provisioning");

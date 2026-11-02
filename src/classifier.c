@@ -406,7 +406,7 @@ static int test_age(const state_set *st, const susanin_config *cfg,
 /* Бюджет прямых проб: проба блокирует цикл, поэтому не более N в минуту и не
  * более M за календарную секунду (иначе один проход встал бы на 12 с). */
 #define DIRECT_PROBE_MS  1200
-#define DIRECT_PROBE_MAX 10
+#define DIRECT_PROBE_MAX 20
 #define DIRECT_PROBE_PER_SEC 2
 #define DOK_TTL_OK     300   /* «прямой путь отвечает»: не заворачивать, с */
 #define DOK_TTL_BUDGET 120   /* бюджет проб исчерпан: короткая отметка */
@@ -753,6 +753,20 @@ static void trace_refused(const ct_flow *f, const char *stage,
     slogf(SL_TRACE, "%s ref=%s", tr, cause);
 }
 
+/* Сильное клиентское доказательство дропа SYN (2026-11-02, решение владельца
+ * по refused:budget=505/сутки): столько ретранслитов — уже не «медленный
+ * сервер», а дроп (DPI/блэкхол). Проба тут не нужна и вредна вдвойне: на
+ * дропающем хосте она молчит все 1200 мс, вешая цикл, и расходует бюджет
+ * ровно на тех кандидатах, что гарантированно блокированы. Порог: удвоенный
+ * fast_syn_min_op, но не меньше 4 ретранслитов (~3-4 с попыток клиента). */
+static int syn_evidence_strong(const susanin_config *cfg, const ct_flow *f)
+{
+    int v = 2 * (cfg->fast_syn_min_op > 0 ? cfg->fast_syn_min_op : 2);
+    if (v < 4)
+        v = 4;
+    return f->op >= (unsigned long)v;
+}
+
 static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
                          const char *stage, const char *reason)
 {
@@ -794,13 +808,14 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
         }
         return;
     }
-    /* Прямая проба — только для «SYN ушёл без ответа»: там свежий connect
-     * информативен. Для DPI-RST/TCP-CLOSE/«тишины» проба бесполезна и вредна:
-     * рукопожатие проходит (блокировка по SNI/данным — уже после connect), и мы
-     * получили бы ложное «прямо ок», не завернув именно тот трафик, что нужно.
-     * Негативный кэш тоже относится только к этому случаю: он не должен
-     * запрещать обучение по сигналам SNI (DPI-RST/CLOSE). */
-    if (f->l4proto == 6 && f->dport > 0 && syn) {
+
+/* Прямая проба — только для «SYN ушёл без ответа»: там свежий connect
+ * информативен. Для DPI-RST/TCP-CLOSE/«тишины» проба бесполезна и вредна:
+ * рукопожатие проходит (блокировка по SNI/данным — уже после connect), и мы
+ * получили бы ложное «прямо ок», не завернув именно тот трафик, что нужно.
+ * Негативный кэш тоже относится только к этому случаю: он не должен
+ * запрещать обучение по сигналам SNI (DPI-RST/CLOSE). */
+    if (f->l4proto == 6 && f->dport > 0 && syn && !syn_evidence_strong(cfg, f)) {
         if (dok_has(f->dst, now)) {
             if (!rf_seen(f->dst, "dok", now)) {
                 nm_cnt[NM_DOK]++;

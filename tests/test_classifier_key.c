@@ -127,6 +127,28 @@ int main(void)
         CHECK(starve_tab[i].n == 1, "новое окно — счёт с нуля");
     }
 
+    printf("=== бюджет проб: сильные ретранслиты SYM идут без пробы ===\n");
+    {
+        ct_flow s;
+        memset(&s, 0, sizeof(s));
+        s.l4proto = 6;
+        cfg.fast_syn_min_op = 2;
+        s.op = 3;
+        CHECK(!syn_evidence_strong(&cfg, &s), "op=3 при пороге 4: проба нужна");
+        s.op = 4;
+        CHECK(syn_evidence_strong(&cfg, &s), "op=4 при пороге 4: проба не нужна");
+        cfg.fast_syn_min_op = 3;
+        s.op = 5;
+        CHECK(!syn_evidence_strong(&cfg, &s), "fast_syn_min_op=3: порог 6, op=5 мала");
+        s.op = 6;
+        CHECK(syn_evidence_strong(&cfg, &s), "op=6 при пороге 6: без пробы");
+        cfg.fast_syn_min_op = 1;
+        s.op = 3;
+        CHECK(!syn_evidence_strong(&cfg, &s), "пол 4: op=3 всё ещё мала");
+        s.op = 4;
+        CHECK(syn_evidence_strong(&cfg, &s), "пол 4: op=4 достаточно");
+    }
+
     printf("\n%s\n", failures ? "ЕСТЬ ОШИБКИ" : "все проверки пройдены");
     return failures ? 1 : 0;
 }
