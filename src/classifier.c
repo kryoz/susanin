@@ -936,6 +936,12 @@ static void starve_note(const ct_flow *f, time_t now)
         starve_tab[slot].last_sport = 0;
     }
     if (now - starve_tab[slot].win >= STARVE_WIN) {
+        /* итог окна печатаем ОДНОЙ строкой: непрерывно-болтливый хост
+         * (телеметрия Яндекса дала 17k строк за 4 часа — 44% лога) не
+         * должен топить корпус; для анализа итог окна и есть данные */
+        if (starve_tab[slot].n > 3)
+            slogf(SL_TRACE, "STARVE-CAND: %s short=%u win=%d total",
+                  starve_tab[slot].key, starve_tab[slot].n, STARVE_WIN);
         starve_tab[slot].n = 0;
         starve_tab[slot].win = now;
     }
@@ -943,8 +949,7 @@ static void starve_note(const ct_flow *f, time_t now)
         return;   /* тот же коннект тикает из прохода в проход — не событие */
     starve_tab[slot].last_sport = f->sport;
     starve_tab[slot].n++;
-    if (starve_tab[slot].n == 3 || (starve_tab[slot].n > 3 &&
-                                    starve_tab[slot].n % 5 == 0))
+    if (starve_tab[slot].n == 3)
         slogf(SL_TRACE, "STARVE-CAND: %s short=%u win=%d", key,
               starve_tab[slot].n, STARVE_WIN);
 }
