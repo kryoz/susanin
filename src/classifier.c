@@ -878,6 +878,63 @@ static int candidate_ok(const classifier_ctx *ctx, const ct_flow *f, time_t now)
            !state_has(st_cool(ctx->st, udp), kf, now);
 }
 
+/* Этап 2, класс «сервер отвечает, но браузеру мало» (memdoor.ai): поток
+ * выглядит здоровым (rb может быть БОЛЬШЕ ob), счётчики класса не выделяют.
+ * Единственный дешёвый признак — поведение браузера: пачки КОРОТКИХ
+ * повторных коннектов к одному dst:port (connect -> сотни байт -> клиент
+ * закрыл -> снова с новым sport). Здесь ТОЛЬКО измерение: трейс-строка раз
+ * в окно, решений и порогов нет — сутки корпуса, потом сигнал и пороги. */
+#define STARVE_MAX 64
+#define STARVE_WIN 120
+typedef struct { char key[72]; unsigned last_sport; unsigned n; time_t win; } starve_slot;
+static starve_slot starve_tab[STARVE_MAX];
+
+static void starve_note(const ct_flow *f, time_t now)
+{
+    char key[72];
+    int i, slot = -1;
+    time_t oldest = 0;
+    if (f->l4proto != 6 || f->dport != 443 || f->rp == 0 ||
+        f->ob < 500 || f->rb < 200)
+        return;   /* интересуют «живые» коннекты, а не пустые и не немые */
+    {
+        static const char *alive[] = { "ESTABLISHED", "SYN_SENT", "SYN_RECV", 0 };
+        for (i = 0; alive[i]; i++)
+            if (!strcmp(f->tcp_state, alive[i]))
+                return;   /* ещё живой: коротышом станет при закрытии */
+    }
+    snprintf(key, sizeof(key), "%s:%u", f->dst, f->dport);
+    for (i = 0; i < STARVE_MAX; i++) {
+        if (!starve_tab[i].key[0] || !strcmp(starve_tab[i].key, key)) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 || starve_tab[i].win < oldest) {
+            oldest = starve_tab[i].win;
+            slot = i;   /* попутно — кандидат на вытеснение */
+        }
+    }
+    if (!starve_tab[slot].key[0] || strcmp(starve_tab[slot].key, key)) {
+        snprintf(starve_tab[slot].key, sizeof(starve_tab[slot].key), "%s", key);
+        starve_tab[slot].n = 0;
+        starve_tab[slot].win = now;
+        starve_tab[slot].last_sport = 0;
+    }
+    if (now - starve_tab[slot].win >= STARVE_WIN) {
+        starve_tab[slot].n = 0;
+        starve_tab[slot].win = now;
+    }
+    if (f->sport == starve_tab[slot].last_sport)
+        return;   /* тот же коннект тикает из прохода в проход — не событие */
+    starve_tab[slot].last_sport = f->sport;
+    starve_tab[slot].n++;
+    if (starve_tab[slot].n == 3 || (starve_tab[slot].n > 3 &&
+                                    starve_tab[slot].n % 5 == 0))
+        slogf(SL_TRACE, "STARVE-CAND: %s short=%u win=%d", key,
+              starve_tab[slot].n, STARVE_WIN);
+}
+
+
 void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
 {
     const susanin_config *cfg = ctx->cfg;
@@ -889,6 +946,7 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
         if (!from_lan(cfg, f->src)) continue;
         if (is_private_dst(f->dst, NULL)) continue;
         if (port_excluded(cfg, f->dport) || port_excluded(cfg, f->sport)) continue;
+        starve_note(f, now);
         if (!candidate_ok(ctx, f, now)) {
             /* Near-miss «сдались, а трафик так и не пошёл»: SYN без ответа по
              * адресу, уже сидящему в cooldown, — туннель пробовали и отступились.

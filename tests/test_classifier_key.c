@@ -94,6 +94,39 @@ int main(void)
         state_free(&st);
     }
 
+    printf("=== starvation: пачки коротких коннектов (этап 2, только счёт) ===\n");
+    {
+        time_t now = 1700000000;
+        ct_flow s;
+        int i;
+        memset(&s, 0, sizeof(s));
+        snprintf(s.dst, sizeof(s.dst), "%s", "198.51.100.7");
+        s.l4proto = 6; s.dport = 443; s.rp = 3; s.ob = 900; s.rb = 400;
+        snprintf(s.tcp_state, sizeof(s.tcp_state), "%s", "CLOSE_WAIT");
+        memset(starve_tab, 0, sizeof(starve_tab));
+        s.sport = 40000;
+        starve_note(&s, now);   /* первый коннект */
+        starve_note(&s, now + 1);
+        starve_note(&s, now + 2);
+        for (i = 0; i < STARVE_MAX; i++)
+            if (starve_tab[i].key[0] && !strcmp(starve_tab[i].key, "198.51.100.7:443"))
+                break;
+        CHECK(i < STARVE_MAX && starve_tab[i].n == 1,
+              "повторы того же sport — один коннект, не три");
+        s.sport = 40001;
+        starve_note(&s, now + 3);
+        s.sport = 40002;
+        starve_note(&s, now + 4);
+        CHECK(starve_tab[i].n == 3, "три разных sport в окне — коротыш посчитан");
+        snprintf(s.tcp_state, sizeof(s.tcp_state), "%s", "ESTABLISHED");
+        s.sport = 40003;
+        starve_note(&s, now + 5);
+        CHECK(starve_tab[i].n == 3, "живой (ESTABLISHED) коннект не считается");
+        snprintf(s.tcp_state, sizeof(s.tcp_state), "%s", "CLOSE_WAIT");
+        starve_note(&s, now + STARVE_WIN + 10);
+        CHECK(starve_tab[i].n == 1, "новое окно — счёт с нуля");
+    }
+
     printf("\n%s\n", failures ? "ЕСТЬ ОШИБКИ" : "все проверки пройдены");
     return failures ? 1 : 0;
 }
