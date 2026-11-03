@@ -815,7 +815,11 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
  * получили бы ложное «прямо ок», не завернув именно тот трафик, что нужно.
  * Негативный кэш тоже относится только к этому случаю: он не должен
  * запрещать обучение по сигналам SNI (DPI-RST/CLOSE). */
-    if (f->l4proto == 6 && f->dport > 0 && syn && !syn_evidence_strong(cfg, f)) {
+    if (f->l4proto == 6 && f->dport > 0 && syn) {
+        /* dok — для ВСЕХ SYN-кандидатов, включая сильные (инцидент
+         * 2026-11-03: торрент-рой, ref=dok 55k за ночь): без него
+         * промоушен → ct_delete → новый коннект клиента → перепромоушен
+         * каждые ~70 с для каждого мёртвого пира, бесконечно. */
         if (dok_has(f->dst, now)) {
             if (!rf_seen(f->dst, "dok", now)) {
                 nm_cnt[NM_DOK]++;
@@ -825,6 +829,7 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
             }
             return;
         }
+        if (!syn_evidence_strong(cfg, f)) {
         if (!direct_probe_budget_ok(now)) {
             /* Бюджет проб исчерпан: осознанно НЕ заворачиваем (короткая отметка),
              * иначе защита отключалась бы ровно под нагрузкой. */
@@ -851,6 +856,11 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
             }
             return;
         }
+        }
+        /* Демпфер петли: отметка «недавно заворачивали» на 300 с.
+         * Подтверждённые сюда не доходят (candidate_ok), TIMEOUT-кандидат
+         * заглушен вместо перепродвижения каждую минуту. */
+        dok_add(f->dst, now, DOK_TTL_OK);
     }
     /* D1: снимаем «мягкое прямо» (DIRECT_PREF), иначе RETURN в цепочке не даст
      * адресу уйти в VPN, когда прямой путь снова деградировал. */
