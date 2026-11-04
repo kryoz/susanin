@@ -7,6 +7,7 @@
 #include "release.h"
 #include "state.h"
 #include "vpn_always.h"
+#include "vpn_never.h"
 #include "version.h"
 
 #include <arpa/inet.h>
@@ -509,6 +510,94 @@ int ops_reset(const susanin_config *cfg, const char *arg)
     return 0;
 }
 
+
+/* Жалоба «сайт не работает» (этап 2, 2026-11-04): пользователь — единственный
+ * детектор класса «сервер отвечает, но браузеру мало» (memdoor.ai: счётчики
+ * потока здоровые, см. отрицательный результат по STARVE-CAND). Действие:
+ * снять never, поставить адреса в test-фазу (вердикт вынесет judge по факту
+ * трафика через туннель), разорвать текущие коннекты клиента, чтобы браузер
+ * переподключился сразу через туннель, и записать золотую метку в лог. */
+int ops_complain(const susanin_config *cfg, const char *arg)
+{
+    const char *path = "/opt/susanin/var/susanin.state";
+    susanin_state st;
+    char ips[32][16];
+    char base[256];
+    int n = 0, i, udp, zone = 0;
+    struct in_addr a;
+    vpn_never *vn;
+
+    if (!arg || !arg[0]) {
+        fprintf(stderr, "usage: susanin-agent complain <ip|domain>\n");
+        return 2;
+    }
+    memset(ips, 0, sizeof(ips));
+    if (inet_pton(AF_INET, arg, &a) == 1) {
+        snprintf(ips[0], sizeof(ips[0]), "%.15s", arg);
+        n = 1;
+    } else {
+        char server[64];
+        char names[8][300];
+        int nn = 0;
+        if (arg[0] == '*' && arg[1] == '.')
+            snprintf(base, sizeof(base), "%.200s", arg + 2);
+        else
+            snprintf(base, sizeof(base), "%.200s", arg);
+        zone = 1;
+        va_pick_resolver(cfg, server, sizeof(server));
+        snprintf(names[nn++], sizeof(names[0]), "%s", base);
+        snprintf(names[nn++], sizeof(names[0]), "www.%s", base);
+        snprintf(names[nn++], sizeof(names[0]), "api.%s", base);
+        snprintf(names[nn++], sizeof(names[0]), "static.%s", base);
+        for (i = 0; i < nn && n < 32; i++) {
+            char tmp[16][16];
+            int m = va_dns_query(server, names[i], tmp, 16, 1500);
+            int j, x;
+            for (j = 0; j < m && n < 32; j++) {
+                int dup = 0;
+                for (x = 0; x < n; x++)
+                    if (!strcmp(ips[x], tmp[j])) { dup = 1; break; }
+                if (!dup)
+                    snprintf(ips[n++], sizeof(ips[0]), "%.15s", tmp[j]);
+            }
+        }
+        if (n == 0) {
+            fprintf(stderr, "[susanin] complain %s: ничего не разрешилось\n", arg);
+            return 1;
+        }
+    }
+
+    vn = vn_new();
+    if (vn)
+        vn_refresh(vn, cfg);
+    state_init(&st);
+    state_load(path, &st);
+    for (i = 0; i < n; i++) {
+        if (vn && vn_has(ips[i])) {
+            /* Never-список — сознательное решение владельца: жалоба не
+             * должна его молча обходить (пин вернулся бы на refresh). */
+            slogf(SL_INFO, "COMPLAINT: %s -> %s REFUSED (vpn_never)", arg, ips[i]);
+            printf("[susanin] complain %s: %s в vpn_never — уберите из списка\n",
+                   arg, ips[i]);
+            continue;
+        }
+        state_remove(&st.never, ips[i]);
+        backend_set_del(cfg, "susanin_never", ips[i]);
+        for (udp = 0; udp < 2; udp++) {
+            state_add(st_test(&st, udp), ips[i], time(NULL), cfg->test_ttl, 0);
+            backend_ipset_add_port(cfg, udp, 0, ips[i], 0, cfg->test_ttl);
+        }
+        backend_ct_flush_ip(ips[i]);
+        slogf(SL_INFO, "COMPLAINT: %s -> %s (test)", arg, ips[i]);
+        printf("[susanin] complain %s%s: %s -> test (%d c)\n",
+               zone ? "zone " : "", arg, ips[i], cfg->test_ttl);
+    }
+    state_save(path, &st);
+    state_free(&st);
+    if (vn)
+        vn_free(vn);
+    return 0;
+}
 static int check_missing(const susanin_config *cfg, char *a[])
 {
     const char *ipt = tool("iptables");

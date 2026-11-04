@@ -10,6 +10,8 @@ int ops_apply(const susanin_config *cfg, const char *conf_path, int dry_run);
 /* Сбросить адрес (IP или домен) из кэша/ipsets и conntrack — «забыть» для
  * повторного обучения. `forget <ip>` — синоним. */
 int ops_reset(const susanin_config *cfg, const char *arg);
+/* Жалоба «сайт не работает»: адрес(а) в test-фазу + золотая метка COMPLAINT. */
+int ops_complain(const susanin_config *cfg, const char *arg);
 const char *ops_default_conf_path(void);
 
 /* Read-only JSON snapshot for the built-in web panel (`/api/status`). */

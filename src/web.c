@@ -1277,6 +1277,12 @@ static void handle_action(int fd, const susanin_config *cfg, const char *target,
         json_ok(fd, "\"action\":\"reset\"");
         return;
     }
+    if (!strcmp(target, "/api/complain")) {
+        if (!form_get(body, "ip", a, sizeof(a)) || !a[0]) { json_err(fd, "value required"); return; }
+        ops_complain(cfg, a);
+        json_ok(fd, "\"action\":\"complain\"");
+        return;
+    }
     if (!strcmp(target, "/api/reload")) {
         if (signal_agent(SIGHUP, err, sizeof(err)) != 0) { json_err(fd, err); return; }
         json_ok(fd, "\"action\":\"reload\"");

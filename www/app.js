@@ -122,6 +122,12 @@
     doPost('/api/reset', { ip: ip }, 'reset ' + ip);
   };
 
+  $('complain').onclick = function () {
+    var ip = $('fcomplain').value.trim();
+    if (!ip) { toast('жалоба: укажите домен или IP', false); return; }
+    doPost('/api/complain', { ip: ip }, 'жалоба ' + ip);
+  };
+
   function renderStatus(d) {
     $('ver').textContent = 'v' + d.version;
     var upd = $('verupd');

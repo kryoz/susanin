@@ -44,6 +44,7 @@ PROMO_RE = re.compile(r"AUTO-SUSANIN: (FAST|SOFT) ([A-Z0-9-]+) (\S+?)[:.](\d+)$"
 # 'dns-map: example.com -> 203.0.113.7' — журнал снифера, единственный мост
 # IP<->домен для офлайн-анализа (у TRC-промоушенов dom= известен редко).
 DNSMAP_RE = re.compile(r"dns-map: (\S+) -> (\S+)\s*$")
+COMPLAINT_RE = re.compile(r"COMPLAINT: (\S+) -> (\S+) \((test|REFUSED)")
 
 # 'ip:port' разбираем в Python: ленивый regex внутри IP цепляется за первую
 # точку ('1.2.3.4:443' -> ip='1', port='2'), а якорь по концу строки не годится —
@@ -89,7 +90,7 @@ def parse_ts(m, year):
 
 def collect(paths):
     """Один проход по всем файлам: промоушены, вердикты, dns-map, без даты."""
-    promos, verdicts, dnsmaps, skipped = [], [], [], 0
+    promos, verdicts, dnsmaps, complaints, skipped = [], [], [], [], 0
     for path in paths:
         anchor = datetime.now()
         with open_log(path) as fh:
@@ -103,6 +104,10 @@ def collect(paths):
                 mm = DNSMAP_RE.search(line)
                 if mm:
                     dnsmaps.append((ts, mm.group(1), mm.group(2)))
+                    continue
+                mc = COMPLAINT_RE.search(line)
+                if mc:
+                    complaints.append((ts, mc.group(1), mc.group(2), mc.group(3)))
                     continue
                 mv = VERDICT_RE.search(line)
                 if mv:
@@ -137,7 +142,7 @@ def collect(paths):
               if p["op"] != "" or
               not any(p["key"] == k and abs((p["ts"] - t).total_seconds()) <= 5
                       for k, t in trc_keys)]
-    return promos, verdicts, dnsmaps, skipped
+    return promos, verdicts, dnsmaps, complaints, skipped
 
 
 def join(promos, verdicts, dnsmaps, window, dedupe, lookback=86400):
@@ -254,6 +259,7 @@ def evaluate(rows, split_epoch):
 def selftest():
     """Склейка на синтетическом логе: подтверждение, отказ, таймаут, дедуп."""
     log = """10-29 09:00:00 DBG: dns-map: stale.example -> 1.1.1.1
+10-30 09:50:00 INFO: COMPLAINT: broken.example -> 1.1.1.1 (test)
 10-30 09:55:00 DBG: dns-map: a.example.com -> 1.1.1.1
 10-30 10:00:00 DBG: TRC sig=FAST/TCP-SYN dst=1.1.1.1 pr=tcp st=SYN_SENT dp=443 sp=10 op=3 ob=180 rp=0 rb=0 hr=0 fn=1 dom=a.example ref=-
 10-30 10:00:20 INFO: AUTO-SUSANIN: CONFIRMED 1.1.1.1:443 label=clean
@@ -273,12 +279,14 @@ def selftest():
     path = "/tmp/_susanin_dataset_selftest.log"
     with open(path, "w") as fh:
         fh.write(log)
-    promos, verdicts, dnsmaps, skipped = collect([path])
+    promos, verdicts, dnsmaps, complaints, skipped = collect([path])
     rows, stats = join(promos, verdicts, dnsmaps, window=90, dedupe=60,
                        lookback=86400)
     by = {(r["key"], r["time"]): r for r in rows}
     checks = [
         (skipped == 1, "строка без даты отброшена и посчитана"),
+        (len(complaints) == 1 and complaints[0][1] == "broken.example",
+         "жалоба распарсена и учтена"),
         (len(rows) == 7, "семь событий: двойная запись промоушена свёрнута"),
         (sum(1 for r in rows if r["key"] == "5.5.5.5:443") == 1 and
          by[("5.5.5.5:443", "10:04:00")]["op"] == "3",
@@ -336,7 +344,7 @@ def main():
     if not a.logs:
         ap.error("нужен хотя бы один лог (или --selftest)")
 
-    promos, verdicts, dnsmaps, skipped = collect(a.logs)
+    promos, verdicts, dnsmaps, complaints, skipped = collect(a.logs)
     rows, stats = join(promos, verdicts, dnsmaps, a.window, a.dedupe,
                        a.lookback)
     rows.sort(key=lambda r: r["_ts"])
@@ -374,6 +382,7 @@ def main():
         w.writerows(rows)
 
     if a.summary:
+        print("жалоб (COMPLAINT): %d" % len(complaints), file=sys.stderr)
         print("=== сводка ===", file=sys.stderr)
         print("строк без даты (пропущено): %d" % skipped, file=sys.stderr)
         print("вердиктов найдено: %d" % len(verdicts), file=sys.stderr)
