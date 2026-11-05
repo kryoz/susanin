@@ -111,6 +111,7 @@ void config_set_defaults(susanin_config *c)
     c->judge_interval = 1;
     c->health_interval = 5;
     c->fast_syn_min_op = 2;
+    c->udp_min_op = 3;
     c->ok_ttl = 6 * 3600;
     c->ok_refresh_below = 3 * 3600;
     c->ok_max_entries = 4096;
@@ -118,6 +119,7 @@ void config_set_defaults(susanin_config *c)
     c->promo_per_min = 120;
     c->test_ttl = 60;
     c->cooldown_ttl = 5 * 60;
+    c->ipset_batch = 1;
     c->cooldown_ok_ttl = 30;
     c->watch_ttl = 8;
     c->watch_retry_below = 4;
@@ -134,6 +136,7 @@ void config_set_defaults(susanin_config *c)
     snprintf(c->domain_prior_file, sizeof(c->domain_prior_file), "%s",
              "/opt/susanin/etc/domain_prior.txt");
     c->vpn_never_interval = 300;
+    c->vpn_refresh_budget_ms = 250;
     snprintf(c->log_level, sizeof(c->log_level), "%s", "info");
     snprintf(c->xray_loglevel, sizeof(c->xray_loglevel), "%s", "warning");
     snprintf(c->xray_gogc, sizeof(c->xray_gogc), "%s", "50");
@@ -374,6 +377,9 @@ int config_load(const char *path, susanin_config *c)
             c->fast_syn_min_op = (int)strtol(val, NULL, 0);
             seen |= PREC_FAST_SYN;
         }
+        else if (!strcmp(key, "udp_min_op")) {
+            c->udp_min_op = (int)strtol(val, NULL, 0);
+        }
         else if (!strcmp(key, "ok_ttl"))
             c->ok_ttl = parse_dur(val, U_SEC);
         else if (!strcmp(key, "ok_refresh_below"))
@@ -388,6 +394,8 @@ int config_load(const char *path, susanin_config *c)
             c->promo_per_min = (int)strtol(val, NULL, 0);
         else if (!strcmp(key, "test_ttl"))
             c->test_ttl = parse_dur(val, U_MIN);
+        else if (!strcmp(key, "ipset_batch"))
+            c->ipset_batch = (int)strtol(val, NULL, 0);
         else if (!strcmp(key, "cooldown_ttl"))
             c->cooldown_ttl = parse_dur(val, U_MIN);
         else if (!strcmp(key, "cooldown_ok_ttl"))
@@ -416,6 +424,8 @@ int config_load(const char *path, susanin_config *c)
             set_str(c->domain_prior_file, sizeof(c->domain_prior_file), val);
         else if (!strcmp(key, "vpn_never_interval"))
             c->vpn_never_interval = parse_dur(val, U_SEC);
+        else if (!strcmp(key, "vpn_refresh_budget_ms"))
+            c->vpn_refresh_budget_ms = (int)strtol(val, NULL, 0);
             else if (!strcmp(key, "log_level"))
                 set_str(c->log_level, sizeof(c->log_level), val);
             else if (!strcmp(key, "xray_loglevel"))
@@ -690,6 +700,10 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "health_interval=%d\n", out_dur(c->health_interval, U_SEC));
     fprintf(fp, "# «Быстрый» детект: SYN без ответа до реакции (1 = быстрее, больше ложных).\n");
     fprintf(fp, "fast_syn_min_op=%d\n", c->fast_syn_min_op);
+    fprintf(fp, "# UDP: сколько неотвеченных пакетов в потоке нужно до заворота адреса\n");
+    fprintf(fp, "# в VPN. Голосовые хендшейки (Discord) дают 3 пакета с нового порта и\n");
+    fprintf(fp, "# сдаются — при большом значении адрес не успевает выучиться. 0 = 12.\n");
+    fprintf(fp, "udp_min_op=%d\n", c->udp_min_op);
     fprintf(fp, "# TTL выученных ok-адресов, сек; 0 = никогда не истекает (наборы растут).\n");
     fprintf(fp, "ok_ttl=%d\n", out_dur(c->ok_ttl, U_SEC));
     fprintf(fp, "# Обновлять ok-адрес, если до истечения меньше заданного, ч.\n");
@@ -704,6 +718,8 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "test_ttl=%d\n", out_dur(c->test_ttl, U_MIN));
     fprintf(fp, "# «Остывание» после снятия адреса из ok, мин.\n");
     fprintf(fp, "cooldown_ttl=%d\n", out_dur(c->cooldown_ttl, U_MIN));
+    fprintf(fp, "# Применять ipset-операции пачкой (ipset restore): 1 = да, 0 = поштучно.\\n");
+    fprintf(fp, "ipset_batch=%d\n", c->ipset_batch);
     fprintf(fp, "# «Остывание» успешно подтверждённого адреса, сек.\n");
     fprintf(fp, "cooldown_ok_ttl=%d\n", out_dur(c->cooldown_ok_ttl, U_SEC));
     fprintf(fp, "# TTL «наблюдения» за подозрительным потоком, сек.\n");
@@ -729,6 +745,10 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "domain_prior_file=%s\n", c->domain_prior_file);
     fprintf(fp, "# Период обновления списка «всегда напрямую», сек.\n");
     fprintf(fp, "vpn_never_interval=%d\n", out_dur(c->vpn_never_interval, U_SEC));
+    fprintf(fp, "# Бюджет DNS-обновления списков за один проход, мс (0 = 4000).\n");
+    fprintf(fp, "# Меньше — короче паузы главного цикла (важно для быстрой реакции\n");
+    fprintf(fp, "# на голос/UDP), но списки обновляются за большее число проходов.\n");
+    fprintf(fp, "vpn_refresh_budget_ms=%d\n", c->vpn_refresh_budget_ms);
     fprintf(fp, "# Уровень логов агента: quiet | error | warn | info | debug | trace.\n");
     fprintf(fp, "log_level=%s\n", c->log_level);
     fprintf(fp, "# Уровень логов Xray: debug | info | warning | none (читает xray-egress.sh).\n");
@@ -979,6 +999,7 @@ void config_print(const susanin_config *c)
     printf("judge_interval=%d\n", out_dur(c->judge_interval, U_SEC));
     printf("health_interval=%d\n", out_dur(c->health_interval, U_SEC));
     printf("fast_syn_min_op=%d\n", c->fast_syn_min_op);
+    printf("udp_min_op=%d\n", c->udp_min_op);
     printf("ok_ttl=%d\n", out_dur(c->ok_ttl, U_SEC));
     printf("ok_refresh_below=%d\n", out_dur(c->ok_refresh_below, U_HOUR));
     printf("ok_max_entries=%d\n", c->ok_max_entries);
@@ -986,6 +1007,7 @@ void config_print(const susanin_config *c)
     printf("promo_per_min=%d\n", c->promo_per_min);
     printf("test_ttl=%d\n", out_dur(c->test_ttl, U_MIN));
     printf("cooldown_ttl=%d\n", out_dur(c->cooldown_ttl, U_MIN));
+    printf("ipset_batch=%d\n", c->ipset_batch);
     printf("cooldown_ok_ttl=%d\n", out_dur(c->cooldown_ok_ttl, U_SEC));
     printf("watch_ttl=%d\n", out_dur(c->watch_ttl, U_SEC));
     printf("watch_retry_below=%d\n", out_dur(c->watch_retry_below, U_SEC));
@@ -999,6 +1021,7 @@ void config_print(const susanin_config *c)
     printf("vpn_never_file=%s\n", c->vpn_never_file);
     printf("domain_prior_file=%s\n", c->domain_prior_file);
     printf("vpn_never_interval=%d\n", out_dur(c->vpn_never_interval, U_SEC));
+    printf("vpn_refresh_budget_ms=%d\n", c->vpn_refresh_budget_ms);
     printf("log_level=%s\n", c->log_level);
     printf("xray_loglevel=%s\n", c->xray_loglevel);
     printf("xray_gogc=%s\n", c->xray_gogc);

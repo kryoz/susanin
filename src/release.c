@@ -12,8 +12,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define RELEASE_API "https://api.github.com/repos/R17a/Susanin.Keenetic/releases/latest"
-#define RELEASE_WEB "https://github.com/R17a/Susanin.Keenetic/releases/tag/"
+/* Форк: проверяем СВОИ релизы (kryoz), иначе панель предлагала бы тестерам
+ * откат на апстримные 0.4.x. */
+#define RELEASE_API "https://api.github.com/repos/kryoz/susanin/releases/latest"
+#define RELEASE_WEB "https://github.com/kryoz/susanin/releases/tag/"
 #define RELEASE_CACHE "/opt/susanin/var/release.state"
 #define RELEASE_TMP "/opt/susanin/var/release.json.tmp"
 #define RELEASE_DEFAULT_INTERVAL 43200   /* 12 ч */

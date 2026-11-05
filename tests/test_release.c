@@ -25,7 +25,7 @@ int main(void)
     CHECK(release_parse_payload("{\"tag_name\":\"0.4.3\"}", tag, sizeof(tag),
                                 url, sizeof(url)) == 0,
           "ответ без html_url разобран");
-    CHECK(strcmp(url, "https://github.com/R17a/Susanin.Keenetic/releases/tag/v0.4.3") == 0,
+    CHECK(strcmp(url, "https://github.com/kryoz/susanin/releases/tag/v0.4.3") == 0,
           "url собран из tag");
     CHECK(release_parse_payload("{\"message\":\"Not Found\"}", tag, sizeof(tag),
                                 url, sizeof(url)) != 0,

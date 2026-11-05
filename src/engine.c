@@ -113,6 +113,10 @@ static void resync_sets(const susanin_config *cfg, susanin_state *st)
     int udp, phase, i;
     time_t now = time(NULL);
     backend_ipset_flush(cfg);
+    /* Восстановление кэша — это сотни адресов: применяем одной пачкой
+     * (`ipset restore`), иначе на каждый адрес был fork+exec и старт/re-provision
+     * заметно тормозили. */
+    backend_batch_begin();
     for (udp = 0; udp < 2; udp++) {
         for (phase = 0; phase < 2; phase++) {
             const state_set *set = phase ? st_ok(st, udp) : st_test(st, udp);
@@ -140,6 +144,7 @@ static void resync_sets(const susanin_config *cfg, susanin_state *st)
         if (ttl > 0)
             backend_set_add(cfg, "susanin_never", st->never.v[i].addr, ttl);
     }
+    backend_batch_end();
     /* ipset'ы пусты — пины dns_sniff применим заново на следующем reconcile. */
     dns_sniff_reset_pins();
 }
@@ -841,6 +846,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         }
     }
     slog_init(cfg->log_level);
+    backend_batch_enable(cfg->ipset_batch);
     if (strcmp(cfg->disk_mode, "soft") == 0)
         slogf(SL_INFO, "disk_mode=soft: log file off, state not saved, no backups");
     if (cfg->ok_ttl == 0)
@@ -941,12 +947,16 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     slogf(SL_INFO, "engine started (egress=%s table=%d)", cfg->egress_interface, cfg->routing_table);
     if (va && tunnel_up) {
         last_force = time(NULL);
+        backend_batch_begin();
         force_pending = va_refresh(va, cfg);
+        backend_batch_end();
     }
     if (nv) {
         int nchanged = 0;
         last_never = time(NULL);
+        backend_batch_begin();
         never_pending = vn_refresh2(nv, cfg, &nchanged);
+        backend_batch_end();
         /* Тяжёлую чистку state делаем только при реальном изменении набора. */
         if (nchanged)
             never_state_clean(cfg, &st, last_never);
@@ -973,6 +983,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
             g_reload = 0;
             if (conf_path && config_load(conf_path, &nc) == 0) {
                 *cfg = nc;
+                backend_batch_enable(cfg->ipset_batch);
                 slogf(SL_INFO, "config reloaded: %s", conf_path);
                 /* W6: перечитать настройку индикатора релиза; при включении —
                  * проверка в ближайшие 30 с, а не через 12 ч. */
@@ -1422,7 +1433,9 @@ int engine_run(susanin_config *cfg, const char *conf_path)
              va_changed(va, cfg))) {
             time_t prev = last_force;
             last_force = now;
+            backend_batch_begin();
             force_pending = va_refresh(va, cfg);
+            backend_batch_end();
             if (force_pending)
                 last_force = prev;  /* догоняем оставшиеся домены вскоре */
         }
@@ -1434,7 +1447,9 @@ int engine_run(susanin_config *cfg, const char *conf_path)
             time_t prev = last_never;
             int nchanged = 0;
             last_never = now;
+            backend_batch_begin();
             never_pending = vn_refresh2(nv, cfg, &nchanged);
+            backend_batch_end();
             /* Чистим state только когда набор реально изменился: иначе обход всех
              * записей с inet_pton случался бы каждые 200 мс. */
             if (nchanged)

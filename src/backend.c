@@ -3,6 +3,8 @@
 #include "log.h"
 
 #include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +69,362 @@ static int run_argv(char *const argv[])
     if (WIFEXITED(st))
         return WEXITSTATUS(st);
     return -1;
+}
+
+/* ---- Батч ipset-операций ---------------------------------------------------
+ * Между backend_batch_begin() и backend_batch_end() все add/del копятся в
+ * текстовом буфере и применяются ОДНИМ `ipset restore -exist` — один fork на
+ * пачку вместо fork+exec на каждую запись. Это нужно там, где за проход
+ * меняются сотни записей:
+ *   - resync_sets() после ре-провижна/рестарта (восстановление кэша),
+ *   - обновление vpn_always/vpn_never (пины сотен IP за проход).
+ * На MIPS каждый fork+exec — единицы миллисекунд, и такой залп держал главный
+ * цикл секундами (в это время классификатор не работает и не выставляет
+ * метки — «маршрут не строится» с задержкой).
+ * Вложенность считается счётчиком; flush — на внешнем end(). */
+
+#define BT_PATH "/tmp/susanin-ipset.batch"
+#define BT_MAX (1024 * 1024)
+/* ipset принимает timeout не больше 2147483 с (INT_MAX/1000). Больше —
+ * «Syntax error: ... is out of range» и падает ВСЯ пачка ipset restore;
+ * так терялась запись с expire=0x7fffffff («никогда не истекает»).
+ * Такие записи отправляем как timeout 0 = бессрочно. */
+#define IPSET_MAX_TIMEOUT 2147483
+
+/* TTL для ipset: 0 = бессрочно; всё, что вне 1..2147483, приводим к 0. */
+static int ipset_ttl(int ttl)
+{
+    if (ttl <= 0 || ttl > IPSET_MAX_TIMEOUT)
+        return 0;
+    return ttl;
+}
+
+static char *g_bt;              /* накопленные команды restore */
+static size_t g_bt_len, g_bt_cap;
+static int g_bt_depth;
+static int g_bt_disabled;      /* 1 = батч выключен (конфиг или авария с ipset) */
+
+void backend_batch_enable(int on)
+{
+    g_bt_disabled = on ? 0 : 1;
+    if (g_bt_disabled) {
+        g_bt_depth = 0;
+        g_bt_len = 0;
+    }
+}
+
+void backend_batch_begin(void)
+{
+    if (g_bt_disabled)
+        return;
+    g_bt_depth++;
+}
+
+static int bt_space(size_t need)
+{
+    char *p;
+    size_t ncap;
+    if (g_bt_len + need + 1 <= g_bt_cap)
+        return 0;
+    if (g_bt_len + need + 1 > BT_MAX)
+        return -1;                  /* слишком большая пачка — применим поштучно */
+    ncap = g_bt_cap ? g_bt_cap * 2 : 8192;
+    while (ncap < g_bt_len + need + 1)
+        ncap *= 2;
+    p = realloc(g_bt, ncap);
+    if (!p)
+        return -1;
+    g_bt = p;
+    g_bt_cap = ncap;
+    return 0;
+}
+
+/* Добавить строку команды restore. 0 = накоплено, -1 = не вышло (тогда
+ * вызывающий сделает обычный fork+exec). */
+static int bt_cmd(const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0 || (size_t)n >= sizeof(line))
+        return -1;
+    if (bt_space((size_t)n) != 0)
+        return -1;
+    memcpy(g_bt + g_bt_len, line, (size_t)n);
+    g_bt_len += (size_t)n;
+    return 0;
+}
+
+/* Записать накопленный буфер в файл (вход для `ipset restore`). */
+static int bt_write_file(void)
+{
+    int fd = open(BT_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return -1;
+    if (write(fd, g_bt, g_bt_len) != (ssize_t)g_bt_len) {
+        close(fd);
+        unlink(BT_PATH);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+/* Сколько ждём `ipset restore`. ipset берёт глобальный lock: если процесс
+ * завис (например, читает stdin, который не закрывается), ВСЕ последующие
+ * вызовы ipset встают намертво, а вместе с ними и главный цикл агента (стенд
+ * 2026-11-02: лог замер, метки не ставились, туннель «умер»). Поэтому любой
+ * вызов ipset ограничен по времени и при таймауте убивается. */
+#define BT_RESTORE_TIMEOUT_MS 1500
+#define BT_APPLY_TIMEOUT_MS   2000
+
+/* Дождаться ребёнка не дольше timeout_ms. Возврат: код выхода, -1 ошибка,
+ * -2 таймаут (ребёнок убит SIGKILL). */
+static int bt_wait_child(pid_t pid, int timeout_ms)
+{
+    int waited = 0, st = -1;
+    for (;;) {
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid)
+            return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        if (w < 0)
+            return -1;
+        if (waited >= timeout_ms) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+            return -2;
+        }
+        usleep(20 * 1000);
+        waited += 20;
+    }
+}
+
+/* Применить пачку одним `ipset restore`, вернуть его код (0 = ок; -2 = завис
+ * и был убит). stderr/stdout ребёнка попадает в err. */
+static int bt_run_restore(char *err, size_t errsz)
+{
+    int p[2];
+    pid_t pid;
+    if (!err || !errsz)
+        return -1;
+    err[0] = '\0';
+    if (pipe(p) != 0)
+        return -1;
+    pid = fork();
+    if (pid == 0) {
+        int in = open(BT_PATH, O_RDONLY);
+        if (in >= 0) {
+            dup2(in, 0);
+            if (in > 2)
+                close(in);
+        }
+        /* Без файла restore читал бы унаследованный stdin и мог висеть вечно:
+         * в этом случае подставляем /dev/null (пустая пачка → мгновенный EOF). */
+        if (in < 0) {
+            int dn = open("/dev/null", O_RDONLY);
+            if (dn >= 0) {
+                dup2(dn, 0);
+                if (dn > 2)
+                    close(dn);
+            }
+        }
+        dup2(p[1], 1);
+        dup2(p[1], 2);
+        close(p[0]);
+        close(p[1]);
+        {
+            char *av[4];
+            av[0] = (char *)tool_ipset();
+            av[1] = "-exist";
+            av[2] = "restore";
+            av[3] = NULL;
+            execvp(av[0], av);
+        }
+        _exit(127);
+    }
+    close(p[1]);
+    if (pid < 0) {
+        close(p[0]);
+        return -1;
+    }
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+    {
+        int waited = 0, st = 0;
+        int done = 0, timedout = 0;
+        while (!done) {
+            char tmp[256];
+            ssize_t r;
+            pid_t w;
+            size_t got = strlen(err);
+            while ((r = read(p[0], tmp, sizeof(tmp))) > 0) {
+                if (got + 1 < errsz) {
+                    size_t n = (size_t)r;
+                    if (n > errsz - 1 - got)
+                        n = errsz - 1 - got;
+                    memcpy(err + got, tmp, n);
+                    got += n;
+                    err[got] = '\0';
+                }
+            }
+            w = waitpid(pid, &st, WNOHANG);
+            if (w == pid) {
+                done = 1;
+                break;
+            }
+            if (w < 0) {
+                done = 1;
+                break;
+            }
+            if (waited >= BT_RESTORE_TIMEOUT_MS) {
+                kill(pid, SIGKILL);
+                waitpid(pid, NULL, 0);
+                timedout = 1;
+                break;
+            }
+            usleep(20 * 1000);
+            waited += 20;
+        }
+        close(p[0]);
+        if (timedout)
+            return -2;
+        return (WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    }
+}
+
+/* Применить одну строку restore как обычную команду ipset (fallback).
+ * Строка — ровно то, что понимает `ipset restore`: "add SET VAL timeout N". */
+static int bt_apply_line(char *line)
+{
+    char *av[8];
+    char *p = line;
+    int n = 0;
+    int rc;
+    pid_t pid;
+    while (*p && n < 6) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        av[n++] = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        if (*p)
+            *p++ = '\0';
+    }
+    if (n < 2)
+        return -1;
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char *argv[8];
+        int k = 0, i;
+        int devnull = open("/dev/null", O_WRONLY);
+        argv[k++] = (char *)tool_ipset();
+        argv[k++] = "-exist";
+        for (i = 0; i < n; i++)
+            argv[k++] = av[i];
+        argv[k] = NULL;
+        if (devnull >= 0) {
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            if (devnull > 2)
+                close(devnull);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    rc = bt_wait_child(pid, BT_APPLY_TIMEOUT_MS);
+    return rc;
+}
+
+static int bt_flush(void)
+{
+    char err[256];
+    int rc;
+    if (!g_bt_len)
+        return 0;
+    if (bt_write_file() != 0) {
+        g_bt_len = 0;
+        return -1;
+    }
+    rc = bt_run_restore(err, sizeof(err));
+    if (rc == -2) {
+        /* ipset завис и держит свой lock: повторять поштучно нельзя — это
+         * только плодит зависшие процессы. Батч выключаем до рестарта. */
+        slogf(SL_ERROR, "ipset restore завис (больше %d мс) — процесс убит, "
+                        "батч ipset отключён до перезапуска агента",
+              BT_RESTORE_TIMEOUT_MS);
+        unlink(BT_PATH);
+        g_bt_len = 0;
+        backend_batch_enable(0);
+        return 0;
+    }
+    if (rc != 0) {
+        /* restore не принял пачку целиком (одна битая строка роняет весь
+         * restore: раньше из-за этого после рестарта не восстанавливался кэш).
+         * Применяем поштучно — медленнее, но без потери остальных записей. */
+        size_t off = 0;
+        int ncmd = 0, bad = 0;
+        char firstbad[512] = "";
+        while (off < g_bt_len) {
+            char *nl = memchr(g_bt + off, '\n', g_bt_len - off);
+            size_t len = nl ? (size_t)(nl - (g_bt + off)) : (g_bt_len - off);
+            if (len) {
+                char line[512];
+                if (len >= sizeof(line))
+                    len = sizeof(line) - 1;
+                memcpy(line, g_bt + off, len);
+                line[len] = '\0';
+                ncmd++;
+                if (bt_apply_line(line) != 0) {
+                    if (!bad)
+                        snprintf(firstbad, sizeof(firstbad), "%s", line);
+                    bad++;
+                }
+            }
+            off += len + (nl ? 1 : 0);
+        }
+        {
+            char e[200];
+            size_t i, j = 0;
+            for (i = 0; err[i] && j + 1 < sizeof(e); i++) {
+                if (err[i] == '\n' || err[i] == '\r')
+                    break;
+                e[j++] = err[i];
+            }
+            e[j] = '\0';
+            if (bad)
+                slogf(SL_WARN, "ipset restore rc=%d (%s): применено поштучно %d, "
+                               "ошибок %d, первая: %s",
+                      rc, e[0] ? e : "no stderr", ncmd - bad, bad, firstbad);
+            else
+                slogf(SL_INFO, "ipset restore rc=%d (%s): применил поштучно %d команд",
+                      rc, e[0] ? e : "no stderr", ncmd);
+        }
+        unlink(BT_PATH);
+        g_bt_len = 0;
+        return 0;               /* записи всё равно применены */
+    }
+    unlink(BT_PATH);
+    g_bt_len = 0;
+    return 0;
+}
+
+int backend_batch_end(void)
+{
+    int rc;
+    if (g_bt_depth > 0)
+        g_bt_depth--;
+    if (g_bt_depth > 0)
+        return 0;
+    rc = bt_flush();
+    if (rc != 0)
+        slogf(SL_ERROR, "ipset restore: пачка команд не применена (rc=%d)", rc);
+    return rc;
 }
 
 /* Run argv capturing combined stdout+stderr into out (truncated to outsz). */
@@ -742,7 +1100,16 @@ int backend_ipset_add_port(const susanin_config *c, int proto_udp, int phase_ok,
     char name[64], t[32], val[80];
     set_name(name, sizeof(name), proto_udp, phase_ok);
     backend_ipset_value(c, ip, port, proto_udp, val, sizeof(val));
-    snprintf(t, sizeof(t), "%d", ttl);
+    /* В обычном режиме наборы hash:ip — значение с ':' или ',' (остаток от
+     * port-aware) невалидно и роняет весь `ipset restore`; после рестарта из-за
+     * такой строки не восстанавливался весь кэш (стенд 2026-11-02). */
+    if (!(c && c->port_aware) && (!val[0] || strchr(val, ':') || strchr(val, ','))) {
+        slogf(SL_DEBUG, "ipset: пропускаю невалидное значение '%s' (%s)", val, name);
+        return -1;
+    }
+    if (g_bt_depth > 0 && bt_cmd("add %s %s timeout %d\n", name, val, ipset_ttl(ttl)) == 0)
+        return 0;
+    snprintf(t, sizeof(t), "%d", ipset_ttl(ttl));
     argv[0] = (char *)tool_ipset();
     argv[1] = "-exist";
     argv[2] = "add";
@@ -761,6 +1128,10 @@ int backend_ipset_del_port(const susanin_config *c, int proto_udp, int phase_ok,
     char name[64], val[80];
     set_name(name, sizeof(name), proto_udp, phase_ok);
     backend_ipset_value(c, ip, port, proto_udp, val, sizeof(val));
+    if (!(c && c->port_aware) && (!val[0] || strchr(val, ':') || strchr(val, ',')))
+        return -1;              /* см. комментарий в backend_ipset_add_port */
+    if (g_bt_depth > 0 && bt_cmd("del %s %s\n", name, val) == 0)
+        return 0;
     argv[0] = (char *)tool_ipset();
     argv[1] = "-exist";
     argv[2] = "del";
@@ -848,7 +1219,9 @@ int backend_set_add(const susanin_config *c, const char *set, const char *val,
     char *argv[8];
     char t[32];
     (void)c;
-    snprintf(t, sizeof(t), "%d", ttl);
+    if (g_bt_depth > 0 && bt_cmd("add %s %s timeout %d\n", set, val, ipset_ttl(ttl)) == 0)
+        return 0;
+    snprintf(t, sizeof(t), "%d", ipset_ttl(ttl));
     argv[0] = (char *)tool_ipset();
     argv[1] = "-exist";
     argv[2] = "add";
@@ -864,6 +1237,8 @@ int backend_set_del(const susanin_config *c, const char *set, const char *val)
 {
     char *argv[6];
     (void)c;
+    if (g_bt_depth > 0 && bt_cmd("del %s %s\n", set, val) == 0)
+        return 0;
     argv[0] = (char *)tool_ipset();
     argv[1] = "-exist";
     argv[2] = "del";
@@ -890,7 +1265,9 @@ int backend_net_add(const susanin_config *c, const char *cidr, int ttl)
     char *argv[8];
     char t[32];
     (void)c;
-    snprintf(t, sizeof(t), "%d", ttl);
+    if (g_bt_depth > 0 && bt_cmd("add susanin_ok_net %s timeout %d\n", cidr, ipset_ttl(ttl)) == 0)
+        return 0;
+    snprintf(t, sizeof(t), "%d", ipset_ttl(ttl));
     argv[0] = (char *)tool_ipset();
     argv[1] = "-exist";
     argv[2] = "add";
@@ -906,6 +1283,8 @@ int backend_net_del(const susanin_config *c, const char *cidr)
 {
     char *argv[6];
     (void)c;
+    if (g_bt_depth > 0 && bt_cmd("del susanin_ok_net %s\n", cidr) == 0)
+        return 0;
     argv[0] = (char *)tool_ipset();
     argv[1] = "-exist";
     argv[2] = "del";
