@@ -48,10 +48,17 @@ die() {
 
 # Скачивание: curl или wget-ssl (у BusyBox-wget нет HTTPS).
 pick_fetch() {
+	# Проверка именно HTTPS-дееспособности: в PATH роутера первым часто стоит
+	# BusyBox-wget без HTTPS, а GNU wget из Entware (/opt/bin) в нелогин-шелле
+	# может в PATH не быть (регрессия 2026-11-05: «нет .ipk для aarch64» при
+	# установленном wget-ssl).
+	_wget_ok() { "$1" --help 2>&1 | grep -q -- '--no-check-certificate'; }
 	if command -v curl >/dev/null 2>&1; then
 		fetch() { curl -fsSL "$1" -o "$2"; }
-	elif command -v wget >/dev/null 2>&1; then
+	elif command -v wget >/dev/null 2>&1 && _wget_ok wget; then
 		fetch() { wget -qO "$2" "$1"; }
+	elif [ -x /opt/bin/wget ] && _wget_ok /opt/bin/wget; then
+		fetch() { /opt/bin/wget -qO "$2" "$1"; }
 	else
 		die "need curl or wget-ssl (Entware: opkg update && opkg install ca-certificates wget-ssl; либо 'opkg install curl')"
 	fi
