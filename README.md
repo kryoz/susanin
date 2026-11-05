@@ -6,8 +6,8 @@
 [![KeeneticOS 5.1.4-5.1.5](https://img.shields.io/badge/KeeneticOS-5.1.4--5.1.5-orange)](README.md)
 [![Entware required](https://img.shields.io/badge/Entware-required-orange)](README.md)
 [![Architectures](https://img.shields.io/badge/arch-mipsel%20%7C%20mips%20%7C%20aarch64%20%7C%20armv7%20%7C%20x86__64-lightgrey)](README.md)
-[![License](https://img.shields.io/github/license/R17a/Susanin.Keenetic)](LICENSE)
-[![Downloads](https://img.shields.io/github/downloads/R17a/Susanin.Keenetic/total)](https://github.com/R17a/Susanin.Keenetic/releases)
+[![License](https://img.shields.io/github/license/kryoz/susanin)](LICENSE)
+[![Downloads](https://img.shields.io/github/downloads/kryoz/susanin/total)](https://github.com/kryoz/susanin/releases)
 
 Проект не связан и не аффилирован с Keenetic, Amnezia, WireGuard, MikroTik или
 авторами упомянутых сторонних проектов. Используйте на свой страх и риск —
@@ -20,22 +20,11 @@
 
 <hr>
 
-## 🇷🇺 Русский
-
-Проект сделан по [статье на Habr](https://habr.com/ru/articles/1076620/) и проекту
-[Fiark/susanin](https://github.com/Fiark/susanin) (адаптивная VPN-маршрутизация для
-MikroTik RouterOS), перенесён на роутеры Keenetic/Entware.
-
 Адаптивная маршрутизация: программа смотрит, какие соединения «не работают» из-за
 блокировок, пробует их через VPN, запоминает рабочие и дальше держит их в VPN. Если
 VPN недоступен — всё идёт напрямую. Есть и простой список доменов, которые должны
 идти через VPN **всегда** (без ручных списков IP — только имена, как в
 Keenetic).
-
-**Статус: релиз форка 0.5.0.** Проверено на Keenetic Giga (KN-1012, aarch64) и
-Keenetic Viva (MT7621, MIPS), KeeneticOS 5.1.4–5.1.6, Entware; клиентский
-OpenConnect-коннектор Keenetic (`nocliN`), WireGuard/AmneziaWG (`nwg*`) и
-Xray VLESS+REALITY (`egress_type=tproxy`). Только IPv4.
 
 **Что делает**
 
@@ -48,15 +37,117 @@ Xray VLESS+REALITY (`egress_type=tproxy`). Только IPv4.
   CIDR, IP;
 - fail-open (нет туннеля — прямой доступ), failover между несколькими VPN и
   автоматический возврат на приоритетный;
-- egress — интерфейс (`nwg*`, `wdtt*`, `nocli*`) или Xray/VLESS+REALITY (`egress_type=tproxy`);
+- egress — интерфейс (`nocli*`);
 - профили маршрутизации: до 4 списков «домены/CIDR → свой туннель»;
 - встроенная веб-панель (только LAN) с интерфейсом на русском, английском и
   китайском; по умолчанию выключена; кнопка «Не открывается сайт?» (жалоба, 0.5.0);
 - сам восстанавливает правила, если их снёс NDM (окно без правил ≤1 с, 0.5.0), и
   умеет маршрутизировать клиентов OpenConnect-сервера на этом же роутере.
 
-Не является VPN-клиентом: туннель («Другое подключение»: OpenConnect-коннектор,
-WireGuard/AmneziaWG) должен уже работать. IPv6 в v1 не поддерживается.
+Не является VPN-клиентом: туннель («Другое подключение»: OpenConnect-коннектор) должен уже работать. IPv6 в v1 не поддерживается.
+
+### Нововведения форка с v0.5.0
+
+#### Кнопка «Не открывается сайт?» 
+
+Иногда попадаются ресурсы, которые отдают только первые байты по запросу, а потом коннект зависает.
+Если у вас такой случай, то попробуйте данный функционал из веб-панели:
+
+![MARK SITE](MARK_SITE.png)
+
+Есть и расширение для браузера (Chrome/Edge/Yandex, Manifest V3): `ext/complain-chrome` — распаковать,
+`chrome://extensions` → «режим разработчика» → «Загрузить распакованное»;
+контекстное меню «Susanin: в VPN» на любой странице/ссылке + попап с вводом
+домена. Панельный адрес и токен — в попапе («Настройки панели»).
+
+Агент разрешит домен, снимет его с `vpn_never`, поставит адреса в
+тестовую фазу и разорвёт текущие коннекты клиента — браузер переподключится
+уже через туннель, а судья подтвердит исход по факту трафика. Сайт в
+`vpn_never` — жалоба отклоняется (сними с never и повтори). 
+
+CLI-аналог: `/opt/susanin/bin/susanin-agent complain <домен|ip>`. 
+
+#### domain_prior — очередь «быстрого прохода» для обучения Susanin
+
+Как работает Susanin обычно: он постоянно подозревает часть сайтов, что «их блокируют» и проверяет их через VPN. Проверять все сразу нельзя — стоит лимит (сколько-то адресов в минуту). Новый блокируемый сайт может простоять в очереди минуту-другую, и всё это время у тебя он «не открывается».
+
+Что даёт domain_prior: это короткий список доменов (по одному на строке, как `vpn_always.txt`). Если сайт из этого списка попался — Susanin проверяет его **первым, вне очереди**. Лимит не отменяется, правила не меняются — меняется только порядок: «проверь сначала то, что у меня уже пригревало».
+
+Аналогия: в аэропорту все стоят в одну очередь на досмотр, а `domain_prior` — это полоса «быстрый проход» для тех, кто летает отсюда каждый день.
+Или же своего рода дополнительный слой кеша между резидентным слоем проб и `vpn_always.txt`
+
+Важно, чем он **не** является:
+- это **не** «всегда в VPN» — для этого есть `vpn_always.txt`;
+- он не решает «блокировать/не блокировать» — вердикт как всегда выносит судья по факту трафика через туннель; ошибка в списке стоит ровно одну лишнюю проверку, ничего не ломая;
+- пустой файл = механизм просто выключен.
+
+Это прежде всего может оказаться полезно для нагруженных роутеров и частых запросов к флапающим CDN.
+
+Откуда берётся список: он строится **из твоей же сети** — Susanin пишет в лог, какие домены у тебя уезжали в VPN, а офлайн-скрипт (`tools/dataset.py`, одна команда на компьютере с Python) превращает суток лога в готовый `domain_prior.txt`. Кладёшь файл на роутер — он подхватывается сам, без рестарта. В поставке файл пустой и это нормально: приор — ускоритель, а не настройка, без которой не работает.
+
+#### Построение `domain_prior.txt` на базе своих логов
+
+Приор ускоряет повторное заворачивание доменов, которые уже блокировались в
+**твоей** сети. Инструмент — `tools/dataset.py` (чистый Python 3, без
+зависимостей; в пакет не входит, берётся из репозитория).
+
+**Шаг 1. На роутере включить видимость** (на несколько дней наблюдений;
+`log_level` и `dns_sniff` применяются только `restart`, не `reload`):
+
+```sh
+/opt/susanin/bin/susanin-agent config set log_level trace
+/opt/susanin/bin/susanin-agent config set dns_sniff 1
+sh /opt/susanin/tools/susanin.sh restart
+```
+
+**Шаг 2. Забрать логи** (нужны несколько суток; `trace` даёт ~3 МБ/сут,
+ротация на роутере держит только 3×5 МиБ — затягивать нельзя; `.gz` тренер
+читает сам):
+
+```sh
+scp -P 222 root@<роутер>:'/opt/susanin/var/susanin.log*' .
+```
+
+**Шаг 3. Обучить приор** (на машине с Python 3; зависимости не нужны).
+Тренеру нужны строки `dns-map:` — они пишутся при включённом `dns_sniff`:
+
+```sh
+scp -P 222 root@<роутер>:/opt/susanin/etc/vpn_always.txt .
+scp -P 222 root@<роутер>:/opt/susanin/etc/vpn_never.txt .
+python3 tools/dataset.py susanin.log* --prior domain_prior.txt \
+  --lists vpn_always.txt vpn_never.txt --eval-hours 12
+```
+
+- `--lists` вычеркивает из обучения домены твоих списков: пин-доменам приор
+  не нужен (они и так всегда в VPN), never-доменам противоречит (решение
+  владельца первее статистики);
+- `--deny deny.txt` (по желанию) — файл исключений по одному домену на
+  строку (`#` — комментарий). Сюда вычеркивают общие CDN с «коллапсальными»
+  подтверждениями: IP соседа по CDN-периферии реально блокируется, проба
+  честно подтверждает туннель, а домен-инфраструктура наследует вину соседа
+  (типичные кандидаты: `rtbcdn.*`, ozone-подобные маркетплейсы за общим
+  edge). После обучения просмотреть список глазами и довычеркнуть лишнее —
+  файл правится руками, это нормальный этап;
+- `--eval-hours 12` — честная оценка: приор учится на первых 12 часах,
+  проверяется на остальных. В сводке: `prior_promos` — сколько промоушенов
+  теста пришлось на prior-домены, `prior_conf` — сколько из них
+  подтвердились (точность = conf/promos), `domain_cov` — покрытия сколько
+  подтверждений вообще имеют известный домен (потолок ~20 %, клиенты с DoH
+  невидимы).
+
+**Шаг 4. Положить результат на роутер** (перечитывается по mtime, рестарт
+не нужен):
+
+```sh
+scp -P 222 domain_prior.txt root@<роутер>:/opt/susanin/etc/domain_prior.txt
+```
+
+**Что ожидать.** Приор меняет только порядок очереди промоушенов: кандидат
+из списка проходит **вперёд лимита** `promo_per_min`. На малоклиентской
+сети эффекта незаметно (очередь не насыщается), вердикты и пороги он не
+меняет никогда — проверять факт работы по строкам `prior (domain_prior)`
+в логе. Вред минимален по построению: лишний домен в списке стоит одну
+лишнюю пробу.
 
 **Требования**
 
@@ -72,10 +163,12 @@ WireGuard/AmneziaWG) должен уже работать. IPv6 в v1 не по�
 
 **Быстрый старт**
 
+Установка из релизов форка:
+
 ```sh
-opkg update && opkg install ca-certificates wget-ssl
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
-susanin version && susanin status && susanin diagnose
+opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
+  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.5.0 --yes
 ```
 
 **Веб-панель (только LAN):** `web_enable=1`, `web_listen=192.168.1.1`,
@@ -93,69 +186,6 @@ susanin version && susanin status && susanin diagnose
 - [CHANGELOG.md](CHANGELOG.md) — что нового по версиям.
 
 <hr>
-
-### Этот форк: OpenConnect-коннектор (0.5.0)
-
-Egress форка — клиентский OpenConnect-коннектор Keenetic («Другие подключения»,
-netdev `nocliN`); авто-детект находит его сам. Отличия от WireGuard: Keenetic
-поднимает коннектор с `accept-addresses`/`accept-routes` (в main-таблице сотни
-префиксов через `nocli1`, а `default` остаётся на WAN), поэтому в таблицу 100
-добавляется `default dev nocli1` — единственное, что даёт «всё помеченное → в
-туннель». DNS туннеля задаётся в ndm: `ip name-server <peer> vpn on OpenConnect1`.
-`oc+` и `dns_hijack` — про OpenConnect-**сервер** на том же роутере, коннектору
-они не нужны.
-
-Установка из релизов форка:
-
-```sh
-opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
-wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
-  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.5.0 --yes
-```
-
-#### Кнопка «Не открывается сайт?» (0.5.0)
-
-Если у клиента сайт не открывается (и не открывается через прокси), а панель
-показывает «всё нормально» — нажми кнопку рядом с Reset и введи домен (или
-IP). Агент разрешит домен, снимет его с `vpn_never`, поставит адреса в
-тестовую фазу и разорвёт текущие коннекты клиента — браузер переподключится
-уже через туннель, а судья подтвердит исход по факту трафика. Сайт в
-`vpn_never` — жалоба отклоняется (сними с never и повтори). CLI-аналог:
-`/opt/susanin/bin/susanin-agent complain <домен|ip>`.
-
-#### Свой `domain_prior.txt` из своих логов (офлайн, 0.5.0)
-
-Приор ускоряет повторное заворачивание доменов, которые уже блокировались в
-**твоей** сети. Инструмент — `tools/dataset.py` (чистый Python 3, без
-зависимостей; в пакет не входит, берётся из репозитория).
-
-1. На роутере включить видимость (на несколько дней наблюдений):
-
-   ```sh
-   /opt/susanin/bin/susanin-agent config set log_level trace
-   /opt/susanin/bin/susanin-agent config set dns_sniff 1
-   sh /opt/susanin/tools/susanin.sh restart
-   ```
-
-2. Забрать логи (несколько суток; `trace` даёт ~3 МБ/сут, ротация на роутере
-   держит только 3×5 МиБ — затягивать нельзя):
-
-   ```sh
-   scp -P 222 root@<роутер>:'/opt/susanin/var/susanin.log*' .
-   ```
-
-3. Обучить приор (нужны строки `dns-map:` — они пишутся при включённом
-   `dns_sniff`; оценка точности — `--eval-hours`):
-
-   ```sh
-   python3 tools/dataset.py susanin.log* --prior domain_prior.txt --eval-hours 12
-   ```
-
-4. Результат положить на роутер (перечитывается по mtime, рестарт не нужен):
-
-   ```sh
-   scp -P 222 domain_prior.txt root@<роутер>:/opt/susanin/etc/domain_prior.txt
-   ```
 
 ## 🇬🇧 English
 
