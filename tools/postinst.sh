@@ -107,6 +107,8 @@ if [ -f "$CONF" ]; then
 	ensure_key vpn_always_interval 300
 	ensure_key vpn_never_file /opt/susanin/etc/vpn_never.txt
 	ensure_key vpn_never_interval 300
+	# 0.5.0: приор автообучения; seed файла создаётся циклом списков ниже.
+	ensure_key domain_prior_file /opt/susanin/etc/domain_prior.txt
 	ensure_key lan_server_interfaces ""
 	ensure_key dp_check_interval 15
 	ensure_key learn_min_op 10
@@ -324,7 +326,7 @@ merge_list() { # merge_list <файл пользователя> <файл пак
 if [ "${SUSANIN_KEEP_LISTS:-0}" = 1 ]; then
 	say "--keep-lists: списки vpn_always/vpn_never не трогаем"
 fi
-for _l in vpn_always vpn_never; do
+for _l in vpn_always vpn_never domain_prior; do
 	if [ ! -f "$PREFIX/etc/$_l.txt" ]; then
 		if [ -f "$SHARE/$_l.txt" ]; then
 			cp "$SHARE/$_l.txt" "$PREFIX/etc/$_l.txt"

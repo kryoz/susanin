@@ -45,6 +45,7 @@ doc     LICENSE
 
 cfg     config.example.conf
 share   cdn_ranges.txt
+share   domain_prior.txt
 share   vpn_always.txt
 share   vpn_never.txt
 share   xray-tproxy.json.example
