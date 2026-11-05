@@ -511,6 +511,26 @@ int ops_reset(const susanin_config *cfg, const char *arg)
 }
 
 
+
+/* Золотая метка жалобы обязана лежать в susanin.log — его собирает
+ * коллектор корпуса. slogf веб-процесса пишёт в susanin-web.log, поэтому
+ * дублируем прямым аппендом; строка короткая, append-атомарности хватает. */
+static void complaint_mark(const char *arg, const char *ip, const char *suffix)
+{
+    char ts[24];
+    struct tm tm;
+    time_t t = time(NULL);
+    FILE *fp;
+    gmtime_r(&t, &tm);
+    strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tm);
+    slogf(SL_INFO, "COMPLAINT: %s -> %s %s", arg, ip, suffix);
+    fp = fopen("/opt/susanin/var/susanin.log", "a");
+    if (fp) {
+        fprintf(fp, "%s INFO: COMPLAINT: %s -> %s %s\n", ts, arg, ip, suffix);
+        fclose(fp);
+    }
+}
+
 /* Жалоба «сайт не работает» (этап 2, 2026-11-04): пользователь — единственный
  * детектор класса «сервер отвечает, но браузеру мало» (memdoor.ai: счётчики
  * потока здоровые, см. отрицательный результат по STARVE-CAND). Действие:
@@ -562,6 +582,24 @@ int ops_complain(const susanin_config *cfg, const char *arg)
             }
         }
         if (n == 0) {
+            /* Инцидент 2026-11-05: DNS туннеля (172.16.10.1) умер при живом
+             * туннеле — жалоба обязана работать и в этом случае: повторяем
+             * через системный DNS-прокси ndm. */
+            int i2;
+            for (i2 = 0; i2 < nn && n < 32; i2++) {
+                char tmp[16][16];
+                int m = va_dns_query("127.0.0.1", names[i2], tmp, 16, 1500);
+                int j, x;
+                for (j = 0; j < m && n < 32; j++) {
+                    int dup = 0;
+                    for (x = 0; x < n; x++)
+                        if (!strcmp(ips[x], tmp[j])) { dup = 1; break; }
+                    if (!dup)
+                        snprintf(ips[n++], sizeof(ips[0]), "%.15s", tmp[j]);
+                }
+            }
+        }
+        if (n == 0) {
             fprintf(stderr, "[susanin] complain %s: ничего не разрешилось\n", arg);
             return 1;
         }
@@ -576,7 +614,7 @@ int ops_complain(const susanin_config *cfg, const char *arg)
         if (vn && vn_has(ips[i])) {
             /* Never-список — сознательное решение владельца: жалоба не
              * должна его молча обходить (пин вернулся бы на refresh). */
-            slogf(SL_INFO, "COMPLAINT: %s -> %s REFUSED (vpn_never)", arg, ips[i]);
+            complaint_mark(arg, ips[i], "REFUSED (vpn_never)");
             printf("[susanin] complain %s: %s в vpn_never — уберите из списка\n",
                    arg, ips[i]);
             continue;
@@ -588,7 +626,7 @@ int ops_complain(const susanin_config *cfg, const char *arg)
             backend_ipset_add_port(cfg, udp, 0, ips[i], 0, cfg->test_ttl);
         }
         backend_ct_flush_ip(ips[i]);
-        slogf(SL_INFO, "COMPLAINT: %s -> %s (test)", arg, ips[i]);
+        complaint_mark(arg, ips[i], "(test)");
         printf("[susanin] complain %s%s: %s -> test (%d c)\n",
                zone ? "zone " : "", arg, ips[i], cfg->test_ttl);
     }

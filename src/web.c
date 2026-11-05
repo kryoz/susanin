@@ -1279,7 +1279,7 @@ static void handle_action(int fd, const susanin_config *cfg, const char *target,
     }
     if (!strcmp(target, "/api/complain")) {
         if (!form_get(body, "ip", a, sizeof(a)) || !a[0]) { json_err(fd, "value required"); return; }
-        ops_complain(cfg, a);
+        if (ops_complain(cfg, a) != 0) { json_err(fd, "не разрешилось"); return; }
         json_ok(fd, "\"action\":\"complain\"");
         return;
     }
