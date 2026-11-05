@@ -46,7 +46,7 @@ Keenetic).
 
 Не является VPN-клиентом: туннель («Другое подключение»: OpenConnect-коннектор) должен уже работать. IPv6 в v1 не поддерживается.
 
-### Нововведения форка с v0.5.0
+### Нововведения форка с v0.5.0-oc
 
 #### Кнопка «Не открывается сайт?» 
 
@@ -168,7 +168,7 @@ scp -P 222 domain_prior.txt root@<роутер>:/opt/susanin/etc/domain_prior.tx
 ```sh
 opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
-  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.5.0 --yes
+  | SUSANIN_REPO=kryoz/susanin sh -s -- --ipk --version v0.5.0-oc --yes
 ```
 
 **Веб-панель (только LAN):** `web_enable=1`, `web_listen=192.168.1.1`,
