@@ -213,6 +213,40 @@ CLI-аналог: `/opt/susanin/bin/susanin-agent complain <домен|ip>`.
 sh /opt/susanin/tools/susanin.sh web start   # http://<адрес роутера>:8087, только LAN
 ```
 
+### Свой `domain_prior.txt` из своих логов (офлайн, 0.5.0)
+
+Приор ускоряет повторное заворачивание доменов, которые уже блокировались в
+**твоей** сети. Инструмент — `tools/dataset.py` (чистый Python 3, без
+зависимостей; в пакет не входит, берётся из репозитория).
+
+1. На роутере включить видимость (на несколько дней наблюдений):
+
+   ```sh
+   /opt/susanin/bin/susanin-agent config set log_level trace
+   /opt/susanin/bin/susanin-agent config set dns_sniff 1
+   sh /opt/susanin/tools/susanin.sh restart
+   ```
+
+2. Забрать логи (несколько суток; `trace` даёт ~3 МБ/сут, ротация на роутере
+   держит только 3×5 МиБ — затягивать нельзя):
+
+   ```sh
+   scp -P 222 root@<роутер>:'/opt/susanin/var/susanin.log*' .
+   ```
+
+3. Обучить приор (нужны строки `dns-map:` — они пишутся при включённом
+   `dns_sniff`; оценка точности — `--eval-hours`):
+
+   ```sh
+   python3 tools/dataset.py susanin.log* --prior domain_prior.txt --eval-hours 12
+   ```
+
+4. Результат положить на роутер (перечитывается по mtime, рестарт не нужен):
+
+   ```sh
+   scp -P 222 domain_prior.txt root@<роутер>:/opt/susanin/etc/domain_prior.txt
+   ```
+
 ## Важно: «Приоритеты подключений» Keenetic и Susanin.Keenetic
 
 Keenetic умеет сам направлять устройства и сегменты в VPN (Web →
