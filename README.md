@@ -55,9 +55,9 @@ Keenetic).
 
 ![MARK SITE](MARK_SITE.png)
 
-Есть и расширение для браузера (Chrome/Edge/Yandex, Manifest V3): `ext/complain-chrome` — распаковать,
+Есть и расширение для браузера (Chrome/Edge/Yandex, Manifest V3): `ext/susanin-helper` — распаковать,
 `chrome://extensions` → «режим разработчика» → «Загрузить распакованное»;
-контекстное меню «Susanin: в VPN» на любой странице/ссылке + попап с вводом
+контекстное меню «Susanin Helper: в VPN» на любой странице/ссылке + попап с вводом
 домена и кнопками «В always / Из always / В never / Из never» для текущего
 сайта (списки панели, тот же `POST /api/list`, что у редактора панели).
 Панельный адрес и токен — в попапе («Настройки панели»).

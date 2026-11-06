@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-- `ext/complain-chrome`: кнопки «В always / Из always / В never / Из never»
+- `ext/susanin-helper`: кнопки «В always / Из always / В never / Из never»
   для текущего сайта — тот же `POST /api/list`, что у редактора панели
   (добавление существующей / удаление отсутствующей записи — идемпотентно).
 

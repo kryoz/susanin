@@ -40,7 +40,7 @@ function notify(domain, text) {
 chrome.runtime.onInstalled.addListener(function () {
   chrome.contextMenus.create({
     id: "susanin-vpn",
-    title: "Susanin: в VPN",
+    title: "Susanin Helper: в VPN",
     contexts: ["page", "link", "selection"]
   });
 });
