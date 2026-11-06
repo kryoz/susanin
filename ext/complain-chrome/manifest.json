@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Susanin — в VPN",
-  "description": "Жалоба «не открывается сайт» из браузера в Susanin.Keenetic (кнопка панели, та же семантика)",
-  "version": "0.1",
+  "description": "Жалоба «не открывается сайт» и списки always/never из браузера в Susanin.Keenetic (кнопка панели, та же семантика)",
+  "version": "0.2",
   "permissions": ["contextMenus", "notifications", "storage", "activeTab"],
   "host_permissions": ["http://*/*"],
   "background": { "service_worker": "background.js" },

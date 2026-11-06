@@ -16,6 +16,33 @@ async function settings() {
   const s = await chrome.storage.local.get(["panelUrl", "token"]);
   return { base: (s.panelUrl || DEFAULT_PANEL).replace(/\/+$/, ""), token: s.token || "" };
 }
+async function listOp(list, op) {
+  if (!curHost) {
+    $("lst").className = "err";
+    $("lst").textContent = "нет текущего сайта";
+    return;
+  }
+  const { base, token } = await settings();
+  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  if (token) headers["X-Auth-Token"] = token;
+  try {
+    const r = await fetch(base + "/api/list", {
+      method: "POST",
+      headers: headers,
+      body: "list=" + list + "&op=" + op + "&value=" + encodeURIComponent(curHost)
+    });
+    const j = await r.json().catch(function () { return {}; });
+    const ok = r.ok && j.ok;
+    $("lst").className = ok ? "" : "err";
+    $("lst").textContent = ok
+      ? curHost + (op === "add" ? " — в " + list : " — убран из " + list)
+      : (j.error || "панель отказала");
+  } catch (e) {
+    $("lst").className = "err";
+    $("lst").textContent = "нет связи";
+  }
+}
+
 
 chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
   try {
@@ -26,6 +53,10 @@ chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
 
 $("go").onclick = function () { send($("d").value.trim() || curHost); };
 $("curBtn").onclick = function () { send(curHost); };
+$("alAdd").onclick = function () { listOp("vpn_always", "add"); };
+$("alDel").onclick = function () { listOp("vpn_always", "del"); };
+$("nvAdd").onclick = function () { listOp("vpn_never", "add"); };
+$("nvDel").onclick = function () { listOp("vpn_never", "del"); };
 $("d").addEventListener("keydown", function (e) {
   if (e.key === "Enter") send(this.value.trim());
 });

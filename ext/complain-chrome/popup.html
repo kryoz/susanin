@@ -33,6 +33,9 @@
   }
   button.primary:hover { background: #1765cc; }
   button.wide { width: 100%; }
+  .row .grow { flex: 1; }
+  #lst { font-size: 12px; margin: -2px 0 6px; color: #188038; }
+  #lst.err { color: #d93025; }
   details { margin-top: 10px; border-top: 1px solid #e8eaed; padding-top: 8px; }
   summary { cursor: pointer; color: #5f6368; margin-bottom: 8px; }
   .grid {
@@ -56,6 +59,15 @@
   <div class="row">
     <button id="curBtn" class="wide">В VPN: эта страница</button>
   </div>
+  <div class="row">
+    <button id="alAdd" class="grow">В always</button>
+    <button id="alDel" class="grow">Из always</button>
+  </div>
+  <div class="row">
+    <button id="nvAdd" class="grow">В never</button>
+    <button id="nvDel" class="grow">Из never</button>
+  </div>
+  <div id="lst"></div>
   <details>
     <summary>Настройки панели</summary>
     <div class="grid">
