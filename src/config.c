@@ -111,7 +111,7 @@ void config_set_defaults(susanin_config *c)
     c->judge_interval = 1;
     c->health_interval = 5;
     c->fast_syn_min_op = 2;
-    c->udp_min_op = 3;
+    c->udp_min_op = 10;
     c->ok_ttl = 6 * 3600;
     c->ok_refresh_below = 3 * 3600;
     c->ok_max_entries = 4096;
@@ -701,8 +701,9 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "# «Быстрый» детект: SYN без ответа до реакции (1 = быстрее, больше ложных).\n");
     fprintf(fp, "fast_syn_min_op=%d\n", c->fast_syn_min_op);
     fprintf(fp, "# UDP: сколько неотвеченных пакетов в потоке нужно до заворота адреса\n");
-    fprintf(fp, "# в VPN. Голосовые хендшейки (Discord) дают 3 пакета с нового порта и\n");
-    fprintf(fp, "# сдаются — при большом значении адрес не успевает выучиться. 0 = 12.\n");
+    fprintf(fp, "# в VPN. 3 (апстрим v0.4.4, голос Discord) было мало: ложные SOFT UDP\n");
+    fprintf(fp, "# заворачивали здоровые RU-домены (ozon/avito, инцидент 2026-11-12).\n");
+    fprintf(fp, "# 0 = 12 (прежнее жёсткое значение).\n");
     fprintf(fp, "udp_min_op=%d\n", c->udp_min_op);
     fprintf(fp, "# TTL выученных ok-адресов, сек; 0 = никогда не истекает (наборы растут).\n");
     fprintf(fp, "ok_ttl=%d\n", out_dur(c->ok_ttl, U_SEC));

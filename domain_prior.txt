@@ -22,10 +22,7 @@ akamaiedge.net
 ekatox.com
 gcfiles.net
 huggingface.co
-crcdn.pro
 bpmlt.com
-jivosite.com
-warthunder.com
 akadns.net
 apdcdn.com
 enacdn.net
@@ -33,15 +30,12 @@ lenition.de
 mozilla.com
 steamcontent.com
 tildacdn.com
-vikisews.online
 kinescope.io
 awswaf.com
-pachca.com
 ovscdns.com
 gitlab.com
 gravatar.com
 vivaldi.com
-kaspersky.com
 cloudflare.com
 githubusercontent.com
 amazonaws.com

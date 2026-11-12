@@ -114,3 +114,35 @@ yandexcloud.net
 # а автообучение может ложно завернуть стрим («клиент шлёт — сервер молчит»).
 deepseek.com
 api.deepseek.com
+
+# --- Ozon: всегда напрямую ---
+# Регрессия апстрима v0.4.4 (смержен в 0.5.0): udp_min_op 12→3 — ложные
+# SOFT UDP завернули здоровые RU-домены в VPN (лог: SOFT UDP → CONFIRMED,
+# порты 650/599/21). Зоны ozon без wildcard-DNS (случайный поддомен —
+# NXDOMAIN): «*.zone» пинит только apex, поэтому нужны явные имена.
+# Новые хосты добираются по dns-map из лога (log_level=debug).
+*.ozon.ru
+www.ozon.ru
+api.ozon.ru
+*.ozon.com
+*.ozone.ru
+*.ozonusercontent.com
+
+*.avito.ru
+www.avito.ru
+api.avito.ru
+m.avito.ru
+static.avito.ru
+*.avito.com
+www.avito.com
+*.avito.st
+www.avito.st
+c10.img.avito.st
+c20.img.avito.st
+c30.img.avito.st
+c40.img.avito.st
+c50.img.avito.st
+c60.img.avito.st
+c70.img.avito.st
+c80.img.avito.st
+c90.img.avito.st
