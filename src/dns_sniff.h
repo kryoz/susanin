@@ -35,7 +35,15 @@ int  dns_sniff_count(void);
 void dns_sniff_diag(char *out, size_t n);
 /* 1 = нашли домен для IP; domain_out заполняется (может быть ""). */
 int  dns_sniff_domain_of(const char *ip, char *domain_out, unsigned n);
-/* 1 = IP принадлежит домену из domain_prior (история подтверждений). */
-int  dns_sniff_prior_of(const char *ip);
+
+#define DNS_DOMAIN_MAX 128
+
+/* r5.2: домен оканчивается на русский TLD из cfg->ru_guard_tlds
+ * (регистронезависимо, punycode-варианты включаются в список). */
+int  dns_sniff_is_ru_domain(const susanin_config *cfg, const char *dom);
+
+/* r5.4: сколько RU-доменов сейчас сидит в VPN (ok_tcp) — пишет
+ * /opt/susanin/var/ru-in-vpn для панели; вызывать из reconcile. */
+void dns_sniff_ru_audit(const susanin_config *cfg);
 
 #endif

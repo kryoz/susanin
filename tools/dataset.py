@@ -62,20 +62,6 @@ FIELDS = [
 ]
 
 
-# Многоуровневые публичные суффиксы: без зависимости от PSL хватает короткого
-# списка для eTLD+1 (дев-only инструмент, точности >95% достаточно).
-MULTI_TLD = {"co.uk", "org.uk", "gov.uk", "ac.uk", "com.au", "net.au", "com.br",
-             "co.jp", "co.kr", "co.nz", "com.mx", "com.tr", "com.ua", "com.cn"}
-
-
-def etld1(domain):
-    """a.b.example.co.uk -> example.co.uk; x.example.com -> example.com."""
-    d = domain.rstrip(".").split(".")
-    if len(d) >= 3 and ".".join(d[-2:]) in MULTI_TLD:
-        return ".".join(d[-3:])
-    return ".".join(d[-2:]) if len(d) >= 2 else domain
-
-
 def open_log(path):
     return gzip.open(path, "rt", errors="replace") if path.endswith(".gz") \
         else open(path, "rt", errors="replace")
@@ -212,83 +198,6 @@ def join(promos, verdicts, dnsmaps, window, dedupe, lookback=86400):
         })
     return rows, stats
 
-def read_deny(path):
-    """--deny: список eTLD+1, исключаемых из обучения (коллапсальные
-    подтверждения общих CDN: ozone/rtbcdn и т.п., регрессия 2026-11-05)."""
-    out = []
-    with open(path) as fh:
-        for ln in fh:
-            ln = ln.split("#", 1)[0].strip().lower()
-            if ln:
-                out.append(ln)
-    return out
-
-
-def in_lists(d, lines):
-    """eTLD+1 попадает в vpn_always/vpn_never: точное совпадение, родитель
-    (список накрывает поддомены) и wildcard *.parent. CIDR/IP-строки списка
-    доменам не сопоставляются — их etld1() не вернёт домен, строку пропускаем."""
-    for ln in lines:
-        if not ("." in ln) or "/" in ln or ln.replace(".", "").isdigit():
-            continue
-        if ln.startswith("*."):
-            base = ln[2:]
-            if d == base or d.endswith("." + base):
-                return True
-        elif d == ln or d.endswith("." + ln):
-            return True
-    return False
-
-
-def build_prior(rows, min_conf=2, deny=(), exclude=()):
-    """Приор по eTLD+1: CONFIRMED — за; COOLDOWN и отказы dok/direct/budget —
-    против (прямая жива или бюджет). TIMEOUT не считаем ничем: часть из них —
-    закрытое окно клиента, а не доказательство «прямо живо». Сглаживание —
-    Лаплас: score=(conf+1)/(conf+neg+2). exclude — содержимое
-    vpn_always/vpn_never: пин-доменам приор не нужен (они и так в VPN),
-    never-доменам противоречит (решение владельца первее статистики)."""
-    deny = {etld1(x) for x in deny}
-    st = {}
-    for r in rows:
-        dom = r.get("jdom") or (r["dom"] if r["dom"] not in ("-", "") else "")
-        if not dom:
-            continue
-        e = st.setdefault(etld1(dom), {"conf": 0, "neg": 0, "ips": set()})
-        if r["outcome"] == "CONFIRMED":
-            e["conf"] += 1
-            e["ips"].add(r["key"].rsplit(":", 1)[0])
-        elif r["outcome"] == "COOLDOWN" or r["ref"] in ("dok", "direct", "budget"):
-            e["neg"] += 1
-    out = []
-    for d, e in st.items():
-        if d in deny:
-            continue
-        if exclude and in_lists(d, exclude):
-            continue
-        if e["conf"] >= min_conf and \
-                (e["conf"] + 1.0) / (e["conf"] + e["neg"] + 2.0) > 0.5:
-            out.append((d, (e["conf"] + 1.0) / (e["conf"] + e["neg"] + 2.0),
-                        e["conf"], e["neg"], len(e["ips"])))
-    out.sort(key=lambda x: (-x[1], -x[2], x[0]))
-    return out
-
-
-def evaluate(rows, split_epoch, deny=(), exclude=()):
-    """Офлайн-оценка: приор строится только по рядам до split_epoch, проверяется
-    на последующих. hit — доля подтверждений теста, чей eTLD+1 был в приоре."""
-    train = [r for r in rows if r["_ts"] < split_epoch]
-    test = [r for r in rows if r["_ts"] >= split_epoch]
-    prior = {d for d, *_ in build_prior(train, deny=deny, exclude=exclude)}
-    conf = [r for r in test if r["outcome"] == "CONFIRMED"]
-    hits = sum(1 for r in conf if r["jdom"] and etld1(r["jdom"]) in prior)
-    cov = sum(1 for r in conf if r["jdom"])
-    pp = [r for r in test if r["jdom"] and etld1(r["jdom"]) in prior
-          and r["ref"] == "-"]
-    pp_ok = sum(1 for r in pp if r["outcome"] == "CONFIRMED")
-    return {"test_conf": len(conf), "prior_hit": hits, "domain_cov": cov,
-            "prior_promos": len(pp), "prior_conf": pp_ok,
-            "prior_size": len(prior), "train_rows": len(train),
-            "test_rows": len(test)}
 
 
 def selftest():
@@ -346,14 +255,6 @@ def selftest():
         (by[("1.1.1.1:443", "10:00:00")]["jdom"] == "a.example.com" and
          by[("2.2.2.2:443", "10:01:00")]["jdom"] == "",
          "домен склеен по IP из dns-map, устаревшая запись за окном отброшена"),
-        (not any(d == "example.com" for d, *_ in build_prior(rows, min_conf=1,
-                                                          deny=("example.com",))),
-         "prior: deny исключает домен"),
-        (not any(d == "example.com" for d, *_ in build_prior(
-            rows, min_conf=1, exclude=("*.example.com", "10.0.0.0/8"))),
-         "prior: vpn-список с wildcard исключает домен, CIDR-строка не ломает"),
-        (any(d == "example.com" for d, *_ in build_prior(rows, min_conf=1)),
-         "приор по eTLD+1 собирается из подтверждений"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     for _, msg in checks:
@@ -372,14 +273,6 @@ def main():
                     help="слиять повторы отказа по одному ключу, сек; 0 = выкл")
     ap.add_argument("--summary", action="store_true", help="сводка в stderr")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--prior", metavar="FILE",
-                    help="выгрузить доменный приор: eTLD+1 score conf neg ips")
-    ap.add_argument("--deny", metavar="FILE",
-                    help="файл доменов-исключений из обучения приора "
-                         "(eTLD+1, по строке; # — комментарий)")
-    ap.add_argument("--lists", metavar="FILE", nargs="*",
-                    help="файлы vpn_always.txt/vpn_never.txt: их домены "
-                         "(с wildcard *.x) исключаются из обучения приора")
     ap.add_argument("--lookback", type=int, default=86400,
                     help="окно склейки IP->домен по dns-map, сек (сутки)")
     ap.add_argument("--eval-hours", type=int, default=0, metavar="H",
@@ -395,30 +288,6 @@ def main():
     rows, stats = join(promos, verdicts, dnsmaps, a.window, a.dedupe,
                        a.lookback)
     rows.sort(key=lambda r: r["_ts"])
-
-    deny = read_deny(a.deny) if a.deny else ()
-    exclude = tuple(x for f in (a.lists or []) for x in read_deny(f))
-    if a.eval_hours and rows:
-        ev = evaluate(rows, rows[0]["_ts"] + a.eval_hours * 3600,
-                      deny=deny, exclude=exclude)
-        print("=== оценка приора (обучение %d ч) ===" % a.eval_hours,
-              file=sys.stderr)
-        for k in ("train_rows", "test_rows", "prior_size", "test_conf",
-                  "prior_hit", "domain_cov", "prior_promos", "prior_conf"):
-            print("%-14s %d" % (k, ev[k]), file=sys.stderr)
-
-    if a.prior:
-        pr = build_prior(rows, deny=deny, exclude=exclude)
-        with open(a.prior, "w") as fh:
-            fh.write("# domain_prior: eTLD+1 с историей подтверждений в VPN.\n"
-                     "# Один домен на строку: читает dns_sniff list_match,\n"
-                     "# формат как у vpn_always.txt (score здесь не нужен).\n")
-            for d, *_ in pr:
-                fh.write("%s\n" % d)
-        for d, sc, c, n, ips in pr[:20]:
-            print("prior %-30s score=%.3f conf=%d neg=%d ips=%d" %
-                  (d, sc, c, n, ips), file=sys.stderr)
-        print("prior: %d доменов -> %s" % (len(pr), a.prior), file=sys.stderr)
 
     if a.out:
         with open(a.out, "w", newline="") as fh:

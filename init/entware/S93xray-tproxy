@@ -7,6 +7,9 @@
 # Установка: /opt/etc/init.d/S93xray-tproxy (chmod +x).
 # Управление: S93xray-tproxy start|stop|restart
 
+# r7.1: локальное время логов (POSIX-пояс из конфига, напр. IST-8)
+_tz=$(sed -n "s/^tz=//p" /opt/susanin/etc/susanin.conf 2>/dev/null | head -n1)
+[ -n "$_tz" ] && export TZ="$_tz"
 XRAY=/opt/sbin/xray
 XCFG=/opt/susanin/etc/xray-tproxy.json
 LOGF=/opt/susanin/var/xray.log
@@ -40,6 +43,36 @@ xray_pid() {
 start() {
     [ -x "$XRAY" ] && [ -f "$XCFG" ] || { echo "xray-tproxy: нет Xray/конфига — пропуск"; return 0; }
     mkdir -p /opt/susanin/var
+    # Лог Xray в tmpfs (/tmp) — это отнятая у системы память:
+    # /tmp/xray.log вырос до 15 МБ, свободная память ушла ниже watermark, и
+    # OOM-killer убил сам Xray (интернет встал при свободном процессоре).
+    # Ранние версии скриптов и ручные запуски писали именно туда — подчищаем.
+    rm -f /tmp/xray.log 2>/dev/null || true
+    # Обрезка штатного лога: при loglevel=debug он растёт на мегабайты.
+    _logkb=$(sed -n 's/^xray_log_max_kb=//p' /opt/susanin/etc/susanin.conf 2>/dev/null | tail -n1)
+    [ -n "$_logkb" ] || _logkb=2048
+    if [ "$_logkb" -gt 0 ] 2>/dev/null && [ -f "$LOGF" ]; then
+        _sz=$(wc -c < "$LOGF" 2>/dev/null || echo 0)
+        if [ "$_sz" -gt $((_logkb * 1024)) ] 2>/dev/null; then
+            : > "$LOGF"
+            echo "xray-tproxy: лог обрезан (был $_sz байт, лимит ${_logkb}КБ)"
+        fi
+    fi
+    # Нехватка памяти: запуск только приблизит OOM — ядро убьёт Xray через
+    # секунды, а watchdog начнёт цикл «убило — подняли — снова убили».
+    # Порог включается ТОЛЬКО явным xray_min_mem_kb>0 в susanin.conf: по
+    # умолчанию 0 (выключено), как в 0.4.4. Зашитый 12288 блокировал подъём
+    # Xray на 122 МБ роутерах (регресс 0.4.6, откатан в 0.4.5-redo).
+    _memmin=$(sed -n 's/^xray_min_mem_kb=//p' /opt/susanin/etc/susanin.conf 2>/dev/null | tail -n1)
+    [ -n "$_memmin" ] || _memmin=0
+    if [ "$_memmin" -gt 0 ] 2>/dev/null; then
+        _av=$(awk '/MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+        if [ -n "$_av" ] && [ "$_av" -lt "$_memmin" ] 2>/dev/null; then
+            echo "xray-tproxy: НЕ запускаю — мало памяти (MemAvailable=${_av}КБ < ${_memmin}КБ)"
+            echo "xray-tproxy: освободите память или снизьте xray_min_mem_kb в susanin.conf"
+            return 0
+        fi
+    fi
     # Уровень логов Xray (независимо от log_level Susanin.Keenetic) — из susanin.conf.
     # Xray читает уровень только при старте, поэтому применяем его до запуска,
     # а для уже запущенного процесса нужен restart.
@@ -61,6 +94,29 @@ start() {
     [ -n "$_gogc" ] || _gogc=50
     _gomem=$(sed -n 's/^xray_gomemlimit=//p' /opt/susanin/etc/susanin.conf 2>/dev/null | tail -n1)
     [ -n "$_gomem" ] || _gomem=64MiB
+    # r7.7: pidfile мог потеряться (носитель был read-only / сбой журнала) —
+    # ищем наши процессы по cmdline (-config наш XCFG), усыновляем первого,
+    # дубликаты гасим. Без этого каждый 'S93 start' плодил новый экземпляр:
+    # на Viva накопилось 9 xray, туннель деградировал.
+    _ours=""
+    for _q in $(pidof xray 2>/dev/null || true); do
+        [ -r "/proc/$_q/cmdline" ] || continue
+        tr '\0' ' ' < "/proc/$_q/cmdline" 2>/dev/null | grep -q -- '-config' || continue
+        tr '\0' ' ' < "/proc/$_q/cmdline" 2>/dev/null | grep -q "$XCFG" && _ours="$_ours $_q"
+    done
+    if [ -n "$(echo $_ours | wc -w)" ] && [ "$(echo $_ours | wc -w)" -gt 1 ]; then
+        _keep=$(echo $_ours | awk '{print $1}')
+        for _q in $_ours; do
+            [ "$_q" = "$_keep" ] && continue
+            kill -TERM "$_q" 2>/dev/null || true
+            echo "xray-tproxy: дубликат pid=$_q снят (был потерян pidfile)"
+        done
+        _ours="$_keep"
+    fi
+    if [ -n "$_ours" ] && [ -z "$(xray_pid || true)" ]; then
+        echo "$_ours" > "$PIDF" 2>/dev/null || true
+        echo "xray-tproxy: усыновлен работающий pid=$_ours (pidfile был потерян)"
+    fi
     _run=$(xray_pid || true)
     if [ -z "$_run" ]; then
         GOGC="$_gogc" GOMEMLIMIT="$_gomem" "$XRAY" run -config "$XCFG" >>"$LOGF" 2>&1 &
@@ -90,7 +146,7 @@ stop() {
     # SIGTERM, затем ЖДЁМ завершения и добиваем SIGKILL. Старый вариант слал один
     # SIGTERM и сразу продолжал: если процесс висел в состоянии D (или игнорировал
     # сигнал), следующий start поднимал второй экземпляр — на роутере накопилось
-    # ~14 процессов Xray, память 101/122 МБ, load average ~20 (2026-10-10).
+    # ~14 процессов Xray, память 101/122 МБ, load average ~20.
     kill "$_p" 2>/dev/null
     _i=0
     while [ "$_i" -lt 10 ]; do

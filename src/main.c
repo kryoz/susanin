@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "config.h"
 #include "conntrack.h"
 #include "backend.h"
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *cfg_path(void)
@@ -29,7 +31,7 @@ static void usage(void)
         "  susanin-agent config set <key> <value>\n"
         "  susanin-agent discover\n"
         "  susanin-agent ct-scan\n"
-        "  susanin-agent datapath {up|down|status|flush|add|del}\n"
+        "  susanin-agent datapath {up|down|p5|p5-down|status|flush|add|del}\n"
         "  susanin-agent run\n"
         "  susanin-agent web\n"
         "  susanin-agent status\n"
@@ -39,6 +41,7 @@ static void usage(void)
         "  susanin-agent uninstall\n"
         "  susanin-agent reset <ip|domain>   (forget — синоним)\n"
         "  susanin-agent complain <ip|domain> (жалоба: сайт не работает)\n"
+        "  susanin-agent why <ip|domain>     (почему адрес идёт так: списки/наборы/кэш)\n"
         "  susanin-agent diag errors         (ERROR/WARN из лога агента)\n",
         SUSANIN_VERSION);
 }
@@ -108,7 +111,7 @@ static int cmd_datapath(int argc, char **argv)
     int n = 0, i;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: susanin-agent datapath {up|down|status|flush|add <ip> <tcp|udp> <test|ok>|del <ip> <tcp|udp>}\n");
+        fprintf(stderr, "usage: susanin-agent datapath {up|down|p5|p5-down|status|flush|add <ip> <tcp|udp> <test|ok>|del <ip> <tcp|udp>}\n");
         return 2;
     }
     newargv[n++] = (char *)script;
@@ -138,6 +141,12 @@ int main(int argc, char **argv)
     if (config_load(cfg_path(), &cfg) != 0) {
         fprintf(stderr, "warning: cannot read config %s; using defaults\n", cfg_path());
         config_set_defaults(&cfg);
+    }
+
+    /* r7.1: локальное время в логах (tz=POSIX, напр. IST-8). Пусто = как есть. */
+    if (cfg.tz[0]) {
+        setenv("TZ", cfg.tz, 1);
+        tzset();
     }
 
     if (!strcmp(cmd, "config")) {
@@ -200,6 +209,9 @@ int main(int argc, char **argv)
     /* complain <ip|domain> — жалоба «не работает»: test-фаза + золотая метка. */
     if (!strcmp(cmd, "complain"))
         return ops_complain(&cfg, argc > 2 ? argv[2] : NULL);
+    /* why <ip|domain> — диагностика маршрутизации адреса. */
+    if (!strcmp(cmd, "why"))
+        return ops_why(&cfg, argc > 2 ? argv[2] : NULL);
 
     if (!strcmp(cmd, "uninstall")) {
         printf("removing Susanin.Keenetic data plane ...\n");

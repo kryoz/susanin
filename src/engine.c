@@ -15,12 +15,14 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -47,38 +49,9 @@ static int collect(void *ud, const ct_flow *f)
     return 0;
 }
 
-static int ip_in_cidr(const char *ip, const char *cidr)
-{
-    char c[64];
-    char *slash;
-    struct in_addr a, n;
-    uint32_t mask, ah, nh;
-    int pre;
-    snprintf(c, sizeof(c), "%s", cidr);
-    slash = strchr(c, '/');
-    if (!slash)
-        return 0;
-    *slash = '\0';
-    pre = atoi(slash + 1);
-    if (inet_pton(AF_INET, ip, &a) != 1 || inet_pton(AF_INET, c, &n) != 1)
-        return 0;
-    mask = pre == 0 ? 0 : (0xffffffffu << (32 - pre));
-    ah = ntohl(a.s_addr);
-    nh = ntohl(n.s_addr);
-    return (ah & mask) == (nh & mask);
-}
-
-static int from_lan(const susanin_config *cfg, const char *src)
-{
-    char buf[512], *save = NULL, *tok;
-    snprintf(buf, sizeof(buf), "%s", cfg->lan_subnets);
-    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        while (*tok == ' ') tok++;
-        if (ip_in_cidr(src, tok))
-            return 1;
-    }
-    return 0;
-}
+/* Фильтры LAN/приватные — бинарные из classifier.c (clf_from_lan4/
+ * clf_is_private4): строковые версии тянули inet_pton и strtok на каждый
+ * поток в каждом проходе. */
 
 /* Ключ состояния -> элемент ipset: "1.2.3.4:443" превращается в "1.2.3.4,443"
  * (в port-aware режиме), обычный адрес идёт как есть. Нужно при ре-ассерте и
@@ -149,6 +122,86 @@ static void resync_sets(const susanin_config *cfg, susanin_state *st)
     dns_sniff_reset_pins();
 }
 
+/* r7.4b: аудит клиентов — «кто запросил» по LAN-хостам: потоки всего /
+ * в туннеле (помеченные) / прямых. Пишется в var/clients.txt (веб-процесс
+ * читает для панели; движок и панель — разные процессы). Не чаще 15 с,
+ * файл перезаписывается только при изменении. */
+static void clients_audit(const susanin_config *cfg, const ct_flow *flows, int n,
+                          time_t now)
+{
+    static time_t last;
+    static char lastbody[2048];
+    /* r7.9: приватные источники ВНЕ lan_subnets (гостевой SSID, mesh, второй
+     * роутер) — Susanin их молча игнорирует, и пользователь думает, что
+     * «правила не работают» (клиент в гостевой подсети вне lan_subnets).
+     * Раз в час на /24 — явная строка с командой починки. */
+    static char unc[8][20];
+    static time_t unc_at[8];
+    static int unc_n;
+    char body[2048];
+    char ips[32][64];
+    int tot[32], vpn[32], dir[32];
+    int cnt = 0, i, j, used = 0;
+    FILE *f;
+    if (now - last < 15)
+        return;
+    last = now;
+    for (i = 0; i < n; i++) {
+        const ct_flow *fl = &flows[i];
+        int k = -1;
+        if (fl->l4proto != 6 && fl->l4proto != 17) continue;
+        if (!clf_from_lan4(cfg, fl->src4)) {
+            if (fl->src4 && clf_is_private4(fl->src4)) {
+                char u24[20];
+                char *dot3;
+                int j;
+                snprintf(u24, sizeof(u24), "%s", fl->src);
+                dot3 = strrchr(u24, '.');
+                if (dot3) {
+                    dot3[1] = '0';
+                    dot3[2] = '\0';
+                }
+                for (j = 0; j < unc_n; j++)
+                    if (!strcmp(unc[j], u24))
+                        break;
+                if (j == unc_n && j < 8) {
+                    snprintf(unc[j], sizeof(unc[j]), "%s", u24);
+                    unc_n++;
+                }
+                if (j < unc_n && now - unc_at[j] >= 3600) {
+                    unc_at[j] = now;
+                    slogf(SL_INFO, "AUTO-SUSANIN: подсеть %s — потоки из LAN, "
+                          "не покрытой lan_subnets (клиенты там не обрабатываются; "
+                          "добавьте подсеть в lan_subnets)", u24);
+                }
+            }
+            continue;
+        }
+        if (clf_is_private4(fl->dst4)) continue;
+        for (j = 0; j < cnt; j++)
+            if (!strcmp(ips[j], fl->src)) { k = j; break; }
+        if (k < 0) {
+            if (cnt >= 32) continue;
+            k = cnt++;
+            snprintf(ips[k], sizeof(ips[k]), "%s", fl->src);
+            tot[k] = vpn[k] = dir[k] = 0;
+        }
+        tot[k]++;
+        if (fl->ctmark != 0) vpn[k]++; else dir[k]++;
+    }
+    for (j = 0; j < cnt && used < (int)sizeof(body) - 80; j++)
+        used += snprintf(body + used, sizeof(body) - used,
+                         "%s %d %d %d\n", ips[j], tot[j], vpn[j], dir[j]);
+    if (!strcmp(body, lastbody))
+        return;
+    snprintf(lastbody, sizeof(lastbody), "%s", body);
+    if ((f = fopen("/opt/susanin/var/clients.txt.tmp", "w")) != NULL) {
+        fputs(body, f);
+        fclose(f);
+        rename("/opt/susanin/var/clients.txt.tmp", "/opt/susanin/var/clients.txt");
+    }
+}
+
 static void sweep_direct(const susanin_config *cfg, susanin_state *st,
                          const ct_flow *flows, int n)
 {
@@ -160,7 +213,7 @@ static void sweep_direct(const susanin_config *cfg, susanin_state *st,
         const ct_flow *f = &flows[i];
         int udp;
         if (f->ctmark != 0) continue;
-        if (!from_lan(cfg, f->src)) continue;
+        if (!clf_from_lan4(cfg, f->src4)) continue;
         /* Адреса из vpn_never должны ходить напрямую — их не трогаем: и те, что
          * сейчас в списке (vn_has), и пины DNS-снифинга (st.never), и недавно
          * снятые. */
@@ -171,7 +224,7 @@ static void sweep_direct(const susanin_config *cfg, susanin_state *st,
         /* Те же фильтры, что в clr_fast: служебные порты (53/853/500/4500/8567)
          * и приватные адреса не рвём. */
         if (clf_port_excluded(cfg, f->dport) || clf_port_excluded(cfg, f->sport)) continue;
-        if (clf_is_private_dst(f->dst)) continue;
+        if (clf_is_private4(f->dst4)) continue;
         udp = (f->l4proto == 17);
         /* Ключ состояния потока: пара ip:порт в port-aware, иначе адрес.
          * Без этого в pair-режиме проверки не находили записи и потоки к
@@ -196,7 +249,7 @@ static void sweep_direct(const susanin_config *cfg, susanin_state *st,
  * убирает запись из кэша, но само соединение живёт (браузер держит keep-alive
  * минуты-часы), а sweep_direct() такие потоки специально пропускает
  * (ctmark != 0). Раз в минуту рвём их точечно и пишем причину в лог: иначе
- * «добавил в never, а сайт всё равно идёт через VPN» (стенд 2026-10-14). */
+ * «добавил в never, а сайт всё равно идёт через VPN». */
 static void never_sweep_marked(const susanin_config *cfg, susanin_state *st,
                                const ct_flow *flows, int n, time_t now)
 {
@@ -211,13 +264,13 @@ static void never_sweep_marked(const susanin_config *cfg, susanin_state *st,
          * «дёргаться»). Приоритет явный: профиль > never. */
         if (f->ctmark & ~cfg->mark_mask)
             continue;
-        if (!from_lan(cfg, f->src))
+        if (!clf_from_lan4(cfg, f->src4))
             continue;
         if (f->l4proto != 6 && f->l4proto != 17)
             continue;
         if (!vn_has(f->dst) && !state_has(&st->never, f->dst, now))
             continue;
-        if (clf_is_private_dst(f->dst) || clf_service_port(f->dport))
+        if (clf_is_private4(f->dst4) || clf_service_port(f->dport))
             continue;
         backend_ct_delete(f);
         done++;
@@ -377,7 +430,7 @@ static void eg_apply(const susanin_config *cfg, int i, int ok, int total, int la
 /* --- Пробы в отдельном процессе ------------------------------------------- */
 
 /* Кандидат-резерв через Xray: в egress_interface можно указать "tproxy"/"xray"
- * (P1, план 2026-10-16). Такой кандидат проверяется SOCKS-пробой апстрима Xray,
+ * (P1). Такой кандидат проверяется SOCKS-пробой апстрима Xray,
  * а при переключении на него датаплейн пересобирается в tproxy-режиме. */
 static int egress_is_tproxy(const char *name)
 {
@@ -580,7 +633,7 @@ static void probe_job_poll(const susanin_config *cfg, int *up, int *miss,
 }
 
 /* Есть ли УЖЕ процесс Xray с НАШИМ конфигом. Нужен, чтобы watchdog не поднимал
- * новый экземпляр поверх зависшего: 2026-10-10 на роутере тестера накопилось
+ * новый экземпляр поверх зависшего: на роутере накопилось
  * ~14 процессов `xray run -config /opt/susanin/etc/xray-tproxy.json` (часть в
  * состоянии D), память 101/122 МБ, load average ~20 — интернет «завис». Причина:
  * stop/start Xray опирался на `pidof xray` (в окружении init-скриптов его может
@@ -631,24 +684,258 @@ static int xray_proc_exists(void)
  *  - «есть ли наш процесс» проверяем из C через xray_proc_exists(), а не через
  *    `sh -c`-цикл по /proc: командная строка самого sh содержит путь к конфигу,
  *    поэтому прежний цикл находил САМ СЕБЯ, делал exit 0 и никогда не запускал
- *    Xray (замечание внешнего разбора — проверено экспериментом). */
-static void restart_xray_process(void)
+ *    Xray (проверено экспериментом). */
+/* Причина последнего неудачного запуска Xray — для лога и диагностики.
+ * Раньше spawn() молча возвращал -1, и в логе оставалось только «не удалось
+ * запустить», без причины: наблюдения показали, что по такому логу
+ * нельзя отличить отсутствие бинаря от нехватки ресурсов на fork(). */
+static char xray_spawn_err[160];
+static char g_agentlog[256];   /* путь файла лога агента ('' = soft/no file) */
+
+/* Свободная память ядра, КБ (из /proc/meminfo); -1 — не прочитать. */
+static long mem_available_kb(void)
 {
+    FILE *f = fopen("/proc/meminfo", "r");
+    char line[128];
+    long kb = -1;
+
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "MemAvailable:", 13)) {
+            kb = strtol(line + 13, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb;
+}
+
+/* Обрезка лога Xray до max_kb. На роутере без swap большой лог — это прямая
+ * потеря памяти: /tmp/xray.log вырос до 15 МБ в tmpfs, свободная
+ * память ушла ниже watermark и OOM-killer убил сам Xray (интернет встал).
+ * max_kb <= 0 — не трогаем. */
+static void xray_log_trim(int max_kb)
+{
+    const char *path = "/opt/susanin/var/xray.log";
+    struct stat st;
+    int fd;
+
+    if (max_kb <= 0)
+        return;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+    if (st.st_size <= (off_t)max_kb * 1024)
+        return;
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0)
+        return;
+    close(fd);
+    slogf(SL_INFO, "tproxy: xray.log обрезан (был больше %d КБ)", max_kb);
+}
+
+/* Можно ли сейчас поднимать Xray: при свободной памяти меньше порога запуск
+ * только приближает OOM, и ядро убьёт Xray через секунды после старта
+ * (попытки подряд, каждая заканчивалась убийством процесса).
+ * Возврат: 1 — можно, 0 — нельзя. */
+static int xray_mem_ok(const susanin_config *cfg)
+{
+    long avail;
+
+    if (cfg->xray_min_mem_kb <= 0)
+        return 1;
+    avail = mem_available_kb();
+    if (avail < 0)              /* /proc/meminfo недоступен — не мешаем старту */
+        return 1;
+    return avail >= cfg->xray_min_mem_kb;
+}
+
+/* Дети, которых агент породил сам (прямой старт xray, shell S93): их надо
+ * пожинать, иначе после каждого падения Xray в /proc копятся зомби.
+ * Массив маленький — дольше 2–3 процессов живой породы за раз не бывает. */
+static pid_t g_xray_kids[4];
+
+static void kid_track(pid_t p)
+{
+    int i;
+    if (p <= 0)
+        return;
+    for (i = 0; i < 4; i++)
+        if (g_xray_kids[i] == p)
+            return;
+    for (i = 0; i < 4; i++) {
+        if (g_xray_kids[i] <= 0) {
+            g_xray_kids[i] = p;
+            return;
+        }
+    }
+    g_xray_kids[0] = p;     /* кольцо: самый старый слот освобождаем новым */
+}
+
+/* Вызывается из главного цикла: собираем завершившихся детей без блокировки.
+ * waitpid только по нашим pid — чужих (probe_job) не трогаем. */
+static void kids_poll(void)
+{
+    int i;
+    for (i = 0; i < 4; i++) {
+        pid_t p = g_xray_kids[i];
+        if (p > 0) {
+            int st;
+            pid_t r = waitpid(p, &st, WNOHANG);
+            if (r == p || (r < 0 && errno != EINTR))
+                g_xray_kids[i] = 0;
+        }
+    }
+}
+
+/* Записать pid нашего Xray туда же, куда пишет S93xray-tproxy: тогда
+ * `S93 status/stop` видят процесс, поднятый агентом (в 0.4.5 pidfile терялся). */
+static void write_xray_pidfile(pid_t pid)
+{
+    FILE *f = fopen("/opt/susanin/var/xray.pid", "w");
+    if (f) {
+        fprintf(f, "%d\n", (int)pid);
+        fclose(f);
+    }
+}
+
+/* Прямой запуск Xray без shell: fork/execl. Это FALLBACK: на роутере
+ * S93xray-tproxy падал с "sh: -c requires an argument", и Xray не поднимался
+ * вообще. Штатный путь — S93 (см. restart_xray_process).
+ * Возврат: 0 — процесс создан, -1 — не удалось (причина в xray_spawn_err). */
+static int spawn_xray_direct(const susanin_config *cfg)
+{
+    pid_t pid;
+    int fd;
+
+    xray_spawn_err[0] = '\0';
+    /* r7.7: порт уже слушается — Xray жив. Потеря pidfile (read-only носитель,
+     * сбой журнала) не повод плодить второй экземпляр: на Viva накопилось 9
+     * процессов xray, туннель дышал на ладан. */
+    if (backend_local_listen(cfg->tproxy_port))
+        return 0;
+    if (!xray_mem_ok(cfg)) {
+        snprintf(xray_spawn_err, sizeof(xray_spawn_err),
+                 "мало свободной памяти: MemAvailable=%ld КБ < xray_min_mem_kb=%d",
+                 mem_available_kb(), cfg->xray_min_mem_kb);
+        return -1;
+    }
+    xray_log_trim(cfg->xray_log_max_kb);
+    if (access("/opt/sbin/xray", X_OK) != 0) {
+        snprintf(xray_spawn_err, sizeof(xray_spawn_err), "access /opt/sbin/xray: %s",
+                 strerror(errno));
+        return -1;
+    }
+    pid = fork();
+    if (pid < 0) {
+        snprintf(xray_spawn_err, sizeof(xray_spawn_err), "fork: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        setsid();
+        fd = open("/opt/susanin/var/xray.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2)
+                close(fd);
+        }
+        /* GOGC/GOMEMLIMIT — из конфига (xray_gogc / xray_gomemlimit). Раньше
+         * здесь были зашиты 50/64MiB, и эти ключи действовали только при
+         * запуске через S93: настройка из susanin.conf молча игнорировалась. */
+        setenv("GOGC", cfg->xray_gogc[0] ? cfg->xray_gogc : "50", 1);
+        setenv("GOMEMLIMIT", cfg->xray_gomemlimit[0] ? cfg->xray_gomemlimit : "64MiB", 1);
+        execl("/opt/sbin/xray", "xray", "run", "-config",
+              "/opt/susanin/etc/xray-tproxy.json", (char *)NULL);
+        _exit(127);
+    }
+    kid_track(pid);
+    write_xray_pidfile(pid);
+    return 0;
+}
+
+/* Асинхронный запуск штатного init-скрипта (S93xray-tproxy restart|start):
+ * без shell -c (тот и падал «sh: -c requires an argument» через system()),
+ * ребёнок пишет лог Xray и сам ведёт pidfile/loglevel. Главный цикл НЕ
+ * блокируется: успех проверяется следующим витком по порту. */
+static void spawn_xray_init(const char *action)
+{
+    pid_t pid;
+
+    pid = fork();
+    if (pid < 0)
+        return;
+    if (pid != 0) {
+        kid_track(pid);
+        return;
+    }
+    setsid();
+    {
+        int fd = open("/opt/susanin/var/xray.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2)
+                close(fd);
+        }
+    }
+    execl("/bin/sh", "sh", "/opt/etc/init.d/S93xray-tproxy", action, (char *)NULL);
+    _exit(127);
+}
+
+/* Подождать, пока Xray займёт порт. Возврат: 0 — слушает, -1 — не дождались.
+ * Проверяем порт, а не pid: процесс может существовать, но не забиндиться. */
+static int wait_xray_port(const susanin_config *cfg, int secs)
+{
+    int w;
+    for (w = 0; w <= secs; w++) {
+        if (backend_local_listen(cfg->tproxy_port))
+            return 0;
+        if (w < secs)
+            sleep(1);
+    }
+    return -1;
+}
+
+/* Поднять Xray. Штатный путь — S93xray-tproxy (асинхронно: свой pidfile,
+ * loglevel/GOGC/GOMEMLIMIT, проверка «удержался»). Прямой fork — только если
+ * S93 нет/не исполняется (fallback для окружений, где S93 падал).
+ * НИЧЕГО НЕ ЖДЁТ ВНУТРИ: главный цикл однопоточный, и ожидание порта здесь
+ * останавливал бы dns_sniff и обучение (регресс watchdog в 0.4.6: блокировка
+ * до ~30 с на попытку при backoff 60 с). Успех проверяет следующий виток
+ * reconcile (dp_check_interval).
+ * Возврат: 0 — породили запуск / процесс уже есть; -1 — поднять не можем. */
+static int restart_xray_process(const susanin_config *cfg)
+{
+    /* Памятный гейт активен только при явном xray_min_mem_kb>0 (по умолчанию
+     * 0 = выключен, как в 0.4.4): на 122 МБ роутере с порогом 12288 КБ Xray
+     * почти никогда не поднимался после падения — долгий fail-open DIRECT и
+     * «сайты грузятся медленно» (регрессия 0.4.6). */
+    if (!xray_mem_ok(cfg)) {
+        slogf(SL_WARN,
+              "tproxy: Xray не поднимаю — мало памяти (MemAvailable=%ld КБ, порог %d КБ)",
+              mem_available_kb(), cfg->xray_min_mem_kb);
+        return -1;
+    }
+
     if (xray_proc_exists()) {
         /* Процесс уже есть: второй экземпляр не поднимаем (накопление процессов
-         * вешало роутер). Освободить зависший — задача S93 restart/kill -9. */
-        return;
+         * вешало роутер). Освободить зависший — restart_xray_forced(). */
+        return 0;
     }
+
+    xray_log_trim(cfg->xray_log_max_kb);
     if (access("/opt/etc/init.d/S93xray-tproxy", X_OK) == 0) {
-        int rc = system("/opt/etc/init.d/S93xray-tproxy restart >/dev/null 2>&1 &");
-        (void)rc;
-        return;
+        spawn_xray_init("restart");
+        slogf(SL_INFO, "tproxy: запуск Xray через S93xray-tproxy restart (асинхронно)");
+        return 0;
     }
-    {
-        int rc = system("(/opt/sbin/xray run -config /opt/susanin/etc/xray-tproxy.json "
-                        ">>/opt/susanin/var/xray.log 2>&1 &)");
-        (void)rc;
+    if (spawn_xray_direct(cfg) == 0) {
+        slogf(SL_WARN, "tproxy: S93xray-tproxy недоступен — подняли Xray напрямую (fallback)");
+        return 0;
     }
+    slogf(SL_ERROR, "tproxy: Xray не запустить: %s", xray_spawn_err);
+    return -1;
 }
 
 
@@ -695,22 +982,14 @@ static int xray_kill_all(void)
 /* Принудительный перезапуск зависшего (живого, но не слушающего порт) Xray:
  * S93 restart умеет kill -9 и отказывается стартовать при процессе в D; без
  * init-скрипта снимаем процессы сами (xray_kill_all) и поднимаем заново. */
-static void restart_xray_forced(void)
+static void restart_xray_forced(const susanin_config *cfg)
 {
-    if (access("/opt/etc/init.d/S93xray-tproxy", X_OK) == 0) {
-        int rc = system("/opt/etc/init.d/S93xray-tproxy restart >/dev/null 2>&1 &");
-        (void)rc;
-        return;
-    }
-    /* Init-скрипта нет: снимаем зависшие процессы сами (kill из C) и поднимаем
-     * заново. restart_xray_process() стартует только если процессов не осталось,
-     * поэтому сначала дожидаемся, что /proc их больше не показывает. */
     if (xray_kill_all() > 0) {
         int w;
         for (w = 0; w < 20 && xray_proc_exists(); w++)
             usleep(100000);
     }
-    restart_xray_process();
+    (void)restart_xray_process(cfg);
 }
 
 /* P2: per-profile failover — держим default в таблице профиля на первом живом
@@ -756,7 +1035,7 @@ static void profile_failover_tick(const susanin_config *cfg)
 /* Применить профили (P1/P2). Статические наборы профилей, ip rule и маршрут в
  * таблице профиля пересобирает tools/profiles.sh. Раньше он вызывался ТОЛЬКО из
  * init-скрипта при старте службы, поэтому «правка конфига → Reload» профили не
- * применяла, хотя подсказка панели обещала обратное (разбор 2026-10-11/13). */
+ * применяла, хотя подсказка панели обещала обратное. */
 static void profiles_apply(const susanin_config *cfg)
 {
     int rc;
@@ -821,8 +1100,11 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     time_t last_cdn = 0;
     time_t last_release = 0;
     time_t next_xray_try = 0;
+    time_t last_logrot = 0;
     int xray_tries = 0;
     int stuck_tries = 0;      /* подряд «процесс есть, но порт не слушается» */
+    int idle_mult = 1;        /* адаптивный период проходов классификатора (1 или 2) */
+    int idle_cnt = 0;         /* подряд проходов без событий обучения */
     time_t last_dnssniff = 0;
     time_t last_snifdiag = 0;
     time_t last_prof = 0;
@@ -842,11 +1124,16 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                 dup2(fd, 2);
                 if (fd > 2)
                     close(fd);
+                snprintf(g_agentlog, sizeof(g_agentlog), "%s", lf);
             }
         }
     }
     slog_init(cfg->log_level);
     backend_batch_enable(cfg->ipset_batch);
+    if (g_agentlog[0] && path_on_tmpfs(g_agentlog))
+        slogf(SL_WARN, "log: %s лежит на tmpfs (это RAM!): рост логов отнимает память, "
+                       "при reboot улики исчезают. Держите лог на flash (так дешевле "
+                       "для носителя, чем кажется) или disk_mode=soft", g_agentlog);
     if (strcmp(cfg->disk_mode, "soft") == 0)
         slogf(SL_INFO, "disk_mode=soft: log file off, state not saved, no backups");
     if (cfg->ok_ttl == 0)
@@ -893,9 +1180,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     if (strcmp(cfg->egress_type, "tproxy") == 0) {
         /* Xray мог запускаться параллельно — даём ему ~10 c забиндить порт,
          * иначе на старте уходим в fail-open из-за гонки. */
-        int w;
-        for (w = 0; w < 10 && !backend_local_listen(cfg->tproxy_port); w++)
-            sleep(1);
+        (void)wait_xray_port(cfg, 10);
     }
     if (strcmp(cfg->egress_type, "tproxy") == 0 &&
         !backend_local_listen(cfg->tproxy_port) && cfg->xray_watchdog) {
@@ -909,13 +1194,10 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         } else {
             slogf(SL_WARN, "tproxy: порт %d не слушается — поднимаю Xray (watchdog)",
                   cfg->tproxy_port);
-            restart_xray_process();
+            (void)restart_xray_process(cfg);
         }
-        {
-            int w;
-            for (w = 0; w < 10 && !backend_local_listen(cfg->tproxy_port); w++)
-                sleep(1);
-        }
+        /* Порт может открыться не сразу: на mipsel старт занимает секунды. */
+        (void)wait_xray_port(cfg, 15);
     }
     if (strcmp(cfg->egress_type, "tproxy") == 0 &&
         !backend_local_listen(cfg->tproxy_port)) {
@@ -965,6 +1247,9 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     while (!g_stop) {
         time_t now = time(NULL);
 
+        kids_poll();     /* пожинать детей прямого запуска Xray/S93 (без зомби) */
+        udp_relay_tick();    /* работник жив? перезапуск убитого/упавшего (B1) */
+
         if (cfg->dns_sniff) {
             dns_sniff_poll();
             /* Без счётчиков «dom= пустой» нераспознаваемо: так выглядит и «нет
@@ -985,6 +1270,10 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                 *cfg = nc;
                 backend_batch_enable(cfg->ipset_batch);
                 slogf(SL_INFO, "config reloaded: %s", conf_path);
+                /* Работник udp-relay держит конфиг, с которым запущен:
+                 * при смене значимых полей — перезапуск, при выключении
+                 * udp_relay — остановка. */
+                udp_relay_reload(cfg);
                 /* W6: перечитать настройку индикатора релиза; при включении —
                  * проверка в ближайшие 30 с, а не через 12 ч. */
                 release_init(cfg);
@@ -1044,9 +1333,9 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         {
             int need_scan = 0;
             if (tunnel_up &&
-                (now - last[0] >= cfg->fast_interval ||
-                 now - last[1] >= cfg->soft_interval ||
-                 now - last[2] >= cfg->judge_interval))
+                (now - last[0] >= cfg->fast_interval * idle_mult ||
+                 now - last[1] >= cfg->soft_interval * idle_mult ||
+                 now - last[2] >= cfg->judge_interval * idle_mult))
                 need_scan = 1;
             if (dp_ok && tunnel_up && now - last_sweep >= 60)
                 need_scan = 1;
@@ -1062,9 +1351,30 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         }
 
         if (tunnel_up) {
-            if (now - last[0] >= cfg->fast_interval) { last[0] = now; clr_fast(&ctx, L.v, L.n, now); }
-            if (now - last[1] >= cfg->soft_interval) { last[1] = now; clr_soft(&ctx, L.v, L.n, now); }
-            if (now - last[2] >= cfg->judge_interval) { last[2] = now; clr_judge(&ctx, L.v, L.n, now); }
+            int ran = 0;
+            /* Проход обучения применяем одним батчем ipset (restore): иначе
+             * каждая add/del на волне промоушенов — отдельный fork+exec, и на
+             * MIPS классификатор захлёбывается вилками. Пустая пачка
+             * сбрасывается без fork'ов. */
+            backend_batch_begin();
+            if (now - last[0] >= cfg->fast_interval * idle_mult) { last[0] = now; clr_fast(&ctx, L.v, L.n, now); ran = 1; }
+            if (now - last[1] >= cfg->soft_interval * idle_mult) { last[1] = now; clr_soft(&ctx, L.v, L.n, now); ran = 1; }
+            if (now - last[2] >= cfg->judge_interval * idle_mult) { last[2] = now; clr_judge(&ctx, L.v, L.n, now); ran = 1; }
+            backend_batch_end();
+            /* Адаптивный период: 15 проходов подряд без событий обучения
+             * (ничего не учим, не подтверждаем, не берём под наблюдение) —
+             * интервалы удваиваются, парсинг conntrack вдвое реже. Первое же
+             * событие возвращает обычный темп: цена простоя — не более +1 с
+             * к реакции на новый заблокированный поток. */
+            if (ran) {
+                if (clf_take_events() > 0) {
+                    idle_cnt = 0;
+                    idle_mult = 1;
+                } else if (++idle_cnt >= 15 && idle_mult < 2) {
+                    idle_mult = 2;
+                }
+            }
+            clients_audit(cfg, L.v, L.n, now);
         }
 
         /* Периодически сбрасываем «залипшие» прямые потоки (mark=0) по адресам
@@ -1229,8 +1539,9 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         if (cfg->cdn_ranges_interval > 0 &&
             now - last_cdn >= (time_t)cfg->cdn_ranges_interval) {
             last_cdn = now;
-            cdn_refresh(cfg);
+            cdn_refresh(cfg);   /* асинхронно: скачивание в отдельном процессе */
         }
+        cdn_poll(cfg);          /* пожать ребёнка; при успехе перечитать диапазоны */
 
         if (cfg->release_check && cfg->release_check_interval > 0 &&
             now - last_release >= (time_t)cfg->release_check_interval) {
@@ -1251,7 +1562,10 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         if (now - last_trim >= 30) {
             int udp, tmo[2] = { 0, 0 };
             last_trim = now;
+            /* Вытеснения GC — тоже пачкой (state_ipset_del вне батча — fork). */
+            backend_batch_begin();
             trim_ok(cfg, &st);
+            backend_batch_end();
             /* Протухшие записи не должны копиться: state_expire() не вызывался. */
             for (udp = 0; udp < 2; udp++) {
                 /* Test-запись, истёкшая без CONFIRMED и без COOLDOWN, — третий
@@ -1324,62 +1638,62 @@ int engine_run(susanin_config *cfg, const char *conf_path)
              * только при dp_ok=1, поэтому после падения Xray (dp_ok=0) агент
              * оставался в fail-open навсегда. */
             if (tproxy && !tp_ok && cfg->xray_watchdog && now >= next_xray_try) {
-                int w, back;
+                int back;
                 if (xray_proc_exists()) {
                     /* Процесс есть, а порт не слушается: висит (D-state) или не
                      * смог забиндиться. НОВЫЙ экземпляр не поднимаем — иначе
-                     * копятся процессы и кончается память (инцидент 2026-10-10).
+                     * копятся процессы и кончается память.
                      * Но и «ждать вечно» нельзя: после FORCED_RESTART_TRIES таких
                      * проверок зовём S93 restart — он умеет kill -9 и отказывается
-                     * стартовать, если процесс в D (замечание внешнего разбора). */
+                     * стартовать, если процесс в D. */
                     stuck_tries++;
                     if (stuck_tries >= FORCED_RESTART_TRIES) {
                         slogf(SL_WARN, "tproxy: Xray есть, но :%d не слушает (%d проверок) — "
                                        "принудительный restart", cfg->tproxy_port, stuck_tries);
-                        restart_xray_forced();
+                        restart_xray_forced(cfg);
                         stuck_tries = 0;
-                        for (w = 0; w < 5 && !backend_local_listen(cfg->tproxy_port); w++)
-                            sleep(1);
-                        tp_ok = backend_local_listen(cfg->tproxy_port);
-                        if (tp_ok) {
-                            slogf(SL_INFO, "tproxy: Xray поднят watchdog'ом (forced)");
-                            next_xray_try = 0;
-                        } else {
-                            next_xray_try = now + 300;
-                        }
+                        /* Ждать порт здесь нельзя: запуск асинхронный, а sleep
+                         * в цикле останавливает dns_sniff и обучение. Следующий
+                         * виток reconcile увидит слушателя и сбросит счётчики. */
+                        next_xray_try = time(NULL) + 30;
                     } else {
                         slogf(SL_WARN, "tproxy: процесс Xray есть, но :%d не слушает — "
                                        "повторный запуск пропускаю (проверка %d из %d)",
                               cfg->tproxy_port, stuck_tries, FORCED_RESTART_TRIES);
-                        next_xray_try = now + 300;
+                        next_xray_try = time(NULL) + 60;
                     }
                 } else {
                     xray_tries++;
-                    back = 15 << (xray_tries < 5 ? xray_tries : 4);
-                    if (back > 900)
-                        back = 900;
-                    next_xray_try = now + back;
-                    slogf(SL_WARN, "tproxy: Xray :%d не слушает — поднимаю (try %d)",
-                          cfg->tproxy_port, xray_tries);
-                    restart_xray_process();
-                    for (w = 0; w < 5 && !backend_local_listen(cfg->tproxy_port); w++)
-                        sleep(1);
-                    tp_ok = backend_local_listen(cfg->tproxy_port);
-                    if (tp_ok) {
-                        slogf(SL_INFO, "tproxy: Xray поднят watchdog'ом");
-                        xray_tries = 0;
-                        next_xray_try = 0;
-                    }
+                    /* Backoff 15/30/60 c, потолок 60 c — безопасен, когда попытка
+                     * асинхронная: в 0.4.6 при потолке 60 с подъём блокировал
+                     * главный цикл до ~30 с, и полцикла dns_sniff/обучение стояли. */
+                    back = 15 << (xray_tries > 3 ? 2 : (xray_tries - 1));
+                    if (back > 60)
+                        back = 60;
+                    slogf(SL_WARN, "tproxy: Xray :%d не слушает — поднимаю (try %d, повтор через %d c)",
+                          cfg->tproxy_port, xray_tries, back);
+                    if (restart_xray_process(cfg) != 0)
+                        slogf(SL_ERROR, "tproxy: Xray не поднялся (try %d) — трафик DIRECT, "
+                                        "следующая попытка через %d c",
+                              xray_tries, back);
+                    /* Успех («порт слушает») и сброс счётчиков — на следующем
+                     * витке reconcile: там же, где вычисляется tp_ok. */
+                    next_xray_try = time(NULL) + back;
                 }
             }
             if (dp_ok && tproxy && !tp_ok) {
                 /* Xray умер — снимаем правила (fail-open DIRECT); watchdog выше
                  * уже пытается поднять Xray. Conntrack VPN-метки тоже чистим:
                  * иначе помеченные потоки останутся в мёртвом туннеле. */
-                slogf(SL_ERROR, "tproxy: Xray :%d пропал — снимаю правила, fail-open DIRECT",
-                      cfg->tproxy_port);
+                slogf(SL_ERROR, "tproxy: Xray :%d пропал — снимаю правила, fail-open DIRECT "
+                                "(процесс %s)", cfg->tproxy_port,
+                      xray_proc_exists() ? "есть" : "нет");
                 backend_teardown(cfg);
                 backend_ct_flush_vpn(cfg);
+                /* P5 не зависит от Xray: возвращаем правила, чтобы прокси на
+                 * роутере продолжал ходить через proxy_egress (nwg0). */
+                if (backend_p5_up(cfg) == 0)
+                    slogf(SL_INFO, "tproxy: P5 (proxy_egress) оставлен активным при fail-open");
                 dp_ok = 0;
                 next_dp_try = now + 15;
             } else if (dp_ok && tunnel_up && !backend_ready(cfg)) {
@@ -1456,6 +1770,19 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                 never_state_clean(cfg, &st, now);
             if (never_pending)
                 last_never = prev;
+        }
+
+        /* Ротация логов по размеру в рантайме: раньше — только
+         * при старте службы; долгий аптайм + INFO/debug = раздутый файл
+         * (в tmpfs — прямая потеря RAM). Агент чистит и свой лог, и web-лог:
+         * писатели с O_APPEND продолжают с нового EOF. */
+        if (now - last_logrot >= 300) {
+            last_logrot = now;
+            if (strcmp(cfg->disk_mode, "soft") != 0) {
+                if (g_agentlog[0])
+                    log_rotate_if_big(g_agentlog, 4096, 1024);
+                log_rotate_if_big("/opt/susanin/var/susanin-web.log", 2048, 512);
+            }
         }
 
         usleep(200000);

@@ -172,6 +172,32 @@
       tb.insertAdjacentHTML('beforeend',
         '<tr><td>' + esc(k) + '</td><td>' + esc(ipsets[k]) + '</td></tr>');
     });
+    if (d.storage_ro) {
+      var roel = document.getElementById('storage-ro');
+      if (roel) roel.hidden = false;
+    }
+    var cb = document.querySelector('#clients tbody');
+    if (cb) {
+      cb.innerHTML = '';
+      (d.clients || []).forEach(function (c) {
+        cb.insertAdjacentHTML('beforeend',
+          '<tr><td>' + esc(c.ip) + '</td><td>' + esc(c.flows) + '</td><td>' +
+          esc(c.vpn) + '</td><td>' + esc(c.direct) + '</td></tr>');
+      });
+    }
+    var rv = d.ru_in_vpn || null;
+    var rvel = document.getElementById('ru-in-vpn');
+    if (rvel) {
+      if (!rv) {
+        rvel.textContent = '—';
+      } else if (rv.count > 0) {
+        rvel.textContent = rv.count + ': ' + (rv.domains || '');
+        rvel.className = 'warn';
+      } else {
+        rvel.textContent = T('status.ru.zero', '0 — норма');
+        rvel.className = 'muted';
+      }
+    }
   }
 
   function load() {

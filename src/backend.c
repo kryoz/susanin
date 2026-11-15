@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -175,11 +177,24 @@ static int bt_write_file(void)
 
 /* Сколько ждём `ipset restore`. ipset берёт глобальный lock: если процесс
  * завис (например, читает stdin, который не закрывается), ВСЕ последующие
- * вызовы ipset встают намертво, а вместе с ними и главный цикл агента (стенд
- * 2026-11-02: лог замер, метки не ставились, туннель «умер»). Поэтому любой
+ * вызовы ipset встают намертво, а вместе с ними и главный цикл агента: лог
+ * замер, метки не ставились, туннель «умер». Поэтому любой
  * вызов ipset ограничен по времени и при таймауте убивается. */
 #define BT_RESTORE_TIMEOUT_MS 1500
 #define BT_APPLY_TIMEOUT_MS   2000
+/* Предел поштучного применения (fallback, когда restore упал, а ipset жив):
+ * не больше BT_FALLBACK_MAX команд и не дольше BT_FALLBACK_MS — иначе залп
+ * fork+exec замораживает главный цикл. */
+#define BT_FALLBACK_MAX 2000
+#define BT_FALLBACK_MS  10000
+
+/* Монотонные миллисекунды — для предела поштучного применения. */
+static long long bt_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* Дождаться ребёнка не дольше timeout_ms. Возврат: код выхода, -1 ошибка,
  * -2 таймаут (ребёнок убит SIGKILL). */
@@ -368,7 +383,8 @@ static int bt_flush(void)
          * restore: раньше из-за этого после рестарта не восстанавливался кэш).
          * Применяем поштучно — медленнее, но без потери остальных записей. */
         size_t off = 0;
-        int ncmd = 0, bad = 0;
+        int ncmd = 0, bad = 0, skipped = 0;
+        long long t0 = bt_now_ms();
         char firstbad[512] = "";
         while (off < g_bt_len) {
             char *nl = memchr(g_bt + off, '\n', g_bt_len - off);
@@ -379,11 +395,16 @@ static int bt_flush(void)
                     len = sizeof(line) - 1;
                 memcpy(line, g_bt + off, len);
                 line[len] = '\0';
-                ncmd++;
-                if (bt_apply_line(line) != 0) {
-                    if (!bad)
-                        snprintf(firstbad, sizeof(firstbad), "%s", line);
-                    bad++;
+                if (ncmd >= BT_FALLBACK_MAX ||
+                    bt_now_ms() - t0 > BT_FALLBACK_MS) {
+                    skipped++;
+                } else {
+                    ncmd++;
+                    if (bt_apply_line(line) != 0) {
+                        if (!bad)
+                            snprintf(firstbad, sizeof(firstbad), "%s", line);
+                        bad++;
+                    }
                 }
             }
             off += len + (nl ? 1 : 0);
@@ -397,10 +418,11 @@ static int bt_flush(void)
                 e[j++] = err[i];
             }
             e[j] = '\0';
-            if (bad)
+            if (bad || skipped)
                 slogf(SL_WARN, "ipset restore rc=%d (%s): применено поштучно %d, "
-                               "ошибок %d, первая: %s",
-                      rc, e[0] ? e : "no stderr", ncmd - bad, bad, firstbad);
+                               "ошибок %d, пропущено %d (предел), первая: %s",
+                      rc, e[0] ? e : "no stderr", ncmd - bad, bad, skipped,
+                      firstbad);
             else
                 slogf(SL_INFO, "ipset restore rc=%d (%s): применил поштучно %d команд",
                       rc, e[0] ? e : "no stderr", ncmd);
@@ -512,7 +534,7 @@ static char g_active_egress[64];
 
 /* Runtime-режим датаплейна: интерфейс или tproxy (Xray). В конфиге режим задаёт
  * egress_type, но список egress_interface может содержать псевдо-кандидат
- * "tproxy" (P1 из плана 2026-10-16): при переключении на него датаплейн
+ * "tproxy" (P1): при переключении на него датаплейн
  * пересобирается целиком, при возврате — обратно. -1 = как в конфиге. */
 static int g_tproxy_mode = -1;
 
@@ -571,6 +593,12 @@ static void set_env(const susanin_config *c)
     /* Port-aware: datapath.sh создаст наборы hash:ip,port и правила dst,dst.
      * По умолчанию 0 — прежнее поведение (наборы hash:ip, матч dst). */
     setenv("SUSANIN_PORT_AWARE", c->port_aware ? "1" : "0", 1);
+    /* P5: сторонний прокси на роутере (Teleproxy/MTProxy): метка по uid и
+     * вывод в proxy_egress через отдельную таблицу. */
+    setenv("SUSANIN_PROXY_UID", c->proxy_uid, 1);
+    setenv("SUSANIN_PROXY_EGRESS", c->proxy_egress, 1);
+    setenv("SUSANIN_PROXY_TABLE", (snprintf(v, sizeof(v), "%d", c->proxy_table), v), 1);
+    setenv("SUSANIN_PROXY_MARK", (snprintf(v, sizeof(v), "0x%lx", c->proxy_mark), v), 1);
 }
 
 static int run_script(const susanin_config *c, const char *a1, const char *a2)
@@ -599,6 +627,23 @@ int backend_provision(const susanin_config *c)
     if (rc != 0)
         log_provision_error(rc, out);
     return rc;
+}
+
+/* P5 отдельно от датаплейна: правила «трафик стороннего прокси -> proxy_egress»
+ * не зависят от tproxy/Xray. Вызывается, когда датаплейн снят в fail-open
+ * (Xray умер), чтобы MTProxy продолжал ходить в туннель. */
+int backend_p5_up(const susanin_config *c)
+{
+    if (!c || !c->proxy_uid[0] || !c->proxy_egress[0])
+        return 0;
+    return run_script(c, "p5", NULL);
+}
+
+int backend_p5_down(const susanin_config *c)
+{
+    if (!c || !c->proxy_uid[0])
+        return 0;
+    return run_script(c, "p5-down", NULL);
 }
 
 /* Отметка о последнем ре-провижене (для наблюдаемости в status/diagnose). */
@@ -663,7 +708,7 @@ int backend_xt_locked(int rc, const char *out)
 
 /* Проверочный вызов с ретраями на xtables-lock. Без него агент считал занятый
  * замок пропажей правил: писал "data plane missing", перепровижнил датаплейн и
- * помечал списки грязными. На стенде 2026-10-28 rc=4 случался до 5 раз за 45 с,
+ * помечал списки грязными. rc=4 случался до 5 раз за 45 с,
  * а ложные срабатывания шли раз в 1–2 минуты. */
 #define XT_LOCK_RETRIES 4
 #define XT_LOCK_WAIT_US (120 * 1000)
@@ -879,6 +924,58 @@ int backend_ready(const susanin_config *c)
                 return 0;
         }
     }
+
+    /* P5: если настроен вывод стороннего прокси через туннель — проверяем,
+     * что метка по uid и ip rule на месте (NDM/перезагрузка могли снести).
+     * Кэш 30 с: backend_ready вызывается каждые 5 с (fast check), а здесь два
+     * форка (iptables -S OUTPUT, ip rule show) — на MIPS это лишний xtables-lock
+     * и CPU. Просрочка кэша — ровно прежняя проверка. */
+    if (c->proxy_uid[0] && c->proxy_egress[0]) {
+        static time_t p5_ok_at;
+        time_t p5now = time(NULL);
+        if (p5_ok_at && p5now - p5_ok_at < 30)
+            goto p5_cached;
+        p5_ok_at = 0;
+        {
+        /* proxy_uid может быть числовым: на Keenetic /etc/passwd read-only и
+         * пользователя не добавить. iptables понимает числовой uid. */
+        unsigned proxy_uid_num = 0;
+        int numeric = (c->proxy_uid[0] >= '0' && c->proxy_uid[0] <= '9');
+        char *pargv[7];
+        if (numeric) {
+            char *endp = 0;
+            unsigned long v = strtoul(c->proxy_uid, &endp, 10);
+            if (!endp || *endp != '\0')
+                return 0;
+            proxy_uid_num = (unsigned)v;
+        } else {
+            struct passwd *pw = getpwnam(c->proxy_uid);
+            if (!pw)
+                return 0;       /* пользователя нет — правило не поставить */
+            proxy_uid_num = (unsigned)pw->pw_uid;
+        }
+        snprintf(needle, sizeof(needle), "--uid-owner %u", proxy_uid_num);
+        pargv[0] = (char *)tool_iptables();
+        pargv[1] = "-w"; pargv[2] = "-t"; pargv[3] = "mangle"; pargv[4] = "-S"; pargv[5] = "OUTPUT"; pargv[6] = NULL;
+        rc = run_check(pargv, out, sizeof(out));
+        if (rc == XT_BUSY)
+            return 1;
+        if (rc != 0 || !strstr(out, needle))
+            return 0;
+
+        snprintf(needle, sizeof(needle), "fwmark 0x%lx/0x%lx lookup %d",
+                 c->proxy_mark, c->proxy_mark, c->proxy_table);
+        pargv[0] = (char *)tool_ip();
+        pargv[1] = "rule"; pargv[2] = "show"; pargv[3] = NULL;
+        rc = run_check(pargv, out, sizeof(out));
+        if (rc == XT_BUSY)
+            return 1;
+        if (rc != 0 || !strstr(out, needle))
+            return 0;
+        p5_ok_at = p5now;
+        }
+    }
+p5_cached:
     return 1;
 }
 
@@ -1093,6 +1190,21 @@ void backend_ipset_value(const susanin_config *c, const char *ip, int port,
         snprintf(out, n, "%s", ip ? ip : "");
 }
 
+/* Наборы могли быть снесены (fail-open, перезагрузка, NDM). Если `ipset add`
+ * вернул ошибку «set does not exist», пересоздаём наборы и повторяем один раз.
+ * Не чаще раза в 30 с, иначе получаем тот же шторм вызовов, что и раньше. */
+static int ensure_sets_throttled(const susanin_config *c)
+{
+    static time_t last;
+    time_t now = time(NULL);
+    if (last && now - last < 30)
+        return -1;
+    last = now;
+    if (!c)
+        return -1;
+    return run_script(c, "sets", NULL);
+}
+
 int backend_ipset_add_port(const susanin_config *c, int proto_udp, int phase_ok,
                            const char *ip, int port, int ttl)
 {
@@ -1102,7 +1214,7 @@ int backend_ipset_add_port(const susanin_config *c, int proto_udp, int phase_ok,
     backend_ipset_value(c, ip, port, proto_udp, val, sizeof(val));
     /* В обычном режиме наборы hash:ip — значение с ':' или ',' (остаток от
      * port-aware) невалидно и роняет весь `ipset restore`; после рестарта из-за
-     * такой строки не восстанавливался весь кэш (стенд 2026-11-02). */
+     * такой строки не восстанавливался весь кэш. */
     if (!(c && c->port_aware) && (!val[0] || strchr(val, ':') || strchr(val, ','))) {
         slogf(SL_DEBUG, "ipset: пропускаю невалидное значение '%s' (%s)", val, name);
         return -1;
@@ -1118,7 +1230,15 @@ int backend_ipset_add_port(const susanin_config *c, int proto_udp, int phase_ok,
     argv[5] = "timeout";
     argv[6] = t;
     argv[7] = NULL;
-    return run_argv(argv);
+    {
+        int rc = run_argv(argv);
+        if (rc != 0) {
+            /* Набора нет (fail-open/NDM снёс) — пересоздаём и пробуем ещё раз. */
+            if (ensure_sets_throttled(c) == 0)
+                rc = run_argv(argv);
+        }
+        return rc;
+    }
 }
 
 int backend_ipset_del_port(const susanin_config *c, int proto_udp, int phase_ok,

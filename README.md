@@ -23,8 +23,12 @@
 Адаптивная маршрутизация: программа смотрит, какие соединения «не работают» из-за
 блокировок, пробует их через VPN, запоминает рабочие и дальше держит их в VPN. Если
 VPN недоступен — всё идёт напрямую. Есть и простой список доменов, которые должны
-идти через VPN **всегда** (без ручных списков IP — только имена, как в
-Keenetic).
+идти через VPN **всегда** (без ручных списков IP — только имена, как в Keenetic).
+
+**Статус: релиз 0.5.2-oc (форк под OpenConnect-коннектор).** Проверено на
+Keenetic Giga (aarch64), KeeneticOS 5.1.4–5.1.6, Entware, OpenConnect-коннектор
+(`nocli*`), WireGuard/AmneziaWG (`nwg0`/`nwg1`), Xray VLESS+REALITY и
+VLESS+WS+TLS (`egress_type=tproxy`), Keenetic Giga/Ultra.
 
 **Что делает**
 
@@ -42,7 +46,22 @@ Keenetic).
 - встроенная веб-панель (только LAN) с интерфейсом на русском, английском и
   китайском; по умолчанию выключена; кнопка «Не открывается сайт?» (жалоба, 0.5.0);
 - сам восстанавливает правила, если их снёс NDM (окно без правил ≤1 с, 0.5.0), и
-  умеет маршрутизировать клиентов OpenConnect-сервера на этом же роутере.
+  умеет маршрутизировать клиентов OpenConnect-сервера на этом же роутере;
+- **P5: вывод стороннего прокси в туннель.** Если на роутере поднят MTProxy
+  (например [Teleproxy.Keenetic](https://github.com/R17a/Teleproxy.Keenetic)),
+  его исходящий трафик метится по uid процесса и уходит в `proxy_egress`
+  (`nwg0`), не пересекаясь с LAN-маршрутизацией. Прокси работает под
+  непривилегированным пользователем, без SOCKS и без `ip route` в main-таблице;
+- DNS-снифинг: связывает IP с доменом из DNS-ответа — списки применяются
+  мгновенно, а `susanin why <ip|домен>` и лог обучения показывают, почему адрес
+  идёт именно так;
+- детект «заморозки» ТСПУ (обрыв TCP-потока после первых десятков пакетов) и
+  наследование вердикта на всю /24-сеть хостинга — новые IP заблокированной
+  сети уходят в VPN без проб;
+- RU-guard: российские домены (`.ru`, `.рф` и др.) автообучение в VPN не
+  заворачивает — антифрод банков и маркетплейсов режет чужой выход;
+- UDP/QUIC через туннель (встроенный SOCKS-UDP-релей) и авто-обновление
+  диапазонов CDN.
 
 Не является VPN-клиентом: туннель («Другое подключение»: OpenConnect-коннектор) должен уже работать. IPv6 в v1 не поддерживается.
 
@@ -68,88 +87,6 @@ Keenetic).
 `vpn_never` — жалоба отклоняется (сними с never и повтори). 
 
 CLI-аналог: `/opt/susanin/bin/susanin-agent complain <домен|ip>`. 
-
-#### domain_prior — очередь «быстрого прохода» для обучения Susanin
-
-Как работает Susanin обычно: он постоянно подозревает часть сайтов, что «их блокируют» и проверяет их через VPN. Проверять все сразу нельзя — стоит лимит (сколько-то адресов в минуту). Новый блокируемый сайт может простоять в очереди минуту-другую, и всё это время у тебя он «не открывается».
-
-Что даёт domain_prior: это короткий список доменов (по одному на строке, как `vpn_always.txt`). Если сайт из этого списка попался — Susanin проверяет его **первым, вне очереди**. Лимит не отменяется, правила не меняются — меняется только порядок: «проверь сначала то, что у меня уже пригревало».
-
-Аналогия: в аэропорту все стоят в одну очередь на досмотр, а `domain_prior` — это полоса «быстрый проход» для тех, кто летает отсюда каждый день.
-Или же своего рода дополнительный слой кеша между резидентным слоем проб и `vpn_always.txt`
-
-Важно, чем он **не** является:
-- это **не** «всегда в VPN» — для этого есть `vpn_always.txt`;
-- он не решает «блокировать/не блокировать» — вердикт как всегда выносит судья по факту трафика через туннель; ошибка в списке стоит ровно одну лишнюю проверку, ничего не ломая;
-- пустой файл = механизм просто выключен.
-
-Это прежде всего может оказаться полезно для нагруженных роутеров и частых запросов к флапающим CDN.
-
-Откуда берётся список: он строится **из твоей же сети** — Susanin пишет в лог, какие домены у тебя уезжали в VPN, а офлайн-скрипт (`tools/dataset.py`, одна команда на компьютере с Python) превращает суток лога в готовый `domain_prior.txt`. Кладёшь файл на роутер — он подхватывается сам, без рестарта. В поставке файл пустой и это нормально: приор — ускоритель, а не настройка, без которой не работает.
-
-#### Построение `domain_prior.txt` на базе своих логов
-
-Приор ускоряет повторное заворачивание доменов, которые уже блокировались в
-**твоей** сети. Инструмент — `tools/dataset.py` (чистый Python 3, без
-зависимостей; в пакет не входит, берётся из репозитория).
-
-**Шаг 1. На роутере включить видимость** (на несколько дней наблюдений;
-`log_level` и `dns_sniff` применяются только `restart`, не `reload`):
-
-```sh
-/opt/susanin/bin/susanin-agent config set log_level trace
-/opt/susanin/bin/susanin-agent config set dns_sniff 1
-sh /opt/susanin/tools/susanin.sh restart
-```
-
-**Шаг 2. Забрать логи** (нужны несколько суток; `trace` даёт ~3 МБ/сут,
-ротация на роутере держит только 3×5 МиБ — затягивать нельзя; `.gz` тренер
-читает сам):
-
-```sh
-scp -P 222 root@<роутер>:'/opt/susanin/var/susanin.log*' .
-```
-
-**Шаг 3. Обучить приор** (на машине с Python 3; зависимости не нужны).
-Тренеру нужны строки `dns-map:` — они пишутся при включённом `dns_sniff`:
-
-```sh
-scp -P 222 root@<роутер>:/opt/susanin/etc/vpn_always.txt .
-scp -P 222 root@<роутер>:/opt/susanin/etc/vpn_never.txt .
-python3 tools/dataset.py susanin.log* --prior domain_prior.txt \
-  --lists vpn_always.txt vpn_never.txt --eval-hours 12
-```
-
-- `--lists` вычеркивает из обучения домены твоих списков: пин-доменам приор
-  не нужен (они и так всегда в VPN), never-доменам противоречит (решение
-  владельца первее статистики);
-- `--deny deny.txt` (по желанию) — файл исключений по одному домену на
-  строку (`#` — комментарий). Сюда вычеркивают общие CDN с «коллапсальными»
-  подтверждениями: IP соседа по CDN-периферии реально блокируется, проба
-  честно подтверждает туннель, а домен-инфраструктура наследует вину соседа
-  (типичные кандидаты: `rtbcdn.*`, ozone-подобные маркетплейсы за общим
-  edge). После обучения просмотреть список глазами и довычеркнуть лишнее —
-  файл правится руками, это нормальный этап;
-- `--eval-hours 12` — честная оценка: приор учится на первых 12 часах,
-  проверяется на остальных. В сводке: `prior_promos` — сколько промоушенов
-  теста пришлось на prior-домены, `prior_conf` — сколько из них
-  подтвердились (точность = conf/promos), `domain_cov` — покрытия сколько
-  подтверждений вообще имеют известный домен (потолок ~20 %, клиенты с DoH
-  невидимы).
-
-**Шаг 4. Положить результат на роутер** (перечитывается по mtime, рестарт
-не нужен):
-
-```sh
-scp -P 222 domain_prior.txt root@<роутер>:/opt/susanin/etc/domain_prior.txt
-```
-
-**Что ожидать.** Приор меняет только порядок очереди промоушенов: кандидат
-из списка проходит **вперёд лимита** `promo_per_min`. На малоклиентской
-сети эффекта незаметно (очередь не насыщается), вердикты и пороги он не
-меняет никогда — проверять факт работы по строкам `prior (domain_prior)`
-в логе. Вред минимален по построению: лишний домен в списке стоит одну
-лишнюю пробу.
 
 **Требования**
 
@@ -187,6 +124,12 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 - [XRAY.md](XRAY.md) — XRay/VLESS-REALITY: совместимость, конфликты, XKeen;
 - [CHANGELOG.md](CHANGELOG.md) — что нового по версиям.
 
+Описание релиза на GitHub собирается при публикации тега: `.github/workflows/release.yml`
+берёт `.github/release-body.template.md` и вытаскивает из `CHANGELOG.md` раздел
+текущей версии. Отдельных файлов `release-notes-v*.md`, как в
+[Teleproxy.Keenetic](https://github.com/R17a/Teleproxy.Keenetic), здесь нет —
+там они нужны, потому что `CHANGELOG.md` апстримовый.
+
 <hr>
 
 ## 🇬🇧 English
@@ -201,9 +144,9 @@ the VPN. If the VPN is unavailable, everything goes direct. There is also a plai
 list of domains that must **always** go through the VPN (no manual IP lists —
 names only, like in Keenetic).
 
-**Status: release 0.4.2.** Tested on Keenetic Viva (MT7621, MIPS),
+**Status: release 0.4.7.** Tested on Keenetic Viva (MT7621, MIPS),
 KeeneticOS 5.1.4–5.1.5, Entware, WireGuard/AmneziaWG tunnels (`nwg0`/`nwg1`),
-Xray VLESS+REALITY (`egress_type=tproxy`), Keenetic Giga/Ultra.
+Xray VLESS+REALITY and VLESS+WS+TLS (`egress_type=tproxy`), Keenetic Giga/Ultra.
 
 **What it does**
 
@@ -222,7 +165,16 @@ Xray VLESS+REALITY (`egress_type=tproxy`), Keenetic Giga/Ultra.
 - built-in web panel (LAN only) with a Russian, English and Chinese interface;
   disabled by default;
 - repairs its own rules if NDM wipes them and can route clients of an OpenConnect
-  server on the same router.
+  server on the same router;
+- DNS sniffing links IPs to domains: lists apply instantly, and
+  `susanin why <ip|domain>` plus the learning log explain every routing decision;
+- detects TSPU "freezing" (TCP stream stalls after the first tens of packets)
+  and inherits the verdict across the whole hosting /24 — new IPs of a frozen
+  network go to the VPN without probing;
+- RU guard: auto-learning never sends Russian domains (`.ru`, `.рф`, etc.) into
+  the VPN — banks and marketplaces anti-fraud drop foreign exits;
+- UDP/QUIC through the tunnel (built-in SOCKS UDP relay) and automatic CDN
+  ranges updates.
 
 It is not a VPN client: the tunnel (WireGuard/AmneziaWG "Additional connection")
 must already work. IPv6 is not supported in v1.
@@ -271,9 +223,9 @@ VPN 路由）实现，并移植到 Keenetic/Entware 路由器。
 连接并继续让它们走 VPN。如果 VPN 不可用，所有流量都直连。此外还有一份「始终走
 VPN」的域名列表（无需手工维护 IP 列表——只写域名，和 Keenetic 一样）。
 
-**状态：0.4.2 版。** 已在 Keenetic Viva（MT7621，MIPS）、KeeneticOS
+**状态：0.4.7 版。** 已在 Keenetic Viva（MT7621，MIPS）、KeeneticOS
 5.1.4–5.1.5、Entware、WireGuard/AmneziaWG 隧道（`nwg0`/`nwg1`）、
-Xray VLESS+REALITY（`egress_type=tproxy`）、Keenetic Giga/Ultra 上验证。
+Xray VLESS+REALITY 及 VLESS+WS+TLS（`egress_type=tproxy`）、Keenetic Giga/Ultra 上验证。
 
 **功能**
 
@@ -287,7 +239,14 @@ Xray VLESS+REALITY（`egress_type=tproxy`）、Keenetic Giga/Ultra 上验证。
 - 路由配置文件：最多 4 份「域名/CIDR → 指定隧道」列表；
 - 内置网页面板（仅限 LAN），界面支持俄语、英语、中文；默认关闭；
 - 若 NDM 清除了规则会自动修复，还可把同一台路由器上 OpenConnect 服务器的客户端
-  纳入路由。
+  纳入路由；
+- DNS 嗅探把 IP 与域名关联——列表即时生效，`susanin why <ip|域名>` 和训练日志
+  解释每个路由决定；
+- 检测 TSPU「冻结」（TCP 流在头几十个数据包后停滞）并把结论扩展到整个 /24
+  主机网络——被冻结网络的新 IP 无需探测直接进 VPN；
+- RU 防护：自动训练不会把俄罗斯域名（`.ru`、`.рф` 等）送入 VPN——银行和电商的
+  反欺诈会切断境外出口；
+- 内置 SOCKS UDP 中继让 UDP/QUIC 也走隧道，CDN 网段自动更新。
 
 它不是 VPN 客户端：隧道（WireGuard/AmneziaWG「额外连接」）必须已经在工作。
 v1 不支持 IPv6。

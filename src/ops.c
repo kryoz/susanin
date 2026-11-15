@@ -173,6 +173,29 @@ static int cap_count_digits(const char *exe, char *const argv[])
     return count;
 }
 
+/* Число записей набора через `ipset list -t` (заголовок без дампа элементов):
+ * «Number of entries: N». Полный `ipset list` на каждый опрос панели (раз в 5 с)
+ * тащит через pipe сотни строк ради счётчика; terse-вариант в разы дешевле и для
+ * веб-процесса, и для CPU роутера. При неожиданном выводе — откат к полному
+ * подсчёту строк-элементов. */
+static int ipset_count(const char *ipset, const char *name)
+{
+    char *a[5];
+    char out[1024];
+    char *p;
+    a[0] = (char *)ipset; a[1] = "list"; a[2] = "-t"; a[3] = (char *)name; a[4] = NULL;
+    if (run_capture(ipset, a, out, sizeof(out)) == 0) {
+        p = strstr(out, "Number of entries:");
+        if (p)
+            return atoi(p + 18);
+    }
+    {
+        char *b[4];
+        b[0] = (char *)ipset; b[1] = "list"; b[2] = (char *)name; b[3] = NULL;
+        return cap_count_digits(ipset, b);
+    }
+}
+
 int ops_setup(const susanin_config *base, const char *conf_path, int argc, char **argv)
 {
     susanin_config cfg = *base;
@@ -258,6 +281,14 @@ int ops_status(const susanin_config *cfg, const char *conf_path)
     printf("susanin-agent %s\n", SUSANIN_VERSION);
     printf("config file: %s (%s)\n", conf_path,
            access(conf_path, R_OK) == 0 ? "present" : "absent");
+    {
+        const char *lp = getenv("SUSANIN_LOG");
+        if (!lp || !*lp)
+            lp = "/opt/susanin/var/susanin.log";
+        printf("log: %s%s\n", lp,
+               strcmp(cfg->disk_mode, "soft") == 0 ? " (disk_mode=soft: файл не ведётся)"
+               : path_on_tmpfs(lp) ? "  (! tmpfs = RAM: риск OOM и утраты логов при reboot)" : "");
+    }
     printf("egress=%s table=%d lan=%s\n", cfg->egress_interface,
            cfg->routing_table, cfg->lan_interfaces);
     cfg_tp = strcmp(cfg->egress_type, "tproxy") == 0;
@@ -280,6 +311,13 @@ int ops_status(const susanin_config *cfg, const char *conf_path)
            cfg->kernel_egress[0] ? cfg->kernel_egress : "-",
            cfg->pin_reassert, cfg->xray_watchdog, cfg->auto_direct,
            cfg->media_enabled);
+    if (cfg->proxy_uid[0] && cfg->proxy_egress[0]) {
+        printf("proxy_egress: uid=%s -> %s (table=%d mark=0x%lx)\n",
+               cfg->proxy_uid, cfg->proxy_egress, cfg->proxy_table,
+               cfg->proxy_mark);
+    } else if (cfg->proxy_uid[0] || cfg->proxy_egress[0]) {
+        printf("proxy_egress: НЕ ВКЛЮЧЁН (нужны и proxy_uid, и proxy_egress)\n");
+    }
     if (cfg->port_aware)
         printf("port_aware=1 (экспериментально): ok/test — пары ip:port (матч dst,dst); "
                "ok_net/never/direct — по адресу. Наборы занимают больше памяти — "
@@ -362,11 +400,8 @@ int ops_status(const susanin_config *cfg, const char *conf_path)
             "susanin_ok_net", "susanin_never"
         };
         int k;
-        for (k = 0; k < 6; k++) {
-            char *b[4];
-            b[0] = (char *)ipset; b[1] = "list"; b[2] = (char *)names[k]; b[3] = NULL;
-            printf("  %-18s = %d\n", names[k], cap_count_digits(ipset, b));
-        }
+        for (k = 0; k < 6; k++)
+            printf("  %-18s = %d\n", names[k], ipset_count(ipset, names[k]));
     }
 
     cdn_load(cfg);
@@ -406,7 +441,7 @@ int ops_status(const susanin_config *cfg, const char *conf_path)
  * (best-effort: DNS не даёт перечислить все поддомены зоны). Файлы
  * vpn_always/vpn_never не изменяются. */
 /* Снять из состояния и susanin_ok_net все сети, покрывающие адрес.
- * Инцидент 2026-10-16 (reg.ru): media-агрегация утащила 194.67.72.0/24 в VPN,
+ * Практика: media-агрегация утащила 194.67.72.0/24 в VPN,
  * а reset/forget показывал «removed=0» — покрывающая сеть оставалась. */
 static int reset_covering_nets(const susanin_config *cfg, susanin_state *st,
                                const char *ip)
@@ -636,6 +671,97 @@ int ops_complain(const susanin_config *cfg, const char *arg)
         vn_free(vn);
     return 0;
 }
+/* `susanin why <ip|domain>` — почему адрес маршрутизируется так, а не иначе:
+ * какая запись списка его накрывает, в каких наборах и кэшах он лежит.
+ * (поиск «почему адрес не учится» занял два часа, потому что
+ * накрывающий CIDR в vpn_never нигде не было видно.) */
+int ops_why(const susanin_config *cfg, const char *arg)
+{
+    char ip[16];
+    char entry[256];
+    struct in_addr a;
+    susanin_state st;
+    const char *spath = "/opt/susanin/var/susanin.state";
+    time_t now = time(NULL);
+    int udp, in_never = 0, in_direct = 0, in_ok = 0, in_test = 0, in_oknet = 0;
+    int stv_never = 0, stv_ok = 0;
+
+    if (!arg || !arg[0]) {
+        fprintf(stderr, "usage: susanin-agent why <ip|domain>\n");
+        return 2;
+    }
+    ip[0] = '\0';
+    if (inet_pton(AF_INET, arg, &a) == 1) {
+        snprintf(ip, sizeof(ip), "%.15s", arg);
+    } else {
+        char server[64];
+        char names[2][300];
+        char ips[16][16];
+        int nn = 0, k, m;
+        va_pick_resolver(cfg, server, sizeof(server));
+        snprintf(names[nn++], sizeof(names[0]), "%.200s", arg);
+        snprintf(names[nn++], sizeof(names[0]), "www.%.200s", arg);
+        for (k = 0; k < nn && !ip[0]; k++) {
+            m = va_dns_query(server, names[k], ips, 16, 1500);
+            if (m > 0)
+                snprintf(ip, sizeof(ip), "%s", ips[0]);
+        }
+        if (!ip[0]) {
+            fprintf(stderr, "[susanin] why %s: адрес не разрешился\n", arg);
+            return 1;
+        }
+        printf("why %s -> %s\n", arg, ip);
+    }
+    if (!cfg->vpn_never_file[0])
+        printf("  vpn_never: (файл списка не задан)\n");
+    else if (vn_match_file(cfg->vpn_never_file, ip, entry, sizeof(entry))) {
+        printf("  vpn_never: запись \"%s\" накрывает адрес -> ВСЕГДА напрямую\n", entry);
+        in_never = 1;
+    } else
+        printf("  vpn_never: накрывающей записи нет\n");
+    if (cfg->vpn_always_file[0] &&
+        vn_match_file(cfg->vpn_always_file, ip, entry, sizeof(entry)))
+        printf("  vpn_always: явная запись \"%s\" (IP/CIDR)\n", entry);
+
+    in_never  = in_never  || backend_set_test(cfg, "susanin_never", ip) == 0;
+    in_direct = backend_set_test(cfg, "susanin_direct", ip) == 0;
+    in_oknet  = backend_set_test(cfg, "susanin_ok_net", ip) == 0;
+    printf("  ipset never/direct/ok_net : %s/%s/%s\n",
+           backend_set_test(cfg, "susanin_never", ip) == 0 ? "ЕСТЬ" : "нет",
+           in_direct ? "ЕСТЬ" : "нет",
+           in_oknet ? "ЕСТЬ (VPN, префикс)" : "нет");
+    for (udp = 0; udp < 2; udp++) {
+        const char *set = udp ? "susanin_ok_udp" : "susanin_ok_tcp";
+        const char *tset = udp ? "susanin_test_udp" : "susanin_test_tcp";
+        int o = backend_set_test(cfg, set, ip) == 0;
+        int t = backend_set_test(cfg, tset, ip) == 0;
+        in_ok = in_ok || o;
+        in_test = in_test || t;
+        printf("  ipset %-17s: %s   %-17s: %s\n", set, o ? "ЕСТЬ (VPN)" : "нет",
+               tset, t ? "ЕСТЬ (проба VPN)" : "нет");
+    }
+
+    state_init(&st);
+    state_load(spath, &st);
+    stv_ok = state_has(st_ok(&st, 0), ip, now) || state_has(st_ok(&st, 1), ip, now);
+    stv_never = state_has(&st.never, ip, now);
+    state_free(&st);
+    printf("  state ok/never: %s/%s\n", stv_ok ? "ЕСТЬ" : "нет", stv_never ? "ЕСТЬ" : "нет");
+
+    printf("  вывод: ");
+    if (in_never || in_direct || stv_never)
+        printf("напрямую (vpn_never/direct) — обучение в VPN заблокировано;"
+               " чтобы пустить через VPN, удалите накрывающую запись из vpn_never\n");
+    else if (in_ok || in_oknet || stv_ok)
+        printf("через VPN (ok)\n");
+    else if (in_test)
+        printf("проба через VPN (test)\n");
+    else
+        printf("не выучен -> прямой путь; при деградации прямого FAST-детект"
+               " завернёт в VPN в течение ~1 мин\n");
+    return 0;
+}
+
 static int check_missing(const susanin_config *cfg, char *a[])
 {
     const char *ipt = tool("iptables");
@@ -810,13 +936,9 @@ int ops_status_json(const susanin_config *cfg, const char *conf_path,
          cfg->mark_test, cfg->mark_ok);
 
     japp(buf, n, &used, "\"ipsets\":{");
-    for (k = 0; k < 6; k++) {
-        char *b[4];
-        int cnt;
-        b[0] = (char *)ipset; b[1] = "list"; b[2] = (char *)sets[k]; b[3] = NULL;
-        cnt = cap_count_digits(ipset, b);
-        japp(buf, n, &used, "%s\"%s\":%d", k ? "," : "", sets[k], cnt);
-    }
+    for (k = 0; k < 6; k++)
+        japp(buf, n, &used, "%s\"%s\":%d", k ? "," : "", sets[k],
+             ipset_count(ipset, sets[k]));
     japp(buf, n, &used, "},");
 
     json_str(esc, sizeof(esc), cfg->vpn_always_file);
@@ -826,6 +948,60 @@ int ops_status_json(const susanin_config *cfg, const char *conf_path,
     json_str(esc, sizeof(esc), cfg->vpn_never_file);
     japp(buf, n, &used, "\"vpn_never\":{\"file\":\"%s\",\"count\":%d}},", esc,
          vn_count);
+
+    /* r5.4: «RU в VPN» — счётчик пишет dns_sniff_ru_audit (движок),
+     * панель только читает: RU-домены, идущие через туннель, — это
+     * потенциальные отказы антифрода. */
+    {
+        char rbuf[512] = "";
+        int rcnt = 0;
+        esc[0] = '\0';
+        FILE *rf = fopen("/opt/susanin/var/ru-in-vpn", "r");
+        if (rf) {
+            if (fgets(rbuf, sizeof(rbuf), rf)) {
+                char *sp = strchr(rbuf, ' ');
+                rcnt = atoi(rbuf);
+                if (sp) {
+                    *sp = '\0';
+                    json_str(esc, sizeof(esc), sp + 1);
+                } else {
+                    json_str(esc, sizeof(esc), "");
+                }
+            }
+            fclose(rf);
+        }
+        japp(buf, n, &used, "\"ru_in_vpn\":{\"count\":%d,\"domains\":\"%s\"},",
+             rcnt, esc);
+    }
+
+    /* r7.5: носитель только для чтения (смерть флешки/сбойjournal) — агент
+     * не может писать pid/лог/state; в панели это должно быть видно сразу. */
+    japp(buf, n, &used, "\"storage_ro\":%s,",
+         access("/opt/susanin/var", W_OK) == 0 ? "false" : "true");
+
+    /* r7.4b: аудит клиентов (пишет движок в var/clients.txt). */
+    japp(buf, n, &used, "\"clients\":[");
+    {
+        FILE *cf = fopen("/opt/susanin/var/clients.txt", "r");
+        char line[128];
+        int any = 0;
+        esc[0] = '\0';
+        if (cf) {
+            while (fgets(line, sizeof(line), cf)) {
+                char cip[64];
+                int t, v, d;
+                if (sscanf(line, "%63s %d %d %d", cip, &t, &v, &d) == 4 && t > 0) {
+                    json_str(esc, sizeof(esc), cip);
+                    japp(buf, n, &used,
+                         "%s{\"ip\":\"%s\",\"flows\":%d,\"vpn\":%d,\"direct\":%d}",
+                         any ? "," : "", esc, t, v, d);
+                    any = 1;
+                }
+            }
+            fclose(cf);
+        }
+        japp(buf, n, &used, "],");
+    }
 
     japp(buf, n, &used, "\"profiles\":[");
     for (k = 0; k < cfg->n_profiles; k++) {

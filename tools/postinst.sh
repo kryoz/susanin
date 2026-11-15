@@ -108,7 +108,6 @@ if [ -f "$CONF" ]; then
 	ensure_key vpn_never_file /opt/susanin/etc/vpn_never.txt
 	ensure_key vpn_never_interval 300
 	# 0.5.0: приор автообучения; seed файла создаётся циклом списков ниже.
-	ensure_key domain_prior_file /opt/susanin/etc/domain_prior.txt
 	ensure_key lan_server_interfaces ""
 	ensure_key dp_check_interval 15
 	ensure_key learn_min_op 10
@@ -326,7 +325,7 @@ merge_list() { # merge_list <файл пользователя> <файл пак
 if [ "${SUSANIN_KEEP_LISTS:-0}" = 1 ]; then
 	say "--keep-lists: списки vpn_always/vpn_never не трогаем"
 fi
-for _l in vpn_always vpn_never domain_prior; do
+for _l in vpn_always vpn_never; do
 	if [ ! -f "$PREFIX/etc/$_l.txt" ]; then
 		if [ -f "$SHARE/$_l.txt" ]; then
 			cp "$SHARE/$_l.txt" "$PREFIX/etc/$_l.txt"
@@ -392,5 +391,13 @@ else
 	fi
 fi
 
+# Сторож S95xray-guard (был в апстрим-0.4.6) из поставки исключён: при
+# обновлении он мог остаться в /opt/etc/init.d и поднимать Xray против
+# решения агента. Снимаем и удаляем остатки (наш pid-файл — тоже наш мусор).
+if [ -f /opt/etc/init.d/S95xray-guard ]; then
+	/opt/etc/init.d/S95xray-guard stop >/dev/null 2>&1 || true
+	rm -f /opt/etc/init.d/S95xray-guard 2>/dev/null || true
+	rm -f /opt/var/run/xray-guard.pid 2>/dev/null || true
+fi
 say "готово. Проверка: susanin status && susanin diagnose"
 exit 0

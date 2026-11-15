@@ -133,8 +133,6 @@ void config_set_defaults(susanin_config *c)
     c->vpn_always_interval = 300;
     snprintf(c->vpn_never_file, sizeof(c->vpn_never_file), "%s",
              "/opt/susanin/etc/vpn_never.txt");
-    snprintf(c->domain_prior_file, sizeof(c->domain_prior_file), "%s",
-             "/opt/susanin/etc/domain_prior.txt");
     c->vpn_never_interval = 300;
     c->vpn_refresh_budget_ms = 250;
     snprintf(c->log_level, sizeof(c->log_level), "%s", "info");
@@ -142,6 +140,15 @@ void config_set_defaults(susanin_config *c)
     snprintf(c->xray_gogc, sizeof(c->xray_gogc), "%s", "50");
     snprintf(c->xray_gomemlimit, sizeof(c->xray_gomemlimit), "%s", "64MiB");
     c->xray_watchdog = 1;
+    /* Порог свободной памяти для запуска Xray (КБ): ниже порога старт
+     * пропускается (защита от OOM-петли). По умолчанию 0 = ВЫКЛЮЧЕНО:
+     * активный порог 12288 в 0.4.6 на 122 МБ роутере почти всегда блокировал
+     * подъём Xray после падения (долгий fail-open DIRECT, «сайты грузятся
+     * медленно»). Включать осознанно, напр. xray_min_mem_kb=6144. */
+    c->xray_min_mem_kb = 0;
+    /* Лог Xray перед запуском обрезаем до 2 МБ: при loglevel=debug он растёт
+     * на мегабайты, а в tmpfs это отнятая у системы память. */
+    c->xray_log_max_kb = 2048;
     snprintf(c->disk_mode, sizeof(c->disk_mode), "%s", "normal");
     c->soft_state_interval = 12 * 3600;   /* soft: сохранять состояние раз в 12 ч */
     /* Порты, которые не участвуют в автообучении (типовой скан-шум). */
@@ -167,6 +174,20 @@ void config_set_defaults(susanin_config *c)
     c->cdn_prefix_learn = 1;
     c->cdn_prefix_ttl = 3600;
     c->aggregate_confirm = 2;
+    c->frozen_net_enabled = 1;
+    c->frozen_net_min_ips = 3;
+    c->frozen_net_prefix = 24;
+    c->frozen_net_ttl = 86400;
+    c->test_net_enabled = 1;
+    c->test_net_min_ips = 2;
+    c->test_net_prefix = 24;
+    c->test_net_window = 60;
+    c->test_net_ttl = 600;
+    c->ru_guard = 1;
+    c->ru_guard_direct = 1;
+    snprintf(c->ru_guard_tlds, sizeof(c->ru_guard_tlds), "%s",
+             ".ru,.su,.рф,.xn--p1ai,.moscow,.xn--80adxhks,.tatar,.xn--80asehdb");
+    c->tz[0] = '\0';
     c->cdn_prefix_max = 24;
     c->ipv6_block = 1;
     c->quic_block = 1;
@@ -199,13 +220,18 @@ void config_set_defaults(susanin_config *c)
     c->pin_reassert = 1;
     c->kernel_offload = 0;
     c->kernel_offload_max = 24;
+    /* P5: proxy_uid/proxy_egress по умолчанию выключены. */
+    c->proxy_uid[0] = '\0';
+    c->proxy_egress[0] = '\0';
+    c->proxy_table = 110;
+    c->proxy_mark = 0x01000000UL;
     c->egress_race = 0;
     c->auto_direct = 1;
     c->direct_pref_ttl = 3600;
     c->media_enabled = 0;
     /* Медиа-порты по умолчанию — только видео/IPTV. 80/443 убраны: обычная
      * загрузка страницы под них подпадала, и два адреса уводили в VPN всю /24
-     * хостинга (инцидент reg.ru 2026-10-16). Кому нужно — задаёт явно. */
+     * хостинга. Кому нужно — задаёт явно. */
     snprintf(c->media_ports, sizeof(c->media_ports), "%s", "554,1935,8080,8443");
     c->media_min_bytes = 1048576;
     c->media_ratio = 8;
@@ -420,8 +446,6 @@ int config_load(const char *path, susanin_config *c)
             c->vpn_always_interval = parse_dur(val, U_SEC);
         else if (!strcmp(key, "vpn_never_file"))
             set_str(c->vpn_never_file, sizeof(c->vpn_never_file), val);
-        else if (!strcmp(key, "domain_prior_file"))
-            set_str(c->domain_prior_file, sizeof(c->domain_prior_file), val);
         else if (!strcmp(key, "vpn_never_interval"))
             c->vpn_never_interval = parse_dur(val, U_SEC);
         else if (!strcmp(key, "vpn_refresh_budget_ms"))
@@ -436,6 +460,10 @@ int config_load(const char *path, susanin_config *c)
                 set_str(c->xray_gomemlimit, sizeof(c->xray_gomemlimit), val);
             else if (!strcmp(key, "xray_watchdog"))
                 c->xray_watchdog = (int)strtol(val, NULL, 0);
+            else if (!strcmp(key, "xray_min_mem_kb"))
+                c->xray_min_mem_kb = (int)strtol(val, NULL, 0);
+            else if (!strcmp(key, "xray_log_max_kb"))
+                c->xray_log_max_kb = (int)strtol(val, NULL, 0);
         else if (!strcmp(key, "disk_mode"))
             set_str(c->disk_mode, sizeof(c->disk_mode), val);
         else if (!strcmp(key, "soft_state_interval"))
@@ -480,6 +508,32 @@ int config_load(const char *path, susanin_config *c)
             c->cdn_prefix_ttl = parse_dur(val, U_SEC);
         else if (!strcmp(key, "aggregate_confirm"))
             c->aggregate_confirm = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "frozen_net_enabled"))
+            c->frozen_net_enabled = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "frozen_net_min_ips"))
+            c->frozen_net_min_ips = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "frozen_net_prefix"))
+            c->frozen_net_prefix = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "frozen_net_ttl"))
+            c->frozen_net_ttl = parse_dur(val, U_SEC);
+        else if (!strcmp(key, "test_net_enabled"))
+            c->test_net_enabled = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "test_net_min_ips"))
+            c->test_net_min_ips = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "test_net_prefix"))
+            c->test_net_prefix = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "test_net_window"))
+            c->test_net_window = parse_dur(val, U_SEC);
+        else if (!strcmp(key, "test_net_ttl"))
+            c->test_net_ttl = parse_dur(val, U_SEC);
+        else if (!strcmp(key, "ru_guard"))
+            c->ru_guard = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "ru_guard_direct"))
+            c->ru_guard_direct = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "ru_guard_tlds"))
+            set_str(c->ru_guard_tlds, sizeof(c->ru_guard_tlds), val);
+        else if (!strcmp(key, "tz"))
+            set_str(c->tz, sizeof(c->tz), val);
         else if (!strcmp(key, "cdn_prefix_max"))
             c->cdn_prefix_max = (int)strtol(val, NULL, 0);
         else if (!strcmp(key, "ipv6_block"))
@@ -514,6 +568,14 @@ int config_load(const char *path, susanin_config *c)
             set_str(c->kernel_egress, sizeof(c->kernel_egress), val);
         else if (!strcmp(key, "kernel_offload_max"))
             c->kernel_offload_max = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "proxy_uid"))
+            set_str(c->proxy_uid, sizeof(c->proxy_uid), val);
+        else if (!strcmp(key, "proxy_egress"))
+            set_str(c->proxy_egress, sizeof(c->proxy_egress), val);
+        else if (!strcmp(key, "proxy_table"))
+            c->proxy_table = (int)strtol(val, NULL, 0);
+        else if (!strcmp(key, "proxy_mark"))
+            c->proxy_mark = strtoul(val, NULL, 0);
         else if (!strcmp(key, "egress_race"))
             c->egress_race = (int)strtol(val, NULL, 0);
         else if (!strcmp(key, "auto_direct"))
@@ -743,7 +805,6 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "vpn_always_interval=%d\n", out_dur(c->vpn_always_interval, U_SEC));
     fprintf(fp, "# Файл списка «всегда напрямую».\n");
     fprintf(fp, "vpn_never_file=%s\n", c->vpn_never_file);
-    fprintf(fp, "domain_prior_file=%s\n", c->domain_prior_file);
     fprintf(fp, "# Период обновления списка «всегда напрямую», сек.\n");
     fprintf(fp, "vpn_never_interval=%d\n", out_dur(c->vpn_never_interval, U_SEC));
     fprintf(fp, "# Бюджет DNS-обновления списков за один проход, мс (0 = 4000).\n");
@@ -760,6 +821,10 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "xray_gomemlimit=%s\n", c->xray_gomemlimit);
     fprintf(fp, "# Watchdog Xray: 1 = агент сам поднимает упавший Xray (tproxy).\n");
     fprintf(fp, "xray_watchdog=%d\n", c->xray_watchdog);
+    fprintf(fp, "# Порог свободной памяти для запуска Xray, КБ (0 = не проверять).\n");
+    fprintf(fp, "xray_min_mem_kb=%d\n", c->xray_min_mem_kb);
+    fprintf(fp, "# Обрезка xray.log перед запуском, КБ (0 = не обрезать).\n");
+    fprintf(fp, "xray_log_max_kb=%d\n", c->xray_log_max_kb);
     fprintf(fp, "# Режим носителя: normal | soft (минимум записей на NAND/flash).\n");
     fprintf(fp, "disk_mode=%s\n", c->disk_mode);
     fprintf(fp, "# Период сохранения состояния в soft-режиме, ч; 0 = никогда.\n");
@@ -794,6 +859,14 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "kernel_egress=%s\n", c->kernel_egress);
     fprintf(fp, "# N2: макс. длина префикса offload-маршрута (бит).\n");
     fprintf(fp, "kernel_offload_max=%d\n", c->kernel_offload_max);
+    fprintf(fp, "# P5: uid процесса-прокси на роутере (MTProxy/Teleproxy); пусто = выкл.\n");
+    fprintf(fp, "proxy_uid=%s\n", c->proxy_uid);
+    fprintf(fp, "# P5: интерфейс для трафика proxy_uid (напр. nwg0); пусто = выкл.\n");
+    fprintf(fp, "proxy_egress=%s\n", c->proxy_egress);
+    fprintf(fp, "# P5: таблица маршрутизации для proxy_uid.\n");
+    fprintf(fp, "proxy_table=%d\n", c->proxy_table);
+    fprintf(fp, "# P5: метка для трафика proxy_uid (hex).\n");
+    fprintf(fp, "proxy_mark=0x%lx\n", c->proxy_mark);
     fprintf(fp, "# N3: race-пробинг egress (выбор быстрейшего): 0 | 1.\n");
     fprintf(fp, "# Кандидаты — все интерфейсы из egress_interface.\n");
     fprintf(fp, "egress_race=%d\n", c->egress_race);
@@ -849,6 +922,44 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "# Сколько РАЗНЫХ адресов подтвердить до агрегации префикса (>=1;\n");
     fprintf(fp, "# 1 = агрегировать по первому подтверждению).\n");
     fprintf(fp, "aggregate_confirm=%d\n", c->aggregate_confirm);
+    fprintf(fp, "# Наследование заморозки ТСПУ на сеть (r4): N разных IP сети\n");
+    fprintf(fp, "# подтверждены в VPN -> весь префикс идёт в VPN без дальнейших\n");
+    fprintf(fp, "# проб (замораживают сети целиком: Hetzner/OVH/DO/Vultr...).\n");
+    fprintf(fp, "frozen_net_enabled=%d\n", c->frozen_net_enabled);
+    fprintf(fp, "# Сколько разных IP префикса подтвердить (>=1).\n");
+    fprintf(fp, "frozen_net_min_ips=%d\n", c->frozen_net_min_ips);
+    fprintf(fp, "# Длина префикса наследования (бит, 8..32).\n");
+    fprintf(fp, "frozen_net_prefix=%d\n", c->frozen_net_prefix);
+    fprintf(fp, "# TTL наследованного префикса, сек (продлевается при новых\n");
+    fprintf(fp, "# подтверждениях сети; истёк — сеть снова учится по IP).\n");
+    fprintf(fp, "frozen_net_ttl=%d\n", out_dur(c->frozen_net_ttl, U_SEC));
+    fprintf(fp, "# Быстрая агрегация на фазе TEST: N разных IP одного префикса\n");
+    fprintf(fp, "# в test за окно секунд -> префикс коротко пинится в susanin_ok_net\n");
+    fprintf(fp, "# (фан-аут источника идёт в VPN сразу, не дожидаясь CONFIRMED\n");
+    fprintf(fp, "# на каждый адрес); vpn_never приоритетнее. 0|1.\n");
+    fprintf(fp, "test_net_enabled=%d\n", c->test_net_enabled);
+    fprintf(fp, "# Сколько разных IP префикса нужно в test (>=1).\n");
+    fprintf(fp, "test_net_min_ips=%d\n", c->test_net_min_ips);
+    fprintf(fp, "# Длина префикса, бит (8..32).\n");
+    fprintf(fp, "test_net_prefix=%d\n", c->test_net_prefix);
+    fprintf(fp, "# Окно накопления серии, сек (серия остыла — счёт заново).\n");
+    fprintf(fp, "test_net_window=%d\n", out_dur(c->test_net_window, U_SEC));
+    fprintf(fp, "# TTL пина префикса, сек (короткий — ограничивает вред\n");
+    fprintf(fp, "# ложного срабатывания).\n");
+    fprintf(fp, "test_net_ttl=%d\n", out_dur(c->test_net_ttl, U_SEC));
+    fprintf(fp, "# RU-guard (r5): российские домены НЕ заворачивать в VPN\n");
+    fprintf(fp, "# автоматически — антифрод банков/OZON рвёт с чужого выхода.\n");
+    fprintf(fp, "# Ручной vpn_always сильнее; работает при dns_sniff=1. 0|1.\n");
+    fprintf(fp, "ru_guard=%d\n", c->ru_guard);
+    fprintf(fp, "# 1 = RU-домены активно держать напрямую (пин в susanin_never,\n");
+    fprintf(fp, "# снятие уже выученного VPN-пина); ручной vpn_always сильнее.\n");
+    fprintf(fp, "ru_guard_direct=%d\n", c->ru_guard_direct);
+    fprintf(fp, "# Суффиксы «российских» доменов через запятую.\n");
+    fprintf(fp, "ru_guard_tlds=%s\n", c->ru_guard_tlds);
+    fprintf(fp, "# Часовой пояс логов в POSIX-форме (Иркутск: IST-8, МСК: MSK-3).\n");
+    fprintf(fp, "# Пусто = системный (на Entware обычно UTC). Влияет на время в логах\n");
+    fprintf(fp, "# агента, панели и xray (init-скрипты экспортируют его в TZ).\n");
+    fprintf(fp, "tz=%s\n", c->tz);
     fprintf(fp, "# Блокировать IPv6 из LAN (клиенты уходят на IPv4): 0 | 1.\n");
     fprintf(fp, "ipv6_block=%d\n", c->ipv6_block);
     fprintf(fp, "# Блокировать QUIC (UDP/443) из LAN: 0 | 1.\n");
@@ -1020,7 +1131,6 @@ void config_print(const susanin_config *c)
     printf("vpn_always_dns=%s\n", c->vpn_always_dns);
     printf("vpn_always_interval=%d\n", out_dur(c->vpn_always_interval, U_SEC));
     printf("vpn_never_file=%s\n", c->vpn_never_file);
-    printf("domain_prior_file=%s\n", c->domain_prior_file);
     printf("vpn_never_interval=%d\n", out_dur(c->vpn_never_interval, U_SEC));
     printf("vpn_refresh_budget_ms=%d\n", c->vpn_refresh_budget_ms);
     printf("log_level=%s\n", c->log_level);
@@ -1028,6 +1138,8 @@ void config_print(const susanin_config *c)
     printf("xray_gogc=%s\n", c->xray_gogc);
     printf("xray_gomemlimit=%s\n", c->xray_gomemlimit);
     printf("xray_watchdog=%d\n", c->xray_watchdog);
+    printf("xray_min_mem_kb=%d\n", c->xray_min_mem_kb);
+    printf("xray_log_max_kb=%d\n", c->xray_log_max_kb);
     printf("disk_mode=%s\n", c->disk_mode);
     printf("soft_state_interval=%d\n", out_dur(c->soft_state_interval, U_HOUR));
     printf("learn_exclude_ports=%s\n", c->learn_exclude_ports);
@@ -1044,6 +1156,10 @@ void config_print(const susanin_config *c)
     printf("kernel_offload=%d\n", c->kernel_offload);
     printf("kernel_egress=%s\n", c->kernel_egress);
     printf("kernel_offload_max=%d\n", c->kernel_offload_max);
+    printf("proxy_uid=%s\n", c->proxy_uid);
+    printf("proxy_egress=%s\n", c->proxy_egress);
+    printf("proxy_table=%d\n", c->proxy_table);
+    printf("proxy_mark=0x%lx\n", c->proxy_mark);
     printf("egress_race=%d\n", c->egress_race);
     printf("auto_direct=%d\n", c->auto_direct);
     printf("direct_pref_ttl=%d\n", out_dur(c->direct_pref_ttl, U_SEC));
@@ -1074,6 +1190,19 @@ void config_print(const susanin_config *c)
     printf("cdn_prefix_ttl=%d\n", out_dur(c->cdn_prefix_ttl, U_SEC));
     printf("cdn_prefix_max=%d\n", c->cdn_prefix_max);
     printf("aggregate_confirm=%d\n", c->aggregate_confirm);
+    printf("frozen_net_enabled=%d\n", c->frozen_net_enabled);
+    printf("frozen_net_min_ips=%d\n", c->frozen_net_min_ips);
+    printf("frozen_net_prefix=%d\n", c->frozen_net_prefix);
+    printf("frozen_net_ttl=%d\n", out_dur(c->frozen_net_ttl, U_SEC));
+    printf("test_net_enabled=%d\n", c->test_net_enabled);
+    printf("test_net_min_ips=%d\n", c->test_net_min_ips);
+    printf("test_net_prefix=%d\n", c->test_net_prefix);
+    printf("test_net_window=%d\n", out_dur(c->test_net_window, U_SEC));
+    printf("test_net_ttl=%d\n", out_dur(c->test_net_ttl, U_SEC));
+    printf("ru_guard=%d\n", c->ru_guard);
+    printf("ru_guard_direct=%d\n", c->ru_guard_direct);
+    printf("ru_guard_tlds=%s\n", c->ru_guard_tlds);
+    printf("tz=%s\n", c->tz);
     printf("ipv6_block=%d\n", c->ipv6_block);
     printf("quic_block=%d\n", c->quic_block);
     printf("mss_clamp=%s\n", c->mss_clamp);

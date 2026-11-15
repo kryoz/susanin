@@ -4,11 +4,95 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Цепочечный хэш-индекс поверх массива v[]: наборы достигают тысяч записей
+ * (кэш ok), а state_has/state_at вызываются на каждом потоке каждую секунду —
+ * линейный обход strcmp был самым горячим местом на слабом CPU. Индекс
+ * поддерживается инкрементально (вставка O(1)) и пересобирается целиком только
+ * после уплотнения массива (remove/expire). Все связи хранятся как «номер
+ * слота + 1», 0 означает «нет». */
+static unsigned long set_hash(const char *s)
+{
+    unsigned long h = 5381;
+    for (; *s; s++)
+        h = ((h << 5) + h) ^ (unsigned char)*s;
+    return h;
+}
+
+static void idx_rechain(state_set *st)
+{
+    int i;
+    if (!st->bkt || st->nb <= 0)
+        return;
+    for (i = 0; i < st->nb; i++)
+        st->bkt[i] = 0;
+    for (i = 0; i < st->n; i++) {
+        unsigned b = set_hash(st->v[i].addr) % (unsigned)st->nb;
+        st->v[i].next = st->bkt[b];
+        st->bkt[b] = i + 1;
+    }
+}
+
+static void idx_grow(state_set *st)
+{
+    int nb = st->nb ? st->nb * 2 : 64;
+    int *nbkt = realloc(st->bkt, (size_t)nb * sizeof(int));
+    if (nbkt) {
+        st->bkt = nbkt;
+        st->nb = nb;
+    }
+    /* Перевешиваем ВСЕ записи (включая только что добавленную). При OOM
+     * бакеты остаются прежними — но пересборка цепочек всё равно нужна,
+     * иначе новый слот не найдётся через индекс. */
+    idx_rechain(st);
+}
+
+static void idx_insert(state_set *st, int slot)
+{
+    unsigned b;
+    if (!st->bkt || st->n > st->nb) {
+        /* Первый вызов (бакетов нет) или загрузка > 1: idx_grow пересобирает
+         * цепи для ВСЕХ слотов 0..n-1, включая slot, — отдельно вешать slot
+         * нельзя, иначе получилась бы ссылка на самого себя. */
+        idx_grow(st);
+        return;         /* при OOM bkt остаётся NULL — поиск линейным fallback'ом */
+    }
+    b = set_hash(st->v[slot].addr) % (unsigned)st->nb;
+    st->v[slot].next = st->bkt[b];
+    st->bkt[b] = slot + 1;
+}
+
+/* Поиск записи: по цепочке при живом индексе, иначе линейно (fallback OOM). */
+static state_entry *set_find(state_set *st, const char *addr, time_t now)
+{
+    if (!st->v || st->n <= 0)
+        return NULL;
+    if (st->bkt && st->nb > 0) {
+        int i = st->bkt[set_hash(addr) % (unsigned)st->nb];
+        while (i > 0 && i <= st->n) {
+            state_entry *e = &st->v[i - 1];
+            int nxt = e->next;
+            if (e->expire > now && strcmp(e->addr, addr) == 0)
+                return e;
+            i = nxt;
+        }
+        return NULL;
+    }
+    {
+        int i;
+        for (i = 0; i < st->n; i++)
+            if (st->v[i].expire > now && strcmp(st->v[i].addr, addr) == 0)
+                return &st->v[i];
+    }
+    return NULL;
+}
+
 static void set_init(state_set *st)
 {
     st->v = NULL;
     st->n = 0;
     st->cap = 0;
+    st->bkt = NULL;
+    st->nb = 0;
 }
 
 void state_init(susanin_state *s)
@@ -23,7 +107,9 @@ void state_init(susanin_state *s)
 static void set_free(state_set *st)
 {
     free(st->v);
+    free(st->bkt);
     st->v = NULL; st->n = 0; st->cap = 0;
+    st->bkt = NULL; st->nb = 0;
 }
 
 void state_free(susanin_state *s)
@@ -100,27 +186,20 @@ int state_expire(state_set *st, time_t now)
     }
     dropped = st->n - w;
     st->n = w;
+    if (dropped)
+        idx_rechain(st);    /* после уплотнения цепочки указывают на старых слотов */
     return dropped;
 }
 
 int state_has(const state_set *st, const char *addr, time_t now)
 {
-    int i;
-    for (i = 0; i < st->n; i++) {
-        if (st->v[i].expire > now && strcmp(st->v[i].addr, addr) == 0)
-            return 1;
-    }
-    return 0;
+    return set_find((state_set *)st, addr, now) != NULL;
 }
 
 time_t state_at(const state_set *st, const char *addr, time_t now)
 {
-    int i;
-    for (i = 0; i < st->n; i++) {
-        if (st->v[i].expire > now && strcmp(st->v[i].addr, addr) == 0)
-            return st->v[i].expire;
-    }
-    return 0;
+    const state_entry *e = set_find((state_set *)st, addr, now);
+    return e ? e->expire : 0;
 }
 
 static int set_reserve(state_set *st, int need)
@@ -139,7 +218,6 @@ static int set_reserve(state_set *st, int need)
 }
 
 int state_add(state_set *st, const char *addr, time_t now, int ttl, int refresh){
-    int i;
     state_entry *e;
     time_t expire;
     if (ttl <= 0)
@@ -147,17 +225,16 @@ int state_add(state_set *st, const char *addr, time_t now, int ttl, int refresh)
     else
         expire = now + ttl;
     if (!refresh) {
-        if (state_has(st, addr, now))
+        if (set_find(st, addr, now))
             state_remove(st, addr);
     } else {
-        for (i = 0; i < st->n; i++) {
-            if (st->v[i].expire > now && strcmp(st->v[i].addr, addr) == 0) {
-                /* refresh: срок только продлеваем — «освежение» не должно
-                 * укорачивать уже выученную запись. */
-                if (expire > st->v[i].expire)
-                    st->v[i].expire = expire;
-                return 0;
-            }
+        e = set_find(st, addr, now);
+        if (e) {
+            /* refresh: срок только продлеваем — «освежение» не должно
+             * укорачивать уже выученную запись. */
+            if (expire > e->expire)
+                e->expire = expire;
+            return 0;
         }
         return -1;
     }
@@ -166,6 +243,8 @@ int state_add(state_set *st, const char *addr, time_t now, int ttl, int refresh)
     e = &st->v[st->n++];
     snprintf(e->addr, sizeof(e->addr), "%s", addr);
     e->expire = expire;
+    e->next = 0;
+    idx_insert(st, st->n - 1);
     return 0;
 }
 
@@ -186,7 +265,10 @@ int state_remove(state_set *st, const char *addr)
         if (strcmp(st->v[i].addr, addr) != 0)
             st->v[w++] = st->v[i];
     }
-    st->n = w;
+    if (w != st->n) {
+        st->n = w;
+        idx_rechain(st);    /* после уплотнения цепочки указывают на старых слотов */
+    }
     return 0;
 }
 
@@ -216,6 +298,11 @@ int state_save(const char *path, const susanin_state *s)
     set_save(fp, "ok udp", &s->ok_udp);
     set_save(fp, "cool tcp", &s->cooldown_tcp);
     set_save(fp, "cool udp", &s->cooldown_udp);
+    /* Наблюдаемые (watch) тоже сохраняем: иначе после рестарта агента
+     * накопленные цепочки late-stall/QUIC приходится набирать заново.
+     * Старые версии агента неизвестную фазу при загрузке пропускают. */
+    set_save(fp, "watch tcp", &s->watch_tcp);
+    set_save(fp, "watch udp", &s->watch_udp);
     /* Префиксы ok_net и «мягко-прямо» (формат тот же: phase proto addr expire). */
     set_save(fp, "net tcp", &s->net);
     set_save(fp, "direct tcp", &s->direct);
@@ -250,6 +337,8 @@ int state_load(const char *path, susanin_state *s)
             set = !strcmp(proto, "tcp") ? &s->ok_tcp : &s->ok_udp;
         else if (!strcmp(phase, "cool"))
             set = !strcmp(proto, "tcp") ? &s->cooldown_tcp : &s->cooldown_udp;
+        else if (!strcmp(phase, "watch"))
+            set = !strcmp(proto, "tcp") ? &s->watch_tcp : &s->watch_udp;
         else if (!strcmp(phase, "net"))
             set = &s->net;
         else if (!strcmp(phase, "direct"))

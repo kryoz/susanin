@@ -238,7 +238,7 @@ wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egres
 ## Обновление и удаление
 
 ```sh
-sh /opt/susanin/tools/susanin.sh update 0.4.1-oc     # или latest — последний релиз
+sh /opt/susanin/tools/susanin.sh update 0.5.2-oc     # или latest — последний релиз
 sh /opt/susanin/tools/susanin.sh uninstall        # снять, конфиг сохранить
 sh /opt/susanin/tools/susanin.sh uninstall --purge # удалить всё
 ```
@@ -250,14 +250,14 @@ sh /opt/susanin/tools/susanin.sh uninstall --purge # удалить всё
 wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 ```
 
-Флаги: `--version v0.4.1-oc`, `--force` (переустановить), `--yes` (без вопросов),
+Флаги: `--version v0.5.2-oc`, `--force` (переустановить), `--yes` (без вопросов),
 `--with-xray-tproxy` (плюс Xray). Вручную то же самое:
 
 ```sh
 mkdir -p /opt/tmp
-wget -O /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk \
-  https://github.com/kryoz/susanin/releases/download/v0.4.1-oc/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
-opkg install /opt/tmp/susanin-keenetic_0.4.1-oc_mipsel-3.4.ipk
+wget -O /opt/tmp/susanin-keenetic_0.5.2-oc_mipsel-3.4.ipk \
+  https://github.com/kryoz/susanin/releases/download/v0.5.2-oc/susanin-keenetic_0.5.2-oc_mipsel-3.4.ipk
+opkg install /opt/tmp/susanin-keenetic_0.5.2-oc_mipsel-3.4.ipk
 ```
 
 Файл под свою архитектуру (её показывает `opkg print-architecture`) выбирайте по

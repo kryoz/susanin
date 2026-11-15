@@ -199,8 +199,10 @@ const char *choice_iface_kind(const char *name)
 {
     /* «awg» — AmneziaWG (userspace amneziawg-go поднимает awg0/wg0): для панели
      * это такой же тоннель, иначе он попадал в группу «Физические» и терялся
-     * среди eth/ra/lo. Ставим ДО «wg», чтобы правило читалось по порядку. */
-    static const char *tun[] = { "nwg", "wdtt", "awg", "wg", "tun", "ppp" };
+     * среди eth/ra/lo. Ставим ДО «wg», чтобы правило читалось по порядку.
+     * «nocli» — интерфейс клиента OpenConnect (nocli0), «occli» — OpenConnect
+     * клиент в некоторых сборках: тоже тоннели, иначе пропадали из списка. */
+    static const char *tun[] = { "nwg", "wdtt", "awg", "wg", "tun", "ppp", "nocli", "occli" };
     size_t i;
 
     if (!name || !name[0])
@@ -818,6 +820,11 @@ static void write_ifaces_json(jbuf *j, const choice_set *cs, const char *netdir)
     size_t i;
 
     jc_add(j, "\"ifaces\":[");
+    /* Псевдо-egress: в tproxy-режиме канал задаётся не интерфейсом, а самим
+     * Xray. Раньше в списке Web-панели его не было, и egress_interface=nwg0,tproxy
+     * нельзя было выбрать иначе как руками. */
+    if (cs->n_ifaces > 0)
+        jc_add(j, "{\"name\":\"tproxy\",\"kind\":\"tproxy\",\"up\":true},");
     for (i = 0; i < cs->n_ifaces; i++) {
         const char *kind = iface_kind_from_sys(netdir, cs->ifaces[i].field);
         if (i)

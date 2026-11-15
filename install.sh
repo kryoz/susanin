@@ -39,6 +39,8 @@ XRAYTUN=0
 USE_IPK=0
 IPK_LOCAL="" # --ipk-file: уже скачанный .ipk на устройстве (без релиза)
 WITH_OC=0    # --with-oc: добавить oc+ (только осознанно, не по умолчанию)
+PROXY_UID="" # --proxy-uid: uid процесса-прокси на роутере (P5)
+PROXY_EGRESS="" # --proxy-egress: интерфейс туннеля для его трафика (P5)
 
 say() { echo "[susanin] $*"; }
 die() {
@@ -47,6 +49,18 @@ die() {
 }
 
 # Скачивание: curl или wget-ssl (у BusyBox-wget нет HTTPS).
+# r7.2: при неудаче прямой загрузки — одна проба через локальный SOCKS-туннель
+# (только egress_type=tproxy и слушающийся socks-in 127.0.0.1:1080; у
+# пользователя без Xray fallback выключен и честная ошибка).
+CONF_FOR_FETCH="$PREFIX/etc/susanin.conf"
+# r7.2: локальный SOCKS доступен? Только tproxy-конфиг и слушающийся socks-in
+# (127.0.0.1:1080 = 0x0438, состояние LISTEN 0A в /proc/net/tcp).
+susanin_socks_avail() {
+    _et=$(sed -n 's/^egress_type=//p' "$CONF_FOR_FETCH" 2>/dev/null | head -n1)
+    [ "$_et" = "tproxy" ] || return 1
+    awk '$2 ~ /:0438$/ && $4 == "0A" { f=1 } END { exit !f }' /proc/net/tcp 2>/dev/null
+}
+
 pick_fetch() {
 	# Проверка именно HTTPS-дееспособности: в PATH роутера первым часто стоит
 	# BusyBox-wget без HTTPS, а GNU wget из Entware (/opt/bin) в нелогин-шелле
@@ -54,11 +68,32 @@ pick_fetch() {
 	# установленном wget-ssl).
 	_wget_ok() { "$1" --help 2>&1 | grep -q -- '--no-check-certificate'; }
 	if command -v curl >/dev/null 2>&1; then
-		fetch() { curl -fsSL "$1" -o "$2"; }
+		fetch() {
+			curl -fsSL --connect-timeout 6 --max-time 240 "$1" -o "$2" && return 0
+			if susanin_socks_avail; then
+				say "прямая загрузка не удалась — проба через локальный туннель (SOCKS)"
+				curl -fsSL --connect-timeout 6 --max-time 300 -x socks5h://127.0.0.1:1080 "$1" -o "$2" && return 0
+			fi
+			return 1
+		}
 	elif command -v wget >/dev/null 2>&1 && _wget_ok wget; then
-		fetch() { wget -qO "$2" "$1"; }
+		fetch() {
+			wget -q -T 30 -O "$2" "$1" && return 0
+			if susanin_socks_avail; then
+				say "прямая загрузка не удалась — проба через локальный туннель (SOCKS)"
+				wget -q -T 60 --tries=2 -e use_proxy=yes -e https_proxy=127.0.0.1:1080 -O "$2" "$1" && return 0
+			fi
+			return 1
+		}
 	elif [ -x /opt/bin/wget ] && _wget_ok /opt/bin/wget; then
-		fetch() { /opt/bin/wget -qO "$2" "$1"; }
+		fetch() {
+			/opt/bin/wget -q -T 30 -O "$2" "$1" && return 0
+			if susanin_socks_avail; then
+				say "прямая загрузка не удалась — проба через локальный туннель (SOCKS)"
+				/opt/bin/wget -q -T 60 --tries=2 -e use_proxy=yes -e https_proxy=127.0.0.1:1080 -O "$2" "$1" && return 0
+			fi
+			return 1
+		}
 	else
 		die "need curl or wget-ssl (Entware: opkg update && opkg install ca-certificates wget-ssl; либо 'opkg install curl')"
 	fi
@@ -218,6 +253,8 @@ while [ $# -gt 0 ]; do
 		;;
 	--with-xray-tproxy) XRAYTUN=1 ;;
 	--with-oc) WITH_OC=1 ;;
+	--proxy-uid) PROXY_UID="$2"; shift ;;
+	--proxy-egress) PROXY_EGRESS="$2"; shift ;;
 	--yes | -y) YES=1 ;;
 	--force) FORCE=1 ;;
 	--no-start) NO_START=1 ;;
@@ -239,6 +276,9 @@ while [ $# -gt 0 ]; do
 		echo "  --with-xray-tproxy  проверить Xray и положить шаблон tproxy-конфига"
 		echo "  --with-oc    добавить 'oc+' (клиенты OpenConnect-сервера) в lan_interfaces."
 		echo "               По умолчанию НЕ добавляется: сервер есть не у всех."
+		echo "  --proxy-uid U  включить P5: трафик процесса с uid U (MTProxy/Teleproxy)"
+		echo "               уходит в туннель. Пользователь создаётся автоматически."
+		echo "  --proxy-egress IF  интерфейс туннеля для трафика прокси (по умолчанию nwg0)."
 		echo
 		echo "  Prompts: answer 'y' (or 'yes'); --yes|-y skips all prompts."
 		exit 0
@@ -734,7 +774,7 @@ fi
 
 # OpenConnect (ocserv): клиенты выходят через tun-интерфейсы oc0, oc1, … Один oc0
 # брать нельзя: tun создаётся по требованию и выпадает из lan_interfaces после
-# `rescan` с отключённым клиентом (регрессия 2026-10-14: «часть сайтов висит,
+# `rescan` с отключённым клиентом (регрессия: «часть сайтов висит,
 # а status зелёный»). Поэтому — шаблон 'oc+' в КОНЕЦ списка.
 oc_srv=0
 [ -f /var/run/ocserv/ocserv.conf ] && oc_srv=1
@@ -890,6 +930,65 @@ SUSANIN_PREFIX="$PREFIX" SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNET
 	SUSANIN_DISK_MODE="$DISK_MODE" SUSANIN_NO_START="$NO_START" \
 	SUSANIN_KEEP_LISTS="$KEEP_LISTS" \
 	sh "$PREFIX/tools/postinst.sh"
+
+# --- P5: сторонний прокси на роутере (Teleproxy/MTProxy) ----------------------
+# Включается флагами --proxy-uid/--proxy-egress. Позиция — после postinst.sh:
+# конфиг к этому моменту гарантированно существует. .ipk-ветка флагов не видит
+# (opkg вызывает postinst сам) — там ключи proxy_* задаются в конфиге руками.
+if [ -n "$PROXY_UID" ]; then
+	say "proxy_uid=$PROXY_UID: проверяю поддержку матча по uid"
+	if ! command -v iptables >/dev/null 2>&1; then
+		die "нет iptables — proxy_uid не настроить"
+	fi
+	# -C возвращает 0 (правило есть) или 1 (правила нет) — оба означают, что
+	# модуль xt_owner доступен. 2 и выше — ошибка разбора/отсутствие модуля.
+	iptables -w -t mangle -C OUTPUT -m owner --uid-owner 0 -j RETURN >/dev/null 2>&1
+	_rc=$?
+	if [ "$_rc" -gt 1 ]; then
+		say "ВНИМАНИЕ: ядро не поддерживает -m owner (xt_owner) — метка по uid не встанет"
+		say "          проверьте: iptables -t mangle -C OUTPUT -m owner --uid-owner 0 -j RETURN"
+	else
+		say "xt_owner: OK"
+	fi
+
+	if [ -z "$PROXY_EGRESS" ]; then
+		PROXY_EGRESS=nwg0
+		say "proxy_egress не задан — беру по умолчанию $PROXY_EGRESS"
+	fi
+	if command -v ip >/dev/null 2>&1 && ! ip link show "$PROXY_EGRESS" >/dev/null 2>&1; then
+		say "ВНИМАНИЕ: интерфейса $PROXY_EGRESS сейчас нет (туннель выключен?)"
+		say "          метка и ip rule будут созданы, маршрут появится при поднятии туннеля"
+	fi
+
+	if id -u "$PROXY_UID" >/dev/null 2>&1; then
+		say "пользователь $PROXY_UID уже есть"
+	else
+		say "создаю пользователя $PROXY_UID"
+		adduser -S -D -H -s /sbin/nologin "$PROXY_UID" >/dev/null 2>&1 || \
+			useradd -r -s /sbin/nologin "$PROXY_UID" >/dev/null 2>&1 || true
+		if id -u "$PROXY_UID" >/dev/null 2>&1; then
+			say "пользователь создан: uid=$(id -u "$PROXY_UID")"
+		else
+			say "ВНИМАНИЕ: создать пользователя не удалось — создайте вручную и повторите"
+		fi
+	fi
+
+	proxy_set_key() { # proxy_set_key <key> <value>
+		if grep -q "^$1=" "$PREFIX/etc/susanin.conf" 2>/dev/null; then
+			sed -i "s|^$1=.*|$1=$2|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
+		else
+			echo "$1=$2" >> "$PREFIX/etc/susanin.conf"
+		fi
+	}
+	proxy_set_key proxy_uid "$PROXY_UID"
+	proxy_set_key proxy_egress "$PROXY_EGRESS"
+	grep -q '^proxy_table=' "$PREFIX/etc/susanin.conf" 2>/dev/null || \
+		echo "proxy_table=110" >> "$PREFIX/etc/susanin.conf"
+	grep -q '^proxy_mark=' "$PREFIX/etc/susanin.conf" 2>/dev/null || \
+		echo "proxy_mark=0x01000000" >> "$PREFIX/etc/susanin.conf"
+	say "P5 включён: uid=$PROXY_UID -> $PROXY_EGRESS (table=110, mark=0x01000000)"
+	say "не забудьте: прокси должен запускаться от этого пользователя (user=$PROXY_UID)"
+fi
 say "installed to $PREFIX (run: sh $PREFIX/tools/susanin.sh status)"
 
 # XRay-egress (tproxy): скачать Xray (если нет), положить шаблон конфига и

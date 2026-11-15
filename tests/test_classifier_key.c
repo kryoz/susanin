@@ -56,6 +56,18 @@ int main(void)
     CHECK(!clf_is_private_dst("8.8.8.8") && !clf_is_private_dst("172.15.0.1") &&
           !clf_is_private_dst("172.32.0.1") && !clf_is_private_dst("100.128.0.1"),
           "публичные и адреса сразу за границами диапазонов — не приватные");
+    /* Бинарное зеркало is_private4 (горячий путь): те же границы, что строковый
+     * список и rule_priv() — расхождение означало бы разную разметку в обучении. */
+    CHECK(clf_is_private4((uint32_t)ct_parse4("172.16.10.72")) &&
+          clf_is_private4((uint32_t)ct_parse4("100.64.0.1")) &&
+          clf_is_private4((uint32_t)ct_parse4("169.254.1.1")) &&
+          clf_is_private4((uint32_t)ct_parse4("127.0.0.1")),
+          "is_private4: сети из rule_priv — приватные");
+    CHECK(!clf_is_private4((uint32_t)ct_parse4("8.8.8.8")) &&
+          !clf_is_private4((uint32_t)ct_parse4("172.32.0.1")) &&
+          !clf_is_private4((uint32_t)ct_parse4("100.128.0.1")) &&
+          !clf_is_private4(0),
+          "is_private4: границы и 0 — не приватные");
 
     printf("=== quic_block=1: QUIC-кандидатов не заводим ===\n");
     {

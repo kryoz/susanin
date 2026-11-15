@@ -42,11 +42,28 @@
 </div>
 
 <div id="view-status" class="view" hidden>
+  <div id="storage-ro" class="warn" hidden data-i18n="status.ro.warn">Носитель /opt только для чтения — агент не может писать логи/состояние, маршрутизация деградировала. Проверьте USB-накопитель.</div>
   <section class="panel">
     <h2 data-i18n="status.sets.title">VPN-наборы (ipset)</h2>
     <div class="table-wrap">
       <table id="sets">
         <thead><tr><th data-i18n="status.th.set">Набор</th><th data-i18n="status.th.count">Записей</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2 data-i18n="status.ru.title">Российские домены через VPN</h2>
+    <div id="ru-in-vpn" class="muted">—</div>
+    <div class="hint muted" data-i18n="status.ru.hint">антифрод банков/маркетплейсов режет туннельный выход; nonzero — проверьте списки</div>
+  </section>
+
+  <section class="panel">
+    <h2 data-i18n="status.clients.title">Клиенты (последние 15 с)</h2>
+    <div class="table-wrap">
+      <table id="clients">
+        <thead><tr><th data-i18n="status.clients.th.ip">Клиент</th><th data-i18n="status.clients.th.flows">Потоков</th><th data-i18n="status.clients.th.vpn">В туннеле</th><th data-i18n="status.clients.th.direct">Напрямую</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>

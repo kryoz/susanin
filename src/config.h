@@ -54,7 +54,6 @@ typedef struct {
     char vpn_always_dns[CFG_PATH_MAX];
     int vpn_always_interval;
     char vpn_never_file[CFG_PATH_MAX];
-    char domain_prior_file[CFG_PATH_MAX];
     int vpn_never_interval;
     /* Сколько миллисекунд за один проход разрешено тратить на DNS-обновление
      * vpn_always/vpn_never. Раньше проход мог занимать до 4 с и всё это время
@@ -65,6 +64,14 @@ typedef struct {
     char xray_gogc[16];      /* GOGC Xray (память; читает init/xray-egress.sh) */
     char xray_gomemlimit[16];/* GOMEMLIMIT Xray (память) */
     int xray_watchdog;       /* 1 = агент сам поднимает упавший Xray (tproxy) */
+    /* Порог свободной памяти (КБ) для запуска Xray агентом: при меньшем значении
+     * запуск пропускается — иначе на роутере без swap OOM-killer убивает Xray
+     * через секунды после старта. 0 = не проверять (по умолчанию: активный
+     * порог на 122 МБ устройствах блокировал подъём — регресс 0.4.6). */
+    int xray_min_mem_kb;
+    /* Обрезка лога Xray (/opt/susanin/var/xray.log) перед запуском, КБ.
+     * 0 = не обрезать. Лог в tmpfs на таком роутере — прямая потеря памяти. */
+    int xray_log_max_kb;
     char disk_mode[8];      /* normal | soft: soft = минимум записей на диск */
     int soft_state_interval; /* soft: как часто сохранять состояние (сек; 0=никогда) */
     char learn_exclude_ports[CFG_PATH_MAX]; /* порты, которые не учим (скан-шум) */
@@ -91,6 +98,34 @@ typedef struct {
     int cdn_prefix_ttl;      /* TTL агрегированного префикса, сек */
     int cdn_prefix_max;      /* максимальная длина префикса для агрегации (напр. 24) */
     int aggregate_confirm;   /* сколько РАЗНЫХ адресов подтвердить до агрегации (>=1) */
+    /* r4: ТСПУ замораживает целые сети хостингов.
+     * Наследование вердикта на префикс: N разных CONFIRMED IP сети -> вся
+     * сеть в ok_net без дальнейших проб. */
+    int frozen_net_enabled;  /* 1 = включено */
+    int frozen_net_min_ips;  /* сколько разных IP сети подтвердить (default 3) */
+    int frozen_net_prefix;   /* длина префикса наследования (default 24) */
+    int frozen_net_ttl;      /* TTL наследованного префикса, сек (default 1 сутки) */
+    /* Быстрая агрегация на фазе TEST: фан-аут источника (плеер/IPTV-плейлист,
+     * сайт на целом /24 хостинга) бьёт сразу по десяткам хостов — ждать
+     * CONFIRMED на каждый адрес долго. N РАЗНЫХ IP одного префикса в test за
+     * окно секунд -> префикс коротко пинится в susanin_ok_net, и новые адреса
+     * сети уходят в VPN с первого пакета. Короткий TTL ограничивает радиус
+     * вреда ложного срабатывания; vpn_never приоритетнее (RETURN раньше ok_net
+     * в цепочке). */
+    int test_net_enabled;    /* 1 = включено */
+    int test_net_min_ips;    /* сколько разных IP префикса нужно в test (default 2) */
+    int test_net_prefix;     /* длина префикса, бит 8..32 (default 24) */
+    int test_net_window;     /* окно накопления серии, сек (default 60) */
+    int test_net_ttl;        /* TTL пина префикса, сек (default 600) */
+    /* r5: RU-guard — российские домены не заворачивать в VPN
+     * автоматически: антифрод банков/OZON рвёт соединения с иностранного
+     * выхода. Ручной vpn_always сильнее. */
+    int ru_guard;            /* 1 = включено (нужен dns_sniff=1) */
+    int ru_guard_direct;     /* 1 = RU-домены активно пинятся в susanin_never */
+    char ru_guard_tlds[128]; /* список суффиксов через запятую */
+    /* r7.1: POSIX-строка пояса для логов (Иркутск: "IST-8").
+     * Пусто = системный пояс (на Entware обычно UTC). */
+    char tz[64];
     /* C3: политика IPv6 — 1 = блокировать IPv6 из LAN, чтобы весь трафик шёл
      * по IPv4 (иначе IPv6-трафик идёт мимо Susanin и может душиться). */
     int ipv6_block;
@@ -140,6 +175,14 @@ typedef struct {
     int kernel_offload;
     char kernel_egress[64];
     int kernel_offload_max; /* макс. длина префикса для offload-маршрута */
+    /* P5: сторонние сервисы на самом роутере (MTProxy/Teleproxy и т.п.).
+     * Их исходящий трафик метится по uid владельца процесса и уходит в
+     * proxy_egress (обычно nwg*), не пересекаясь с LAN-маршрутизацией.
+     * proxy_uid пусто = выключено; proxy_egress пусто = тоже выключено. */
+    char proxy_uid[32];
+    char proxy_egress[64];
+    int proxy_table;            /* таблица маршрутизации для proxy_uid (0 = 110) */
+    unsigned long proxy_mark;   /* метка для proxy_uid (0 = 0x01000000) */
     /* N3: race-пробинг egress — параллельно замерить кандидатов
      * (кандидаты — все интерфейсы из egress_interface). */
     int egress_race;
