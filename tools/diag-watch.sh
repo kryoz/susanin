@@ -67,13 +67,6 @@ ipset_sizes() {
     echo "${_out:-none}"
 }
 
-p5_state() {
-    _rule=$(iptables -t mangle -S OUTPUT 2>/dev/null | grep -c 'uid-owner' || true)
-    _pkts=$(iptables -t mangle -L OUTPUT -v -n 2>/dev/null | awk '/owner UID/{print $1}' | head -1)
-    _rule5=$(ip rule show 2>/dev/null | grep -c 'lookup 110' || true)
-    _route=$(ip route show table 110 2>/dev/null | grep -c 'default dev' || true)
-    echo "rule=$_rule pkts=${_pkts:-0} iprule=$_rule5 route=$_route"
-}
 
 reprov_count() { # сколько раз в логе встречается слово re-provision
     [ -f "$LOG" ] || { echo 0; return; }
@@ -141,7 +134,7 @@ mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
     echo "# diag-watch start $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "# susanin: $(susanin version 2>/dev/null || echo '?'), kernel: $(uname -r), arch: $(uname -m)"
     echo "# interval=${INTERVAL}s file=$OUT egress=${EGRESS_IF} tproxy_port=${TP_PORT}"
-    echo "# columns: ts load mfree mavail slab sunreclaim ct tcp_inuse tcp_orphan tcp_tw xray xr_pid eg port chain jump agent p5 reprov"
+    echo "# columns: ts load mfree mavail slab sunreclaim ct tcp_inuse tcp_orphan tcp_tw xray xr_pid eg port chain jump agent reprov"
 } >> "$OUT"
 
 prev_reprov=$(reprov_count)
@@ -158,19 +151,17 @@ while :; do
     inuse=${1:-0}; orphan=${3:-0}; tw=${5:-0}
     xr=$(xray_state); xpid=$(xray_pid); eg=$(link_state "$EGRESS_IF")
     prt=$(port_state); ch=$(chain_state); jp=$(jump_state); ag=$(agent_state)
-    p5=$(p5_state)
     cur_reprov=$(reprov_count)
     drep=$((cur_reprov - prev_reprov))
     prev_reprov=$cur_reprov
 
-    echo "$now load=$load mfree=$mfree mavail=$mavail slab=$slab sunreclaim=$sunrec ct=$ct tcp_inuse=$inuse tcp_orphan=$orphan tcp_tw=$tw xray=$xr xr_pid=$xpid eg=$eg port=$prt chain=$ch jump=$jp agent=$ag $p5 reprov_delta=$drep" >> "$OUT"
+    echo "$now load=$load mfree=$mfree mavail=$mavail slab=$slab sunreclaim=$sunrec ct=$ct tcp_inuse=$inuse tcp_orphan=$orphan tcp_tw=$tw xray=$xr xr_pid=$xpid eg=$eg port=$prt chain=$ch jump=$jp agent=$ag reprov_delta=$drep" >> "$OUT"
 
     # раз в 10 сэмплов — детали; а также сразу, если правила/порт/интерфейс упали
     if [ $((i % 10)) -eq 0 ] || [ "$ch" = "no" ] || [ "$prt" = "down" ] || [ "$eg" != "up" ]; then
         {
             echo "  --- $(date -u '+%H:%M:%SZ') ---"
             echo "  ipset: $(ipset_sizes)"
-            echo "  p5: $(p5_state)"
             echo "  tproxy: port=$TP_PORT:$prt chain=$ch jump=$jp xray=$xr($xpid) egress=$EGRESS_IF:$eg agent=$ag"
             echo "  watchdog tail:"
             [ -f "$LOG" ] && grep -E 'tproxy: (Xray|не удалось|порт)' "$LOG" 2>/dev/null | tail -3 | sed 's/^/    /'

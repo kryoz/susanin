@@ -60,21 +60,6 @@ MSS_CLAMP_LAN=${SUSANIN_MSS_CLAMP_LAN:-0}
 # Нужно, когда клиент шлёт DNS на 8.8.8.8, а сервер не форсирует DNS в туннель.
 DNS_HIJACK=${SUSANIN_DNS_HIJACK:-0}
 DNS_HIJACK_TARGET=${SUSANIN_DNS_HIJACK_TARGET:-}
-# P5: сторонний прокси на роутере (Teleproxy/MTProxy). Трафик процесса с uid
-# PROXY_UID метится в mangle OUTPUT и уходит в PROXY_EGRESS по своей таблице.
-# Пустые значения = выключено.
-PROXY_UID=${SUSANIN_PROXY_UID:-}
-PROXY_EGRESS=${SUSANIN_PROXY_EGRESS:-}
-PROXY_TABLE=${SUSANIN_PROXY_TABLE:-110}
-PROXY_MARK=${SUSANIN_PROXY_MARK:-0x01000000}
-# iptables печатает метку без ведущих нулей (0x1000000) — для grep приводим
-# к каноническому виду.
-PROXY_MARK_HEX=$(printf '0x%x' "$((PROXY_MARK))")
-# ВАЖНО: NDM ставит rule по src-адресу WAN с приоритетом ~1170. Если наш rule
-# по метке окажется ниже (больше число), помеченные пакеты уйдут по src-правилу
-# в таблицу NDM и в туннель не попадут (соединения к DC висят в SYN_SENT).
-# Поэтому приоритет P5 — 1100, выше NDM-правил.
-PRI_PROXY=${SUSANIN_PRI_PROXY:-1100}
 
 # Ручной запуск (не из демона): значения берём из конфига; из демона всё
 # приходит через окружение (backend.c) — поведение не меняется.
@@ -104,10 +89,6 @@ LAN=$(printf '%s' "$LAN" | tr ',' ' ')
 [ -n "${SUSANIN_MSS_CLAMP_LAN:-}" ]  || MSS_CLAMP_LAN=$(cfg_val mss_clamp_lan "$MSS_CLAMP_LAN")
 [ -n "${SUSANIN_DNS_HIJACK:-}" ]     || DNS_HIJACK=$(cfg_val dns_hijack "$DNS_HIJACK")
 [ -n "${SUSANIN_DNS_HIJACK_TARGET:-}" ] || DNS_HIJACK_TARGET=$(cfg_val dns_hijack_target "$DNS_HIJACK_TARGET")
-[ -n "${SUSANIN_PROXY_UID:-}" ]      || PROXY_UID=$(cfg_val proxy_uid "")
-[ -n "${SUSANIN_PROXY_EGRESS:-}" ]   || PROXY_EGRESS=$(cfg_val proxy_egress "")
-[ -n "${SUSANIN_PROXY_TABLE:-}" ]    || PROXY_TABLE=$(cfg_val proxy_table "$PROXY_TABLE")
-[ -n "${SUSANIN_PROXY_MARK:-}" ]     || PROXY_MARK=$(cfg_val proxy_mark "$PROXY_MARK")
 # Порты демон выставляет только когда режим включён — повторяем ту же логику.
 if [ -z "${SUSANIN_TPROXY_PORT:-}" ]; then
     if [ "$(cfg_val egress_type interface)" = "tproxy" ]; then
@@ -721,80 +702,9 @@ dns_hijack_rules() {
     say "dns_hijack: DNS клиентов ($_ifaces) -> $_dst (правил DNAT: $_n)"
 }
 
-# ══ P5: сторонний прокси на роутере (Teleproxy/MTProxy) ═══════════════════
-# Исходящие соединения процесса с uid PROXY_UID уходят в PROXY_EGRESS
-# (обычно nwg0) через отдельную таблицу, не задевая LAN-маршрутизацию:
-#   1) mangle OUTPUT: -m owner --uid-owner UID -j MARK --set-xmark MARK/MARK
-#   2) ip rule fwmark MARK/MARK -> lookup PROXY_TABLE
-#   3) ip route default dev PROXY_EGRESS table PROXY_TABLE
-# PROXY_TABLE должна быть выделенной (по умолчанию 110): при down она
-# очищается целиком.
-proxy_egress_rules() {
-    [ -n "$PROXY_UID" ] || return 0
-    if [ -z "$PROXY_EGRESS" ]; then
-        say "proxy_uid=$PROXY_UID, но proxy_egress пуст — пропускаю"
-        return 0
-    fi
-    if ! "$IPCMD" route replace default dev "$PROXY_EGRESS" table "$PROXY_TABLE" 2>/dev/null; then
-        say "proxy_uid: маршрут через $PROXY_EGRESS в таблицу $PROXY_TABLE не добавлен (интерфейс поднят?)"
-        return 0
-    fi
-    "$IPCMD" rule del fwmark "$PROXY_MARK/$PROXY_MARK" lookup "$PROXY_TABLE" >/dev/null 2>&1 || true
-    if ! "$IPCMD" rule add fwmark "$PROXY_MARK/$PROXY_MARK" priority "$PRI_PROXY" lookup "$PROXY_TABLE" 2>/dev/null; then
-        say "proxy_uid: ip rule fwmark $PROXY_MARK -> $PROXY_TABLE не добавлен"
-        return 0
-    fi
-    proxy_egress_mark_clean
-    # Помечаем только соединения, ИНИЦИИРОВАННЫЕ процессом (ctstate NEW):
-    # слепая метка всех пакетов uid отправляла в туннель и ответы входящим
-    # клиентам (Teleproxy слушает 8443), из-за чего они не доходили.
-    if ! "ipt" -t mangle -A OUTPUT -m owner --uid-owner "$PROXY_UID" \
-            -m conntrack --ctstate NEW \
-            -j CONNMARK --set-xmark "$PROXY_MARK/$PROXY_MARK" 2>/dev/null; then
-        say "proxy_uid: не удалось поставить CONNMARK по uid (нет xt_owner/xt_connmark?)"
-        return 0
-    fi
-    if ! "ipt" -t mangle -A OUTPUT -m connmark --mark "$PROXY_MARK/$PROXY_MARK" \
-            -j MARK --set-xmark "$PROXY_MARK/$PROXY_MARK" 2>/dev/null; then
-        say "proxy_uid: не удалось восстановить MARK из conntrack"
-        return 0
-    fi
-    # Адрес источника сокет выбирает ДО метки — по main-таблице. Без SNAT пакеты
-    # уходят в туннель с адресом WAN, ответы возвращаются мимо туннеля, и
-    # соединения висят в SYN_SENT. Подменяем адрес на адрес интерфейса.
-    "ipt" -t nat -D POSTROUTING -o "$PROXY_EGRESS" -m mark \
-        --mark "$PROXY_MARK/$PROXY_MARK" -j MASQUERADE >/dev/null 2>&1 || true
-    if ! "ipt" -t nat -A POSTROUTING -o "$PROXY_EGRESS" -m mark \
-            --mark "$PROXY_MARK/$PROXY_MARK" -j MASQUERADE 2>/dev/null; then
-        say "proxy_uid: не удалось включить MASQUERADE на $PROXY_EGRESS"
-        return 0
-    fi
-    say "proxy egress: uid=$PROXY_UID -> $PROXY_EGRESS (table=$PROXY_TABLE mark=$PROXY_MARK prio=$PRI_PROXY)"
-}
-
-# Снять ТОЛЬКО свои правила метки в OUTPUT (по строке set-xmark).
-proxy_egress_mark_clean() {
-    "ipt" -t mangle -S OUTPUT 2>/dev/null | grep -F -- "--set-xmark $PROXY_MARK_HEX/$PROXY_MARK_HEX" | \
-        while IFS= read -r _l; do
-            _sp=$(printf '%s' "$_l" | sed 's/^-A OUTPUT //')
-            "ipt" -t mangle -D OUTPUT $_sp >/dev/null 2>&1 || true
-        done || true
-}
-
-proxy_egress_clean() {
-    proxy_egress_mark_clean
-    "ipt" -t nat -D POSTROUTING -o "$PROXY_EGRESS" -m mark \
-        --mark "$PROXY_MARK/$PROXY_MARK" -j MASQUERADE >/dev/null 2>&1 || true
-    "$IPCMD" rule del fwmark "$PROXY_MARK/$PROXY_MARK" lookup "$PROXY_TABLE" >/dev/null 2>&1 || true
-    "$IPCMD" route flush table "$PROXY_TABLE" >/dev/null 2>&1 || true
-}
 
 command_up() {
     backup
-    # P5 — первым и независимо от tproxy: если какая-то ступень ниже упадёт
-    # (нет xt_TPROXY, Xray не поднят, ipset занят), правила прокси обязаны встать,
-    # иначе MTProxy остаётся без маршрута в proxy_egress.
-    proxy_egress_rules || say "proxy_egress: правила не применены"
     ensure_sets
     ensure_chain
     rule_priv
@@ -832,9 +742,6 @@ command_down() {
     ipv6_block_clean || true
     quic_block_clean || true
     mss_clamp_clean || true
-    # P5 (трафик стороннего прокси -> proxy_egress) НЕ снимаем здесь: он не
-    # зависит от tproxy/Xray и должен переживать fail-open, когда Xray умер.
-    # Снимается явно командой `datapath.sh p5-down` (susanin stop / down).
     say "data plane DOWN"
 }
 
@@ -906,16 +813,6 @@ command_status() {
     if [ "$KERNEL_OFFLOAD" = "1" ] && [ -n "$KERNEL_EGRESS" ]; then
         ko=$("$IPCMD" rule show 2>/dev/null | grep -c "lookup $KERNEL_TABLE" || true)
         echo "kernel_offload: on ($KERNEL_EGRESS table=$KERNEL_TABLE rules=$ko)"
-    fi
-    if [ -n "$PROXY_UID" ] && [ -n "$PROXY_EGRESS" ]; then
-        _pm=$("ipt" -t mangle -S OUTPUT 2>/dev/null | grep -cF -- "--set-xmark $PROXY_MARK_HEX/$PROXY_MARK_HEX" || true)
-        _pr=$("$IPCMD" rule show 2>/dev/null | grep -c "lookup $PROXY_TABLE" || true)
-        _prt=$("$IPCMD" route show table "$PROXY_TABLE" 2>/dev/null | grep -c '^default' || true)
-        echo "proxy_egress: on (uid=$PROXY_UID -> $PROXY_EGRESS table=$PROXY_TABLE mark=$PROXY_MARK; mark_rules=$_pm ip_rule=$_pr default_route=$_prt)"
-    elif [ -n "$PROXY_UID" ]; then
-        echo "proxy_egress: proxy_uid задан, но proxy_egress пуст — выключено"
-    else
-        echo "proxy_egress: off"
     fi
     q=$("ipt" -t mangle -S PREROUTING 2>/dev/null | grep -c -- '-p udp .* --dport 443 -j DROP' || true)
     if [ "$QUIC_BLOCK" = "1" ]; then
@@ -1005,8 +902,6 @@ command_del() {
 
 case "${1:-}" in
     up) command_up ;;
-    p5) proxy_egress_rules ;;
-    p5-down) proxy_egress_clean ;;
     sets) ensure_sets ;;
     sets-down)
         for _s in $SETS; do set_exists "$_s" && "$IPSET" destroy "$_s" || true; done
@@ -1021,7 +916,7 @@ case "${1:-}" in
     add) command_add "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     del) command_del "${2:-}" "${3:-}" "${4:-}" ;;
     *)
-        echo "usage: $0 {up|down|p5|p5-down|status|flush|egress <iface>|add <ip> [<port>] <tcp|udp> <test|ok>|del <ip> [<port>] <tcp|udp>}" >&2
+        echo "usage: $0 {up|down|status|flush|egress <iface>|add <ip> [<port>] <tcp|udp> <test|ok>|del <ip> [<port>] <tcp|udp>}" >&2
         echo "  (порт обязателен при SUSANIN_PORT_AWARE=1; ok_net/never/direct всегда по адресу)" >&2
         exit 2 ;;
 esac

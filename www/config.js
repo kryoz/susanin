@@ -75,12 +75,6 @@
           f('socks_addr', 'Адрес Xray SOCKS', '', 'text', { kind: 'ip' }),
           f('socks_port', 'Порт Xray SOCKS', '', 'number', { kind: 'int' })
         ]},
-        { title: 'P5: сторонний прокси (MTProxy/Teleproxy)', fields: [
-          f('proxy_uid', 'UID/пользователь прокси', 'трафик этого процесса уходит в proxy_egress; пусто = выключено', 'text'),
-          f('proxy_egress', 'Интерфейс для прокси', 'например nwg0/nocli0; пусто = выключено', 'text', { kind: 'iface' }),
-          f('proxy_table', 'Таблица маршрутизации', 'по умолчанию 110; при down очищается', 'number', { kind: 'int' }),
-          f('proxy_mark', 'Метка (hex)', 'не должна пересекаться с mark_ok/mark_test/профилями', 'text')
-        ]},
         { title: 'Отказоустойчивость (Master/Slave)', fields: [
           f('egress_failback', 'Возврат на приоритетный VPN', 'первый в egress_interface — основной; после его восстановления трафик возвращается на него', 'bool'),
           f('egress_failback_debounce', 'Пауза до возврата', 'сек; сколько основной должен держаться, прежде чем вернуться', 'text', { kind: 'duration' }),

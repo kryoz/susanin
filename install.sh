@@ -39,8 +39,6 @@ XRAYTUN=0
 USE_IPK=0
 IPK_LOCAL="" # --ipk-file: уже скачанный .ipk на устройстве (без релиза)
 WITH_OC=0    # --with-oc: добавить oc+ (только осознанно, не по умолчанию)
-PROXY_UID="" # --proxy-uid: uid процесса-прокси на роутере (P5)
-PROXY_EGRESS="" # --proxy-egress: интерфейс туннеля для его трафика (P5)
 
 say() { echo "[susanin] $*"; }
 die() {
@@ -253,8 +251,6 @@ while [ $# -gt 0 ]; do
 		;;
 	--with-xray-tproxy) XRAYTUN=1 ;;
 	--with-oc) WITH_OC=1 ;;
-	--proxy-uid) PROXY_UID="$2"; shift ;;
-	--proxy-egress) PROXY_EGRESS="$2"; shift ;;
 	--yes | -y) YES=1 ;;
 	--force) FORCE=1 ;;
 	--no-start) NO_START=1 ;;
@@ -276,9 +272,6 @@ while [ $# -gt 0 ]; do
 		echo "  --with-xray-tproxy  проверить Xray и положить шаблон tproxy-конфига"
 		echo "  --with-oc    добавить 'oc+' (клиенты OpenConnect-сервера) в lan_interfaces."
 		echo "               По умолчанию НЕ добавляется: сервер есть не у всех."
-		echo "  --proxy-uid U  включить P5: трафик процесса с uid U (MTProxy/Teleproxy)"
-		echo "               уходит в туннель. Пользователь создаётся автоматически."
-		echo "  --proxy-egress IF  интерфейс туннеля для трафика прокси (по умолчанию nwg0)."
 		echo
 		echo "  Prompts: answer 'y' (or 'yes'); --yes|-y skips all prompts."
 		exit 0
@@ -931,64 +924,6 @@ SUSANIN_PREFIX="$PREFIX" SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNET
 	SUSANIN_KEEP_LISTS="$KEEP_LISTS" \
 	sh "$PREFIX/tools/postinst.sh"
 
-# --- P5: сторонний прокси на роутере (Teleproxy/MTProxy) ----------------------
-# Включается флагами --proxy-uid/--proxy-egress. Позиция — после postinst.sh:
-# конфиг к этому моменту гарантированно существует. .ipk-ветка флагов не видит
-# (opkg вызывает postinst сам) — там ключи proxy_* задаются в конфиге руками.
-if [ -n "$PROXY_UID" ]; then
-	say "proxy_uid=$PROXY_UID: проверяю поддержку матча по uid"
-	if ! command -v iptables >/dev/null 2>&1; then
-		die "нет iptables — proxy_uid не настроить"
-	fi
-	# -C возвращает 0 (правило есть) или 1 (правила нет) — оба означают, что
-	# модуль xt_owner доступен. 2 и выше — ошибка разбора/отсутствие модуля.
-	iptables -w -t mangle -C OUTPUT -m owner --uid-owner 0 -j RETURN >/dev/null 2>&1
-	_rc=$?
-	if [ "$_rc" -gt 1 ]; then
-		say "ВНИМАНИЕ: ядро не поддерживает -m owner (xt_owner) — метка по uid не встанет"
-		say "          проверьте: iptables -t mangle -C OUTPUT -m owner --uid-owner 0 -j RETURN"
-	else
-		say "xt_owner: OK"
-	fi
-
-	if [ -z "$PROXY_EGRESS" ]; then
-		PROXY_EGRESS=nwg0
-		say "proxy_egress не задан — беру по умолчанию $PROXY_EGRESS"
-	fi
-	if command -v ip >/dev/null 2>&1 && ! ip link show "$PROXY_EGRESS" >/dev/null 2>&1; then
-		say "ВНИМАНИЕ: интерфейса $PROXY_EGRESS сейчас нет (туннель выключен?)"
-		say "          метка и ip rule будут созданы, маршрут появится при поднятии туннеля"
-	fi
-
-	if id -u "$PROXY_UID" >/dev/null 2>&1; then
-		say "пользователь $PROXY_UID уже есть"
-	else
-		say "создаю пользователя $PROXY_UID"
-		adduser -S -D -H -s /sbin/nologin "$PROXY_UID" >/dev/null 2>&1 || \
-			useradd -r -s /sbin/nologin "$PROXY_UID" >/dev/null 2>&1 || true
-		if id -u "$PROXY_UID" >/dev/null 2>&1; then
-			say "пользователь создан: uid=$(id -u "$PROXY_UID")"
-		else
-			say "ВНИМАНИЕ: создать пользователя не удалось — создайте вручную и повторите"
-		fi
-	fi
-
-	proxy_set_key() { # proxy_set_key <key> <value>
-		if grep -q "^$1=" "$PREFIX/etc/susanin.conf" 2>/dev/null; then
-			sed -i "s|^$1=.*|$1=$2|" "$PREFIX/etc/susanin.conf" 2>/dev/null || true
-		else
-			echo "$1=$2" >> "$PREFIX/etc/susanin.conf"
-		fi
-	}
-	proxy_set_key proxy_uid "$PROXY_UID"
-	proxy_set_key proxy_egress "$PROXY_EGRESS"
-	grep -q '^proxy_table=' "$PREFIX/etc/susanin.conf" 2>/dev/null || \
-		echo "proxy_table=110" >> "$PREFIX/etc/susanin.conf"
-	grep -q '^proxy_mark=' "$PREFIX/etc/susanin.conf" 2>/dev/null || \
-		echo "proxy_mark=0x01000000" >> "$PREFIX/etc/susanin.conf"
-	say "P5 включён: uid=$PROXY_UID -> $PROXY_EGRESS (table=110, mark=0x01000000)"
-	say "не забудьте: прокси должен запускаться от этого пользователя (user=$PROXY_UID)"
-fi
 say "installed to $PREFIX (run: sh $PREFIX/tools/susanin.sh status)"
 
 # XRay-egress (tproxy): скачать Xray (если нет), положить шаблон конфига и

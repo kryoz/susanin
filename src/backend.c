@@ -593,12 +593,6 @@ static void set_env(const susanin_config *c)
     /* Port-aware: datapath.sh создаст наборы hash:ip,port и правила dst,dst.
      * По умолчанию 0 — прежнее поведение (наборы hash:ip, матч dst). */
     setenv("SUSANIN_PORT_AWARE", c->port_aware ? "1" : "0", 1);
-    /* P5: сторонний прокси на роутере (Teleproxy/MTProxy): метка по uid и
-     * вывод в proxy_egress через отдельную таблицу. */
-    setenv("SUSANIN_PROXY_UID", c->proxy_uid, 1);
-    setenv("SUSANIN_PROXY_EGRESS", c->proxy_egress, 1);
-    setenv("SUSANIN_PROXY_TABLE", (snprintf(v, sizeof(v), "%d", c->proxy_table), v), 1);
-    setenv("SUSANIN_PROXY_MARK", (snprintf(v, sizeof(v), "0x%lx", c->proxy_mark), v), 1);
 }
 
 static int run_script(const susanin_config *c, const char *a1, const char *a2)
@@ -629,22 +623,6 @@ int backend_provision(const susanin_config *c)
     return rc;
 }
 
-/* P5 отдельно от датаплейна: правила «трафик стороннего прокси -> proxy_egress»
- * не зависят от tproxy/Xray. Вызывается, когда датаплейн снят в fail-open
- * (Xray умер), чтобы MTProxy продолжал ходить в туннель. */
-int backend_p5_up(const susanin_config *c)
-{
-    if (!c || !c->proxy_uid[0] || !c->proxy_egress[0])
-        return 0;
-    return run_script(c, "p5", NULL);
-}
-
-int backend_p5_down(const susanin_config *c)
-{
-    if (!c || !c->proxy_uid[0])
-        return 0;
-    return run_script(c, "p5-down", NULL);
-}
 
 /* Отметка о последнем ре-провижене (для наблюдаемости в status/diagnose). */
 #define DP_REPROV_FILE "/opt/susanin/var/dp-reprov"
@@ -925,57 +903,6 @@ int backend_ready(const susanin_config *c)
         }
     }
 
-    /* P5: если настроен вывод стороннего прокси через туннель — проверяем,
-     * что метка по uid и ip rule на месте (NDM/перезагрузка могли снести).
-     * Кэш 30 с: backend_ready вызывается каждые 5 с (fast check), а здесь два
-     * форка (iptables -S OUTPUT, ip rule show) — на MIPS это лишний xtables-lock
-     * и CPU. Просрочка кэша — ровно прежняя проверка. */
-    if (c->proxy_uid[0] && c->proxy_egress[0]) {
-        static time_t p5_ok_at;
-        time_t p5now = time(NULL);
-        if (p5_ok_at && p5now - p5_ok_at < 30)
-            goto p5_cached;
-        p5_ok_at = 0;
-        {
-        /* proxy_uid может быть числовым: на Keenetic /etc/passwd read-only и
-         * пользователя не добавить. iptables понимает числовой uid. */
-        unsigned proxy_uid_num = 0;
-        int numeric = (c->proxy_uid[0] >= '0' && c->proxy_uid[0] <= '9');
-        char *pargv[7];
-        if (numeric) {
-            char *endp = 0;
-            unsigned long v = strtoul(c->proxy_uid, &endp, 10);
-            if (!endp || *endp != '\0')
-                return 0;
-            proxy_uid_num = (unsigned)v;
-        } else {
-            struct passwd *pw = getpwnam(c->proxy_uid);
-            if (!pw)
-                return 0;       /* пользователя нет — правило не поставить */
-            proxy_uid_num = (unsigned)pw->pw_uid;
-        }
-        snprintf(needle, sizeof(needle), "--uid-owner %u", proxy_uid_num);
-        pargv[0] = (char *)tool_iptables();
-        pargv[1] = "-w"; pargv[2] = "-t"; pargv[3] = "mangle"; pargv[4] = "-S"; pargv[5] = "OUTPUT"; pargv[6] = NULL;
-        rc = run_check(pargv, out, sizeof(out));
-        if (rc == XT_BUSY)
-            return 1;
-        if (rc != 0 || !strstr(out, needle))
-            return 0;
-
-        snprintf(needle, sizeof(needle), "fwmark 0x%lx/0x%lx lookup %d",
-                 c->proxy_mark, c->proxy_mark, c->proxy_table);
-        pargv[0] = (char *)tool_ip();
-        pargv[1] = "rule"; pargv[2] = "show"; pargv[3] = NULL;
-        rc = run_check(pargv, out, sizeof(out));
-        if (rc == XT_BUSY)
-            return 1;
-        if (rc != 0 || !strstr(out, needle))
-            return 0;
-        p5_ok_at = p5now;
-        }
-    }
-p5_cached:
     return 1;
 }
 

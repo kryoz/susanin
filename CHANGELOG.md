@@ -12,14 +12,16 @@
   (`ru_guard_direct`), кэш вердиктов dns_sniff (reconcile без полных сканов),
   ротация логов по размеру в рантайме, `tz=` (POSIX-пояс логов), «кто запросил»
   в строках обучения, watchdog udp-relay, terse-счётчик ipset, `storage_ro`
-  в `/api/status`, P5 (сторонний прокси: `proxy_uid`/`proxy_egress`),
+  в `/api/status`,
   `why <ip|domain>`, `diag-watch.sh`, наборы ipset живут при fail-open
   (`sets-down`), прямой fork/exec Xray, fallback загрузчика через SOCKS.
-- **Убран доменный приор (`domain_prior`).** Полезность не подтвердилась:
+- **Убран доменный приор (`domain_prior`) и P5 (`proxy_uid`/`proxy_egress`).** Полезность не подтвердилась:
   вырезаны `domain_prior_file`, `prior_mark`/`dns_sniff_prior_of`, обход
   `promo_per_min`, `tests/test_domain_prior`, сид `domain_prior.txt` и
   `dataset.py --prior`. Осталось: датасет (этап 0), `dns-map`-журнал,
-  «жалоба» (кнопка/CLI) — от приора не зависят.
+  «жалоба» (кнопка/CLI) — от приора не зависят. P5 (сторонний прокси на
+  роутере из 0.4.7: `proxy_uid`/`proxy_egress`/`proxy_table`/`proxy_mark`,
+  `datapath p5/p5-down`) вырезан целиком — в этом контуре не используется.
 - Версия пакета: 0.5.2-oc (opkg: 0.5.1-oc < 0.5.2-oc).
 
 ## 0.5.1-oc — 2026-11-12: udp_min_op=10, ozon/avito в never, crcdn.pro из приора
