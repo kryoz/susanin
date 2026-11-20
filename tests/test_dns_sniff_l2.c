@@ -1,6 +1,6 @@
 /* Тест разбора L2-кадра для dns_sniff: сокет SOCK_RAW отдаёт кадр целиком, а
  * LAN-порты Keenetic — VLAN-сабы (eth2.1, ra7.1), так что ethertype лежит не
- * по смещению 12. dns_sniff.c включается в TU ради static l2_ipv4. make test. */
+ * по смещению 12. dns_sniff.c включается в TU ради static l2_ip. make test. */
 #define _GNU_SOURCE
 #include "dns_sniff.c"
 #include "dns_sniff.h"
@@ -30,56 +30,64 @@ int main(void)
 {
     uint8_t f[128];
     unsigned l2 = 0;
+    uint16_t et = 0;
     int i;
 
     printf("=== обычный кадр ===\n");
     memset(f, 0, sizeof(f));
     set16(f, 12, T_IPV4);
-    CHECK(l2_ipv4(f, 42, &l2) && l2 == 14, "IPv4 без тегов -> смещение 14");
+    CHECK(l2_ip(f, 42, &l2, &et) && l2 == 14 && et == T_IPV4,
+          "IPv4 без тегов -> смещение 14");
 
     printf("=== VLAN (802.1Q) ===\n");
     memset(f, 0, sizeof(f));
     set16(f, 12, TPID_1Q);
     set16(f, 16, T_IPV4);       /* вложенный ethertype идёт после TCI */
-    CHECK(l2_ipv4(f, 46, &l2) && l2 == 18, "один тег -> смещение 18");
+    CHECK(l2_ip(f, 46, &l2, &et) && l2 == 18 && et == T_IPV4,
+          "один тег -> смещение 18");
 
     printf("=== Q-in-Q (802.1ad + 802.1Q) ===\n");
     memset(f, 0, sizeof(f));
     set16(f, 12, TPID_AD);
     set16(f, 16, TPID_1Q);
     set16(f, 20, T_IPV4);
-    CHECK(l2_ipv4(f, 50, &l2) && l2 == 22, "два тега -> смещение 22");
+    CHECK(l2_ip(f, 50, &l2, &et) && l2 == 22 && et == T_IPV4,
+          "два тега -> смещение 22");
 
     printf("=== чужие ethertype ===\n");
     memset(f, 0, sizeof(f));
     set16(f, 12, T_ARP);
-    CHECK(!l2_ipv4(f, 42, &l2), "ARP не разбираем");
+    CHECK(l2_ip(f, 42, &l2, &et) && et == T_ARP && l2 == 14,
+          "ARP: заголовок раскрывается, ethertype не IPv4");
     set16(f, 12, T_IPV6);
-    CHECK(!l2_ipv4(f, 42, &l2), "IPv6 не разбираем (проект только IPv4)");
+    CHECK(l2_ip(f, 42, &l2, &et) && et == T_IPV6 && l2 == 14,
+          "IPv6: распознаётся (ответы резолвера идут в IPv6)");
     set16(f, 12, TPID_1Q);
     set16(f, 16, T_ARP);
-    CHECK(!l2_ipv4(f, 46, &l2), "ARP под VLAN-тегом не разбираем");
+    CHECK(l2_ip(f, 46, &l2, &et) && et == T_ARP && l2 == 18,
+          "ARP под VLAN-тегом: ethertype не IPv4");
 
     printf("=== обрезанные кадры (данные из сети) ===\n");
     memset(f, 0, sizeof(f));
     set16(f, 12, T_IPV4);
-    CHECK(!l2_ipv4(f, 13, &l2), "кадр короче заголовка Ethernet");
+    CHECK(!l2_ip(f, 13, &l2, &et), "кадр короче заголовка Ethernet");
     memset(f, 0, sizeof(f));
     set16(f, 12, TPID_1Q);
-    CHECK(!l2_ipv4(f, 16, &l2), "тег обещает продолжения, которых нет");
-    CHECK(!l2_ipv4(f, 17, &l2), "тег обрезан на середине поля");
+    CHECK(!l2_ip(f, 16, &l2, &et), "тег обещает продолжения, которых нет");
+    CHECK(!l2_ip(f, 17, &l2, &et), "тег обрезан на середине поля");
 
     printf("=== злонамеренная цепочка тегов ===\n");
     memset(f, 0, sizeof(f));
     for (i = 0; i < 10; i++)
         set16(f, (size_t)(12 + 4 * i), TPID_1Q);   /* каждый следующий вложенный */
-    CHECK(!l2_ipv4(f, 14 + 4 * 10 - 1, &l2),
+    CHECK(!l2_ip(f, 14 + 4 * 10 - 1, &l2, &et),
           "цепочка тегов упирается в границу буфера, а не читает за ней");
     memset(f, 0, sizeof(f));
     for (i = 0; i < 10; i++)
         set16(f, (size_t)(12 + 4 * i), TPID_AD);
     set16(f, 52, T_IPV4);
-    CHECK(l2_ipv4(f, 56, &l2) && l2 == 54, "десяток тегов внутри буфера обработан");
+    CHECK(l2_ip(f, 56, &l2, &et) && l2 == 54 && et == T_IPV4,
+          "десяток тегов внутри буфера обработан");
 
     printf("\n%s\n", failures ? "ЕСТЬ ОШИБКИ" : "все проверки пройдены");
     return failures ? 1 : 0;

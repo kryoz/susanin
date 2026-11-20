@@ -9,11 +9,11 @@ VARDIR = $(PREFIX)/susanin/var
 SRCS = src/main.c src/config.c src/discover.c src/conntrack.c src/state.c \
        src/backend.c src/classifier.c src/health.c src/engine.c src/log.c src/ops.c \
        src/vpn_always.c src/vpn_never.c src/web.c src/web_choices.c \
-       src/udp_relay.c src/cdn.c src/dns_sniff.c src/profiles.c src/release.c
+       src/udp_relay.c src/cdn.c src/dns_sniff.c src/profiles.c src/release.c src/vpin.c src/entryparse.c src/snisniff.c src/lang.c src/lang_catalog.c src/dns_lan.c src/ops_dnsprobe.c
 OBJS = $(SRCS:.c=.o)
 
 TARGET = susanin-agent
-TESTS = tests/test_conntrack tests/test_config tests/test_ops tests/test_web_list tests/test_web_choices tests/test_state tests/test_backend_value tests/test_backend_lock tests/test_classifier_key tests/test_classifier_media tests/test_trace_line tests/test_dns_sniff_l2 tests/test_web_token tests/test_release
+TESTS = tests/test_conntrack tests/test_config tests/test_ops tests/test_web_list tests/test_web_choices tests/test_state tests/test_backend_value tests/test_backend_lock tests/test_classifier_key tests/test_classifier_media tests/test_trace_line tests/test_dns_sniff_l2 tests/test_classifier_synfail tests/test_classifier_stall tests/test_config_sync tests/test_dns_sniff_stats tests/test_socks_timeout tests/test_web_token tests/test_release tests/test_vpin tests/test_entryparse tests/test_snisniff tests/test_va_soft tests/test_log_level tests/test_lang tests/test_dns_lan
 SAMPLES = testdata/nf_conntrack.samples
 # Объекты для тестов, которые включают .c-файл в свой TU (тогда его .o линковать нельзя).
 TEST_OBJS = $(filter-out src/main.o,$(OBJS))
@@ -25,14 +25,31 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
+src/lang_catalog.c: lang/slog.json tools/gen-lang.py
+	@python3 tools/gen-lang.py > $@.tmp && mv $@.tmp $@ || { rm -f $@.tmp; echo 'gen-lang: python3 unavailable - using committed file'; }
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# web.c включает заголовок модуля «известных значений» — пересобираем при правке.
-src/web.o src/web_choices.o: src/web_choices.h
+# Все объектники зависят от всех заголовков src/. Без этого правка структуры в
+# config.h (новые поля меняют смещения) пересобирает только изменённый .c, а
+# остальные остаются со СТАРОЙ раскладкой — линкуется бинарник с разными layout
+# в одном процессе. На хосте это выглядит как чудесно падающий тест, на роутере
+# — как чтение чужих полей. Раньше зависимость ставили точечно (web_choices.h);
+# теперь общая, включая тестовые сборки, которые линкуют те же объектники.
+HDRS = $(wildcard src/*.h)
+$(OBJS): $(HDRS)
+# Тестовые бинари — тоже: они линкуют те же объектники и включают те же
+# заголовки, а правило выше покрывает только src/*.o. Без этого, например,
+# test_release мог остаться собранным со старым version.h.
+$(TESTS): $(HDRS)
 
 # Тесты (хост-компилятор; в кросс-сборку и поставку не входят).
-test: $(TESTS)
+# `all` в зависимостях обязателен: test-installer-sync.sh запускает сам
+# `susanin-agent` (config check/sync), и без этого шага он молча проверял бы
+# бинарник, оставшийся от прошлой сборки, — зелёный результат при изменённом
+# исходнике.
+test: all $(TESTS)
 	./tests/test_conntrack $(SAMPLES)
 	./tests/test_config
 	./tests/test_ops
@@ -45,14 +62,51 @@ test: $(TESTS)
 	./tests/test_classifier_media
 	./tests/test_trace_line
 	./tests/test_dns_sniff_l2
+	./tests/test_classifier_synfail
+	./tests/test_classifier_stall
+	./tests/test_config_sync
+	./tests/test_dns_sniff_stats
+	./tests/test_socks_timeout
 	./tests/test_web_token
 	./tests/test_release
+	./tests/test_vpin
+	./tests/test_entryparse
+	./tests/test_snisniff
+	./tests/test_va_soft
+	./tests/test_log_level
+	./tests/test_lang
+	./tests/test_dns_lan
 	sh tests/test-egress-failover.sh
 	@if command -v python3 >/dev/null 2>&1; then python3 tools/dataset.py --selftest; \
 	 else echo "python3 нет — самопроверка tools/dataset.py пропущена"; fi
+	sh tests/test-installer-sync.sh
+	sh tests/test-cfg-spaces.sh
 
 tests/test_state: tests/test_state.c src/state.c src/state.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_state.c src/state.c
+
+# Очередь аудита пинов: чистый модуль без сети/ipset — линкуем только его.
+tests/test_vpin: tests/test_vpin.c src/vpin.c src/vpin.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_vpin.c src/vpin.c
+
+# Разбор строк списков (префикс ? и зоны *.domain) — чистый модуль.
+tests/test_entryparse: tests/test_entryparse.c src/entryparse.c src/entryparse.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_entryparse.c src/entryparse.c
+
+# Уровни записи журнала: имя из конфига -> порог отсечения. log.c не требует
+# ни сети, ни конфига, поэтому линкуем только его.
+tests/test_dns_lan: tests/test_dns_lan.c src/dns_lan.h src/log.c src/log.h src/config.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_dns_lan.c src/log.c src/lang.c src/lang_catalog.c
+
+tests/test_lang: tests/test_lang.c src/lang.c src/lang_catalog.c src/log.c src/lang.h src/log.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_lang.c src/lang.c src/lang_catalog.c src/log.c
+
+tests/test_log_level: tests/test_log_level.c src/log.c src/lang.c src/lang_catalog.c src/log.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_log_level.c src/log.c src/lang.c src/lang_catalog.c
+
+# SNI-парсер ClientHello: чистый разбор полезной нагрузки, без сокетов.
+tests/test_snisniff: tests/test_snisniff.c src/snisniff.c src/snisniff.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_snisniff.c src/snisniff.c
 
 # test_web_token включает src/web.c (static token_eq/header_value/cookie_value):
 # .o web исключаем, а web_choices.o линкуем (его вызывают функции web.c).
@@ -81,22 +135,50 @@ tests/test_classifier_media: tests/test_classifier_media.c src/classifier.c src/
 tests/test_trace_line: tests/test_trace_line.c src/classifier.c src/classifier.h $(TEST_OBJS)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_trace_line.c $(filter-out src/classifier.o,$(TEST_OBJS))
 
-# test_dns_sniff_l2 включает src/dns_sniff.c (static l2_ipv4) — его .o исключаем.
+# test_dns_sniff_l2 включает src/dns_sniff.c (static l2_ip) — его .o исключаем.
 # Кадр приходит из сети, поэтому отдельно проверяются VLAN-теги и обрезанные кадры.
 tests/test_dns_sniff_l2: tests/test_dns_sniff_l2.c src/dns_sniff.c src/dns_sniff.h $(TEST_OBJS)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_dns_sniff_l2.c $(filter-out src/dns_sniff.o,$(TEST_OBJS))
 
 # Этап 1: доменный приор — prior_mark/dns_sniff_prior_of без сокетов.
+# Улика гибели прямого пути: sf_note — static, поэтому classifier.c включается в TU.
+tests/test_classifier_synfail: tests/test_classifier_synfail.c src/classifier.c src/classifier.h $(TEST_OBJS)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_classifier_synfail.c $(filter-out src/classifier.o,$(TEST_OBJS))
+
+# Подтверждение stall-сигналов: sc_note/stall_hold/stall_release — static,
+# поэтому classifier.c тоже включается в TU (и .o классификатора исключаем).
+tests/test_classifier_stall: tests/test_classifier_stall.c src/classifier.c src/classifier.h $(TEST_OBJS)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_classifier_stall.c $(filter-out src/classifier.o,$(TEST_OBJS))
+
+# config sync работает с файлом: config.c + log.c (slogf вызывается из config.c).
+tests/test_config_sync: tests/test_config_sync.c src/config.c src/config.h src/log.c src/log.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_config_sync.c src/config.c src/log.c src/lang.c src/lang_catalog.c
+
+# Счётчики снифинга: dns_sniff.c включается в TU (static-глобалы g_fds/g_started),
+# поэтому его .o из линковки исключаем; в TU нет ни ipset, ни iptables
+# (пустые пути списков и ru_guard_tlds — reconcile пины не ставит).
+tests/test_dns_sniff_stats: tests/test_dns_sniff_stats.c src/dns_sniff.c src/dns_sniff.h $(TEST_OBJS)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_dns_sniff_stats.c $(filter-out src/dns_sniff.o,$(TEST_OBJS))
+
+# Мягкая запись (?) vpn_always: vpn_always.c включается в TU (static file_load/
+# doms_reconcile/dom_find), его .o из линковки исключаем.
+tests/test_va_soft: tests/test_va_soft.c src/vpn_always.c src/vpn_always.h $(TEST_OBJS)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_va_soft.c $(filter-out src/vpn_always.o,$(TEST_OBJS))
+
+# Таймауты SOCKS: udp_relay.c включается в TU (static socks_associate), его .o
+# из линковки исключаем.
+tests/test_socks_timeout: tests/test_socks_timeout.c src/udp_relay.c src/udp_relay.h $(TEST_OBJS)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_socks_timeout.c $(filter-out src/udp_relay.o,$(TEST_OBJS))
 
 tests/test_conntrack: tests/test_conntrack.c src/conntrack.c src/conntrack.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_conntrack.c src/conntrack.c
 
 tests/test_config: tests/test_config.c src/config.c src/config.h
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_config.c src/config.c
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_config.c src/config.c src/lang.c src/lang_catalog.c
 
 # W6: чистые функции разбора GitHub/сравнения версий; log.c нужен из-за slogf.
-tests/test_release: tests/test_release.c src/release.c src/log.c
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_release.c src/release.c src/log.c
+tests/test_release: tests/test_release.c src/release.c src/log.c src/lang.c src/lang_catalog.c
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_release.c src/release.c src/log.c src/lang.c src/lang_catalog.c
 
 # test_ops включает src/ops.c, test_web_list — src/web.c: их .o из линковки
 # исключаем, иначе дубли символов. src/web_choices.o, наоборот, ЛИНКУЕМ:

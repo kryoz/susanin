@@ -54,14 +54,32 @@ is_web_running() {
 }
 
 web_enabled() {
-    [ "$(sed -n 's/^web_enable=//p' "$CONF" 2>/dev/null | tail -n1)" = "1" ]
+    [ "$(sed -n 's/^[[:space:]]*web_enable[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)" = "1" ]
+}
+
+# disk_mode=soft по документации означает, что ЛОГ НЕ ВЕДЁТСЯ. Раньше это
+# делалось наполовину: агент не открывал свой файл, но оболочка привязывала
+# stdout демона и панели к $LOG безусловным редиректом, а панель в soft чтение
+# лога отказывала. Итог был худший из возможных: флешка стерлась записями,
+# которые никто не мог прочитать. Теперь в soft вывод идёт в /dev/null.
+disk_mode_of() {
+    sed -n 's/^[[:space:]]*disk_mode[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1
+}
+
+# log_dest <обычный_файл> — куда привязывать вывод процессов
+log_dest() {
+    if [ "$(disk_mode_of)" = "soft" ]; then
+        echo /dev/null
+    else
+        echo "$1"
+    fi
 }
 
 cmd_web_start() {
     web_enabled || return 0
     is_web_running && return 0
     mkdir -p /opt/susanin/var
-    SUSANIN_CONF="$CONF" "$BIN" web >>"$WEB_LOG" 2>&1 </dev/null &
+    SUSANIN_CONF="$CONF" "$BIN" web >>"$(log_dest "$WEB_LOG")" 2>&1 </dev/null &
     echo $! > "$WEB_PID"
     echo "[susanin] web started (pid $(cat "$WEB_PID" 2>/dev/null))"
     return 0
@@ -78,6 +96,9 @@ cmd_web_stop() {
 
 # Rotate log above 5 MiB; keep compressed archives susanin.log.1.gz .. .3.gz
 rotate_log() {
+    # В soft лога нет как такового: нечего и вращать (и не будем трогать
+    # старый файл, оставшийся от normal-периода).
+    [ "$(disk_mode_of)" = "soft" ] && return 0
     [ -f "$LOG" ] || return 0
     _sz=$(wc -c < "$LOG" 2>/dev/null || echo 0)
     [ "${_sz:-0}" -lt 5242880 ] && return 0
@@ -110,14 +131,19 @@ start_daemon() {
     fi
     mkdir -p /opt/susanin/var
     rotate_log
+    _out=$(log_dest "$LOG")
     (
         trap '' HUP
-        SUSANIN_CONF="$CONF" SUSANIN_LOG="$LOG" exec "$BIN" run
-    ) >>"$LOG" 2>&1 </dev/null &
+        SUSANIN_CONF="$CONF" SUSANIN_LOG="$_out" exec "$BIN" run
+    ) >>"$_out" 2>&1 </dev/null &
     echo $! > /opt/susanin/var/susanin-agent.pid
     sleep 2
     if is_running; then
-        echo "[susanin] started, log: $LOG"
+        if [ "$_out" = "/dev/null" ]; then
+            echo "[susanin] started, лог не ведётся (disk_mode=soft)"
+        else
+            echo "[susanin] started, log: $_out"
+        fi
     else
         echo "[susanin] failed to start, see log: $LOG" >&2
         tail -n 10 "$LOG" 2>/dev/null || true
@@ -131,6 +157,13 @@ cmd_start() {
 }
 
 stop_daemon() {
+    # dns_lan: DNAT клиентов снимаем ДО остановки форвардера — иначе на всё
+    # время остановки (до 10 с ожидания) LAN остаётся без DNS: перенаправлять
+    # уже некуда, а слушателя на порту форвардера ещё/уже нет. Снимаем и в
+    # случае, когда агент уже мёртв: правила могли остаться от прошлого запуска.
+    if [ -f "$TOOLS/datapath.sh" ]; then
+        sh "$TOOLS/datapath.sh" dns-lan-down >/dev/null 2>&1 || true
+    fi
     if ! is_running; then
         echo "[susanin] not running"
         return 0
@@ -191,6 +224,10 @@ cmd_status() {
 
 cmd_log() {
     n="${1:-30}"
+    if [ "$(disk_mode_of)" = "soft" ]; then
+        echo "[susanin] лог не ведётся (disk_mode=soft); включите disk_mode=normal и перезапустите службу"
+        return 0
+    fi
     tail -n "$n" "$LOG" 2>/dev/null || echo "log is empty: $LOG"
 }
 
@@ -243,7 +280,7 @@ cmd_rescan() {
             *) continue ;;
         esac
         [ -n "$v" ] || continue
-        _cur=$(sed -n "s|^$k=||p" "$CONF" 2>/dev/null | head -n1)
+        _cur=$(sed -n "s/^[[:space:]]*${k}[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" "$CONF" 2>/dev/null | tail -n1)
         if [ "$k" = "egress_interface" ] && [ "$force" != "1" ] &&
            [ -n "$_cur" ] && [ "$_cur" != "$v" ]; then
             if _csv_subset "$_cur" "$v"; then
@@ -258,8 +295,8 @@ cmd_rescan() {
             continue
         fi
         [ "$_cur" = "$v" ] && continue
-        if grep -q "^$k=" "$CONF" 2>/dev/null; then
-            sed -i "s|^$k=.*|$k=$v|" "$CONF"
+        if grep -Eq "^[[:space:]]*${k}[[:space:]]*=" "$CONF" 2>/dev/null; then
+            sed -i "s|^[[:space:]]*${k}[[:space:]]*=.*|$k=$v|" "$CONF" 2>/dev/null || true
         else
             printf '%s=%s\n' "$k" "$v" >> "$CONF"
         fi

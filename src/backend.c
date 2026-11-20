@@ -87,6 +87,9 @@ static int run_argv(char *const argv[])
 
 #define BT_PATH "/tmp/susanin-ipset.batch"
 #define BT_MAX (1024 * 1024)
+/* Пауза после зависания restore и потолок её удвоения: 30 с … 10 мин. */
+#define BT_HANG_PAUSE_MS     30000
+#define BT_HANG_PAUSE_MAX_MS 600000
 /* ipset принимает timeout не больше 2147483 с (INT_MAX/1000). Больше —
  * «Syntax error: ... is out of range» и падает ВСЯ пачка ipset restore;
  * так терялась запись с expire=0x7fffffff («никогда не истекает»).
@@ -106,18 +109,43 @@ static size_t g_bt_len, g_bt_cap;
 static int g_bt_depth;
 static int g_bt_disabled;      /* 1 = батч выключен (конфиг или авария с ipset) */
 
+/* Зависание `ipset restore` было одноразовым (ipset берёт глобальный lock, а
+ * его держит NDM при пересборке NAT), но прежняя реакция была необратимой:
+ * пачка выбрасывалась, а батч оставался выключенным до перезапуска агента.
+ * То есть адреса, которые надо было добавить, не применялись никогда, а
+ * оператор видел это только как «списки легли частично». Теперь: пачка
+ * сохраняется, батч ставится на паузу, и после паузы делается одна проверка
+ * живости ipset — ожил, значит недонесённое применяется и батч возвращается. */
+static char *g_bt_orphan;          /* команды из зависшей пачки */
+static size_t g_bt_orphan_len;
+static int g_bt_paused;
+static long long g_bt_retry_at;    /* мс, до которых не трогаем ipset */
+static long long g_bt_pause_ms = BT_HANG_PAUSE_MS;
+
 void backend_batch_enable(int on)
 {
     g_bt_disabled = on ? 0 : 1;
     if (g_bt_disabled) {
         g_bt_depth = 0;
         g_bt_len = 0;
+        g_bt_paused = 0;
+        g_bt_pause_ms = BT_HANG_PAUSE_MS;
+        free(g_bt_orphan);
+        g_bt_orphan = NULL;
+        g_bt_orphan_len = 0;
     }
 }
+
+/* Выход из паузы и возврат недонесённой пачки — реализация ниже, рядом с
+ * поштучным применением (ей нужны bt_now_ms, bt_wait_child и bt_apply_line). */
+static void bt_maybe_resume(void);
 
 void backend_batch_begin(void)
 {
     if (g_bt_disabled)
+        return;
+    bt_maybe_resume();
+    if (g_bt_paused)
         return;
     g_bt_depth++;
 }
@@ -187,6 +215,11 @@ static int bt_write_file(void)
  * fork+exec замораживает главный цикл. */
 #define BT_FALLBACK_MAX 2000
 #define BT_FALLBACK_MS  10000
+/* Возврат сохранённой пачки после зависания: порция за проход. Остаток не
+ * теряется — он остаётся в буфере и применяется следующим проходом, поэтому
+ * порция сознательно небольшая: залп fork+exec замораживает главный цикл. */
+#define BT_RESUME_MAX 40
+#define BT_RESUME_MS  800
 
 /* Монотонные миллисекунды — для предела поштучного применения. */
 static long long bt_now_ms(void)
@@ -318,7 +351,7 @@ static int bt_apply_line(char *line)
     int n = 0;
     int rc;
     pid_t pid;
-    while (*p && n < 6) {
+    while (*p && n < 5) {   /* максимум 5 токенов: 2 фиксированных + 5 + NULL = 8 */
         while (*p == ' ' || *p == '\t')
             p++;
         if (!*p)
@@ -356,6 +389,116 @@ static int bt_apply_line(char *line)
     return rc;
 }
 
+/* Жив ли ipset: один короткий `ipset list -n` с таймаутом. Пробуем редко и
+ * только когда батч на паузе, иначе проверка сама стала бы источником вилок. */
+static int bt_alive(void)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return 0;
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        char *av[4];
+        if (dn >= 0) {
+            if (dn != 1 && dn != 2) { dup2(dn, 1); dup2(dn, 2); }
+            if (dn > 2)
+                close(dn);
+        }
+        av[0] = (char *)tool_ipset();
+        av[1] = (char *)"list";
+        av[2] = (char *)"-n";
+        av[3] = NULL;
+        execvp(av[0], av);
+        _exit(127);
+    }
+    /* Выход 0 = ipset ответил; 1 = «набора нет» тоже нормальный ответ для
+     * `list -n`, поэтому любую завершившуюся без таймаута попытку считаем
+     * признаком живости, а вот -1/-2 (ошибка/завис) — нет. */
+    {
+        int rc = bt_wait_child(pid, BT_APPLY_TIMEOUT_MS);
+        return rc != -1 && rc != -2;
+    }
+}
+
+/* Применить буфер команд поштучно, порциями: за проход не больше max_cmds
+ * команд и не дольше max_ms. Возврат — сколько БАЙТ разобрано; остаток
+ * вызывающий переносит в начало буфера и применит следующим проходом.
+ * Раньше остаток за пределом просто пропускался, и после зависания ipset в
+ * набор не доезжали сотни записей (на живом роутере — 2232 из пачки), а списки
+ * выглядели «применёнными частично». */
+static size_t bt_apply_buffer(const char *buf, size_t len, const char *why,
+                              int max_cmds, long long max_ms)
+{
+    size_t off = 0;
+    long long t0 = bt_now_ms();
+    int ncmd = 0, bad = 0;
+
+    while (off < len) {
+        char line[512];
+        const char *nl = memchr(buf + off, '\n', len - off);
+        size_t l = nl ? (size_t)(nl - (buf + off)) : (len - off);
+        size_t step = nl ? ((size_t)(nl - (buf + off)) + 1) : (len - off);
+        if (l >= sizeof(line))
+            l = sizeof(line) - 1;
+        memcpy(line, buf + off, l);
+        line[l] = '\0';
+        if (l) {
+            if (ncmd >= max_cmds || bt_now_ms() - t0 > max_ms)
+                break;              /* остаток разберём следующим проходом */
+            ncmd++;
+            if (bt_apply_line(line) != 0)
+                bad++;
+        }
+        off += step;
+    }
+    if (off < len)
+        slogf(SL_WARN, "%s: применено %d, ошибок %d, остаток (%zu байт) — "
+                        "следующим проходом", why, ncmd - bad, bad, len - off);
+    else if (bad || ncmd)
+        slogf(SL_INFO, "%s: применено %d, ошибок %d", why, ncmd - bad, bad);
+    return off;
+}
+
+/* Выход из паузы после зависания restore: не раньше срока, и только если ipset
+ * отвечает. Недонесённую пачку возвращаем в набор, иначе записи теряются. */
+static void bt_maybe_resume(void)
+{
+    long long now;
+    if (!g_bt_paused)
+        return;
+    now = bt_now_ms();
+    if (now < g_bt_retry_at)
+        return;
+    g_bt_retry_at = now + g_bt_pause_ms;
+    if (g_bt_pause_ms < BT_HANG_PAUSE_MAX_MS) {
+        g_bt_pause_ms *= 2;
+        if (g_bt_pause_ms > BT_HANG_PAUSE_MAX_MS)
+            g_bt_pause_ms = BT_HANG_PAUSE_MAX_MS;
+    }
+    if (!bt_alive())
+        return;
+    if (g_bt_orphan && g_bt_orphan_len) {
+        size_t used = bt_apply_buffer(g_bt_orphan, g_bt_orphan_len,
+                                      "ipset ожил: возвращаю пачку после зависания",
+                                      BT_RESUME_MAX, BT_RESUME_MS);
+        if (used < g_bt_orphan_len) {
+            /* Предел прохода: остаток оставляем себе и берём его скоро, не
+             * дожидаясь бэкоффа паузы — пачка и так уже задержалась. */
+            memmove(g_bt_orphan, g_bt_orphan + used,
+                    g_bt_orphan_len - used);
+            g_bt_orphan_len -= used;
+            g_bt_retry_at = bt_now_ms() + 5000;
+            return;                 /* остаёмся в паузе, батч ещё не вернулся */
+        }
+    }
+    free(g_bt_orphan);
+    g_bt_orphan = NULL;
+    g_bt_orphan_len = 0;
+    g_bt_paused = 0;
+    g_bt_pause_ms = BT_HANG_PAUSE_MS;
+    slogf(SL_WARN, "батч ipset восстановлен без перезапуска агента");
+}
+
 static int bt_flush(void)
 {
     char err[256];
@@ -368,14 +511,24 @@ static int bt_flush(void)
     }
     rc = bt_run_restore(err, sizeof(err));
     if (rc == -2) {
-        /* ipset завис и держит свой lock: повторять поштучно нельзя — это
-         * только плодит зависшие процессы. Батч выключаем до рестарта. */
+        /* ipset завис и держит свой lock: повторять поштучно прямо сейчас
+         * нельзя — это только плодит зависшие процессы. Но и выбрасывать пачку
+         * нельзя: её записи не применились бы никогда. Забираем буфер себе
+         * (без копирования), ставим батч на паузу и пробуждаемся по сроку —
+         * ожил ipset, значит недонесённое доедет, а батч вернётся сам. */
         slogf(SL_ERROR, "ipset restore завис (больше %d мс) — процесс убит, "
-                        "батч ipset отключён до перезапуска агента",
-              BT_RESTORE_TIMEOUT_MS);
+                        "батч на паузе, пачка (%zu байт) сохранена для повторной "
+                        "попытки", BT_RESTORE_TIMEOUT_MS, g_bt_len);
         unlink(BT_PATH);
+        free(g_bt_orphan);
+        g_bt_orphan = g_bt;
+        g_bt_orphan_len = g_bt_len;
+        g_bt = NULL;
+        g_bt_cap = 0;
         g_bt_len = 0;
-        backend_batch_enable(0);
+        g_bt_paused = 1;
+        g_bt_pause_ms = BT_HANG_PAUSE_MS;
+        g_bt_retry_at = bt_now_ms() + g_bt_pause_ms;
         return 0;
     }
     if (rc != 0) {
@@ -480,7 +633,7 @@ static int run_capture_argv(char *const argv[], char *out, size_t outsz)
         char tmp[512];
         ssize_t r;
         while ((r = read(p[0], tmp, sizeof(tmp))) > 0) {
-            if (out && n < outsz - 1) {
+            if (out && outsz > 1 && n < outsz - 1) {
                 size_t room = outsz - 1 - n;
                 size_t take = (size_t)r < room ? (size_t)r : room;
                 memcpy(out + n, tmp, take);
@@ -766,11 +919,14 @@ static int iface_prefix_in_list(const char *list, const char *pfx)
  * interface: цепочки SUSANIN МАЛО — NDM может снести ip rule, default в таблице
  * или разрешение в filter/FORWARD, и тогда метка ставится, а трафик идёт
  * напрямую (снаружи это «vpn_always не работает»). */
-int backend_ready(const susanin_config *c)
+static int be_ready_int(const susanin_config *c, int *unknown)
 {
     char *argv[7];
     char out[8192], needle[96];
     int rc;
+
+    if (unknown)
+        *unknown = 0;
 
     /* iptables — всегда с `-w` (как в datapath.sh): без ожидания xtables-lock
      * чтение правил в момент перекладки NDM возвращало ошибку, агент считал её
@@ -783,10 +939,21 @@ int backend_ready(const susanin_config *c)
     argv[4] = "-S";
     argv[5] = "SUSANIN";
     argv[6] = NULL;
-    rc = run_check(argv, NULL, 0);
-    if (rc == XT_BUSY)
+    /* Буфер обязателен: без него текстовая детекция «xtables lock» невозможна
+     * и остаётся только код 4, а iptables разных сборок отдаёт 1 с тем же
+     * сообщением. Плюс содержимое цепочки видно только по выводу -S. */
+    rc = run_check(argv, out, sizeof(out));
+    if (rc == XT_BUSY) {
+        if (unknown)
+            *unknown = 1;
         return 1;               /* проверить нельзя — не объявляем пропажу */
+    }
     if (rc != 0)
+        return 0;
+    /* Цепочка существует — НЕ то же самое, что «датаплейн на месте»: NDM и
+     * `iptables -F` снимают правила, оставляя пустую пользовательскую
+     * цепочку, и прежняя проверка считала это готовностью навсегда. */
+    if (!strstr(out, "-A SUSANIN"))
         return 0;
 
     /* T3: dns_hijack ставит DNAT 53 заранее (в т.ч. шаблоном oc+ без живого
@@ -802,8 +969,11 @@ int backend_ready(const susanin_config *c)
         na[1] = "-w"; na[2] = "-t"; na[3] = "nat"; na[4] = "-S";
         na[5] = "PREROUTING"; na[6] = NULL;
         rc = run_check(na, out, sizeof(out));
-        if (rc == XT_BUSY)
+        if (rc == XT_BUSY) {
+            if (unknown)
+                *unknown = 1;
             return 1;
+        }
         if (rc != 0 || !strstr(out, "susanin-dns"))
             return 0;
     }
@@ -815,8 +985,11 @@ int backend_ready(const susanin_config *c)
         argv[1] = "-w"; argv[2] = "-t"; argv[3] = "nat"; argv[4] = "-S";
         argv[5] = "PREROUTING"; argv[6] = NULL;
         rc = run_check(argv, out, sizeof(out));
-        if (rc == XT_BUSY)
+        if (rc == XT_BUSY) {
+            if (unknown)
+                *unknown = 1;
             return 1;
+        }
         if (rc != 0 || !strstr(out, needle))
             return 0;
 
@@ -827,8 +1000,11 @@ int backend_ready(const susanin_config *c)
             argv[1] = "-w"; argv[2] = "-t"; argv[3] = "mangle"; argv[4] = "-S";
             argv[5] = "PREROUTING"; argv[6] = NULL;
             rc = run_check(argv, out, sizeof(out));
-            if (rc == XT_BUSY)
+            if (rc == XT_BUSY) {
+                if (unknown)
+                    *unknown = 1;
                 return 1;
+            }
             if (rc != 0 || !strstr(out, needle))
                 return 0;
         }
@@ -840,8 +1016,11 @@ int backend_ready(const susanin_config *c)
             ipargv[0] = (char *)tool_ip();
             ipargv[1] = "rule"; ipargv[2] = "show"; ipargv[3] = NULL;
             rc = run_check(ipargv, out, sizeof(out));
-            if (rc == XT_BUSY)
+            if (rc == XT_BUSY) {
+                if (unknown)
+                    *unknown = 1;
                 return 1;
+            }
             if (rc != 0 || !strstr(out, needle))
                 return 0;
         }
@@ -861,8 +1040,11 @@ int backend_ready(const susanin_config *c)
         ipargv[0] = (char *)tool_ip();
         ipargv[1] = "rule"; ipargv[2] = "show"; ipargv[3] = NULL;
         rc = run_check(ipargv, out, sizeof(out));
-        if (rc == XT_BUSY)
+        if (rc == XT_BUSY) {
+            if (unknown)
+                *unknown = 1;
             return 1;
+        }
         if (rc != 0 || !strstr(out, needle))
             return 0;
 
@@ -877,8 +1059,11 @@ int backend_ready(const susanin_config *c)
             ipargv[1] = "route"; ipargv[2] = "show"; ipargv[3] = "table";
             ipargv[4] = tbl; ipargv[5] = NULL;
             rc = run_check(ipargv, out, sizeof(out));
-            if (rc == XT_BUSY)
+            if (rc == XT_BUSY) {
+                if (unknown)
+                    *unknown = 1;
                 return 1;
+            }
             if (rc != 0 || !strstr(out, "default"))
                 return 0;
         }
@@ -895,15 +1080,32 @@ int backend_ready(const susanin_config *c)
             fargv[5] = "FORWARD"; fargv[6] = "-m"; fargv[7] = "mark";
             fargv[8] = "--mark"; fargv[9] = mbuf; fargv[10] = "-j";
             fargv[11] = "ACCEPT"; fargv[12] = NULL;
-            rc = run_check(fargv, NULL, 0);
-            if (rc == XT_BUSY)
+            rc = run_check(fargv, out, sizeof(out));
+            if (rc == XT_BUSY) {
+                if (unknown)
+                    *unknown = 1;
                 return 1;
+            }
             if (rc != 0)
                 return 0;
         }
     }
 
     return 1;
+}
+
+int backend_ready(const susanin_config *c)
+{
+    return be_ready_int(c, NULL);
+}
+
+/* То же, но различает «проверено, на месте» и «проверить не удалось»:
+ * *unknown = 1, если хотя бы одна проверка упёрлась в занятый xtables-лок.
+ * Без этого движок не мог отличить «всё хорошо» от «мы ничего не знаем» и
+ * молчал, пока лок удерживали минуты. */
+int backend_ready_ex(const susanin_config *c, int *unknown)
+{
+    return be_ready_int(c, unknown);
 }
 
 /* Check the environment the data plane needs: external tools and the egress

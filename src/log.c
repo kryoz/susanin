@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "log.h"
+#include "lang.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -16,10 +17,23 @@ void slog_init(const char *level)
         return;
     if (!strcmp(level, "quiet")) g_level = SL_QUIET;
     else if (!strcmp(level, "error")) g_level = SL_ERROR;
+    /* warn был в перечне уровней в документации и стоял по умолчанию, но
+     * разбора у него не было — строка проваливалась в ветку неизвестного
+     * значения и включала INFO. То есть «пишем минимум» не работало молча:
+     * конфиг выглядит правильным, `config check` не ругается, а в журнале
+     * по-прежнему INFO-поток. */
+    else if (!strcmp(level, "warn")) g_level = SL_WARN;
     else if (!strcmp(level, "info")) g_level = SL_INFO;
     else if (!strcmp(level, "debug")) g_level = SL_DEBUG;
     else if (!strcmp(level, "trace")) g_level = SL_TRACE;
     else g_level = SL_INFO;
+}
+
+/* Текущий уровень — нужен, чтобы Reload сообщал, что именно изменилось,
+ * строкой уровня WARN (иначе смена на warn/quiet сама уже не видна). */
+int slog_level(void)
+{
+    return g_level;
 }
 
 int slog_enabled(int lvl)
@@ -47,8 +61,10 @@ void slogf(int lvl, const char *fmt, ...)
      * разъезжаются по дням). */
     strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
     fprintf(stdout, "%s %s: ", ts, tag);
+    /* Перевод шаблона по выбранному языку: ключ — русская строка из вызова,
+     * поэтому сами вызовы slogf() менять не нужно. */
     va_start(ap, fmt);
-    vfprintf(stdout, fmt, ap);
+    vfprintf(stdout, lang_tr(fmt), ap);
     va_end(ap);
     fputc('\n', stdout);
     fflush(stdout);
@@ -85,7 +101,7 @@ void log_rotate_if_big(const char *path, long max_kb, long keep_kb)
         free(buf);
         return;
     }
-    if (fseek(f, (long)from, SEEK_SET) != 0) {
+    if (fseeko(f, from, SEEK_SET) != 0) {
         fclose(f);
         free(buf);
         return;

@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 
 static int split_line(char *s)   /* обрезает перевод строки, возвращает длину */
@@ -19,6 +20,19 @@ static int split_line(char *s)   /* обрезает перевод строки
     while (l && (s[l - 1] == ' ' || s[l - 1] == '\t'))
         s[--l] = '\0';
     return (int)l;
+}
+
+/* Приём записей сканом — для проверки обрезанных строк. */
+static char g_seen[8][64];
+static int g_seen_n;
+
+static int collect_cb(void *ud, const ct_flow *f)
+{
+    (void)ud;
+    if (g_seen_n < 8)
+        snprintf(g_seen[g_seen_n], sizeof(g_seen[0]), "%s", f->dst);
+    g_seen_n++;
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -95,6 +109,112 @@ int main(int argc, char **argv)
         printf("ok[%d] %s %s:%u -> %s:%u\n", n, f.proto, f.src, f.sport, f.dst, f.dport);
     }
     fclose(fp);
+    printf("\n=== запись длиннее CT_LINE_MAX ===\n");
+    {
+        char p2l[160];
+        const char *p2 = p2l;
+
+        snprintf(p2l, sizeof(p2l), "/tmp/susanin-ct-trunc-%d.txt",
+                 (int)getpid());
+        unsigned long before = conntrack_overlong();
+        FILE *w = fopen(p2, "w");
+        int got, i;
+
+        if (!w) {
+            printf("SKIP: не удалось записать %s\n", p2);
+        } else {
+            /* 1) полностью корректная запись, но добитая до длины выше буфера:
+             * src/dst в этом формате в середине/конце, поэтому обрезок
+             * неразличим от «плохой строки» — его обязан пометить счётчик. */
+            fputs("ipv4     2 tcp      6 431995 ESTABLISHED src=192.0.2.1 "
+                  "dst=192.0.2.50 sport=51234 dport=443 packets=12 bytes=4096 "
+                  "src=192.0.2.50 dst=192.0.2.1 sport=443 dport=51234 "
+                  "packets=8 bytes=2048 [ASSURED] mark=0 use=1 ", w);
+            for (i = 0; i < CT_LINE_MAX + 500; i++)
+                fputc('x', w);
+            fputs("\n", w);
+            /* 2) обычная запись сразу после неё: если остаток длинной строки
+             * не дочитан, следующим чтением мы взяли бы его середину. */
+            fputs("ipv4     2 tcp      6 431995 ESTABLISHED src=192.0.2.2 "
+                  "dst=192.0.2.51 sport=51235 dport=80 packets=12 bytes=4096 "
+                  "src=192.0.2.51 dst=192.0.2.2 sport=80 dport=51235 "
+                  "packets=8 bytes=2048 [ASSURED] mark=0 use=1\n", w);
+            fclose(w);
+
+            g_seen_n = 0;
+            memset(g_seen, 0, sizeof(g_seen));
+            got = conntrack_scan(p2, collect_cb, NULL);
+            if (got == 1)
+                printf("ok  разобрана ровно одна запись (обрезанная пропущена)\n");
+            else {
+                printf("FAIL  записей разобрано: %d, ожидалось 1\n", got);
+                bad++;
+            }
+            if (conntrack_overlong() == before + 1)
+                printf("ok  обрезанная запись учтена счётчиком\n");
+            else {
+                printf("FAIL  счётчик: +%lu, ожидалось +1\n",
+                       conntrack_overlong() - before);
+                bad++;
+            }
+            if (g_seen_n == 1 && !strcmp(g_seen[0], "192.0.2.51"))
+                printf("ok  следующая запись прочитана целиком (остаток дочитан)\n");
+            else {
+                printf("FAIL  после обрезка принято %d записей, первая dst=%s\n",
+                       g_seen_n, g_seen_n ? g_seen[0] : "-");
+                bad++;
+            }
+            remove(p2);
+        }
+    }
+
+    printf("\n=== запись длиной ровно в буфер ===\n");
+    {
+        /* Прежняя детекция («нет \n и не feof») считала обрезком и строку
+         * длиной ровно CT_LINE_MAX-1, где не влез лишь перевод строки:
+         * корректный поток терялся и ещё и попадал в счётчик обрезанных. */
+        char rec[CT_LINE_MAX + 8];
+        char pad[CT_LINE_MAX + 8];
+        const char *base =
+            "ipv4     2 tcp      6 431995 ESTABLISHED src=192.0.2.7 "
+            "dst=192.0.2.51 sport=51236 dport=80 packets=12 bytes=4096 "
+            "src=192.0.2.51 dst=192.0.2.7 sport=80 dport=51236 packets=8 "
+            "bytes=2048 [ASSURED] mark=0 use=1 pad=";
+        char p3l[160];
+        FILE *f3;
+        unsigned long ob3 = conntrack_overlong();
+        int got3;
+
+        memset(pad, 'z', sizeof(pad) - 1);
+        pad[CT_LINE_MAX - 1 - strlen(base)] = '\0';
+        snprintf(rec, sizeof(rec), "%s%s\n", base, pad);
+        if (strlen(rec) - 1 != (size_t)(CT_LINE_MAX - 1)) {
+            printf("FAIL  не удалось собрать строку длиной %d (получилось %zu)\n",
+                   CT_LINE_MAX - 1, strlen(rec) - 1);
+            bad++;
+        } else {
+            snprintf(p3l, sizeof(p3l), "/tmp/susanin-ct-exact-%d.txt", (int)getpid());
+            f3 = fopen(p3l, "w");
+            fputs(rec, f3);
+            fclose(f3);
+            g_seen_n = 0;
+            got3 = conntrack_scan(p3l, collect_cb, NULL);
+            if (got3 == 1)
+                printf("ok  запись длиной ровно в буфер разобрана\n");
+            else {
+                printf("FAIL  разобрано %d, ожидалось 1\n", got3);
+                bad++;
+            }
+            if (conntrack_overlong() == ob3)
+                printf("ok  и не засчитана в обрезанные\n");
+            else {
+                printf("FAIL  счётчик обрезанных вырос ложно\n");
+                bad++;
+            }
+            remove(p3l);
+        }
+    }
+
     printf("\nстрок проверено: %d, ошибок: %d\n", n, bad);
     return bad ? 1 : 0;
 }

@@ -202,7 +202,15 @@ static int valid_cidr(const char *s, char *out, size_t n)
     pre = strtol(slash + 1, &e, 10);
     if (e == slash + 1 || *e != '\0' || errno != 0 || pre < 0 || pre > 32)
         return 0;
-    snprintf(out, n, "%s", s);
+    {
+        in_addr_t mask = pre == 0 ? 0u : (in_addr_t)(0xffffffffu << (32 - (int)pre));
+        struct in_addr na;
+        char nb[INET_ADDRSTRLEN];
+        na.s_addr = htonl(ntohl(a.s_addr) & mask);
+        if (!inet_ntop(AF_INET, &na, nb, sizeof(nb)))
+            return 0;
+        snprintf(out, n, "%s/%ld", nb, pre);
+    }
     return 1;
 }
 
@@ -236,7 +244,7 @@ static int file_load(const char *path, char names[][256], int wilds[],
 {
     FILE *fp = fopen(path, "r");
     char line[320];
-    int n = 0;
+    int n = 0, nq = 0;
     if (!fp)
         return -1;
     while (fgets(line, sizeof(line), fp)) {
@@ -247,6 +255,13 @@ static int file_load(const char *path, char names[][256], int wilds[],
         trim_line(line);
         if (line[0] == '\0' || line[0] == '#')
             continue;
+        if (line[0] == '?') {
+            /* «?» здесь молча отбрасывалась как мусорное имя, и оператор
+             * узнавал об этом только из исходников. Правило одно: мягкие
+             * записи поддержаны только в vpn_always. */
+            nq++;
+            continue;
+        }
         if (line[0] == '*' && line[1] == '.') {
             wild = 1;
             p = line + 2;
@@ -270,14 +285,19 @@ static int file_load(const char *path, char names[][256], int wilds[],
         }
     }
     fclose(fp);
+    /* Одно WARN на перечитывание файла, а не на строку: список мог быть
+     * большой, спам в warn-логе не нужен. */
+    if (nq > 0)
+        slogf(SL_WARN, "vpn_never: проигнорировано строк с «?»: %d — мягкие "
+              "записи поддержаны только в vpn_always", nq);
     return n;
 }
 
-static vn_dom *dom_find(vpn_never *v, const char *name)
+static vn_dom *dom_find(vpn_never *v, const char *name, int wild)
 {
     int i;
     for (i = 0; i < v->nd; i++)
-        if (strcmp(v->dom[i].name, name) == 0)
+        if (strcmp(v->dom[i].name, name) == 0 && v->dom[i].wild == wild)
             return &v->dom[i];
     return NULL;
 }
@@ -290,7 +310,7 @@ static void doms_reconcile(vpn_never *v, const susanin_config *cfg,
     vn_dom keep[VN_MAXDOM];
     int nk = 0, i, j, k;
     for (i = 0; i < n && i < VN_MAXDOM; i++) {
-        vn_dom *old = dom_find(v, names[i]);
+        vn_dom *old = dom_find(v, names[i], wilds[i]);
         vn_dom *d = &keep[nk++];
         if (old && old->wild == wilds[i])
             *d = *old;
@@ -388,9 +408,11 @@ int vn_changed(vpn_never *v, const susanin_config *cfg)
 {
     struct stat st;
     int had;
-    if (!v || !cfg->vpn_never_file[0])
+    if (!v)
         return 0;
     had = v->seen_exists;
+    if (!cfg->vpn_never_file[0])
+        return had ? 1 : 0;       /* путь обнулили — прямой пин надо снять */
     if (stat(cfg->vpn_never_file, &st) != 0)
         return had ? 1 : 0;
     if (!had)
@@ -494,12 +516,13 @@ int vn_refresh2(vpn_never *v, const susanin_config *cfg, int *changed)
     char desired[VN_TRACK][64];
     char (*des)[64] = desired;
     struct stat st;
+    int nofile;
     time_t now = time(NULL);
     int i, nd = 0, added = 0, removed = 0, pending = 0, new_epoch = 0;
     int nfail = 0, nex = 0;
     char exa[3][64] = { "", "", "" };
     long long t0 = now_ms();
-    int interval = cfg->vpn_never_interval > 0 ? cfg->vpn_never_interval : 300;
+    int interval = cfg->vpn_never_interval > 0 ? cfg->vpn_never_interval : CFG_DEF_VPN_LIST_INTERVAL;
     /* Бюджет одного прохода (см. vpn_refresh_budget_ms в susanin.conf):
      * короткие проходы не держат главный цикл и не задерживают метки. */
     long long budget = (cfg->vpn_refresh_budget_ms > 0)
@@ -511,8 +534,12 @@ int vn_refresh2(vpn_never *v, const susanin_config *cfg, int *changed)
     if (changed)
         *changed = 0;
 
-    if (!v || !cfg->vpn_never_file[0])
+    if (!v)
         return 0;
+    /* Пустой vpn_never_file = функция выключена, а НЕ «ничего не делать»:
+     * ранее запиненные «прямо» адреса обязаны быть сняты, иначе они остаются в
+     * susanin_never навсегда (см. vpn_always.c, тот же класс). */
+    nofile = !cfg->vpn_never_file[0];
 
     /* Hysteresis считает интервалы, а не вызовы (см. vpn_always.c). */
     {
@@ -522,23 +549,29 @@ int vn_refresh2(vpn_never *v, const susanin_config *cfg, int *changed)
             v->epoch = epoch;
     }
 
-    if (stat(cfg->vpn_never_file, &st) != 0) {
+    if (nofile || stat(cfg->vpn_never_file, &st) != 0) {
         if (v->seen_exists) {
             v->seen_exists = 0;
             v->nd = 0;
+            v->seen_mtime = 0;   /* при возврате файла перечитаем независимо от mtime/size */
+            v->seen_size = 0;
             while (v->ntrack > 0) {
                 backend_set_del(cfg, VN_SET, v->track[0]);
                 slogf(SL_INFO, "vpn_never: unpin %s (file removed)",
                       v->track[0]);
-                recent_note(v->track[0], time(NULL));
                 tracked_remove(v, v->track[0]);
             }
             /* r4.3: списка больше нет — кулдаун не за чем держать. */
             recent_clear();
+            if (changed)
+                *changed = 1;     /* набор изменился — движок должен чистить state */
         } else if (!v->warned) {
             v->warned = 1;
-            slogf(SL_INFO, "vpn_never: %s absent (disabled)",
-                  cfg->vpn_never_file);
+            if (nofile)
+                slogf(SL_INFO, "vpn_never: список не задан (функция выключена)");
+            else
+                slogf(SL_INFO, "vpn_never: %s absent (disabled)",
+                      cfg->vpn_never_file);
         }
         return 0;
     }
@@ -743,4 +776,15 @@ int vn_match_file(const char *path, const char *ip, char *out, size_t n)
         }
     }
     return 0;
+}
+
+/* Состояние списка для наблюдаемости (см. va_counts): refresh молчит, когда
+ * меняться нечему, и по логу нельзя было отличить «перечитано и ничего не
+ * изменилось» от «не перечитано вовсе». */
+void vn_counts(const vpn_never *v, int *ndom, int *ntrack)
+{
+    if (ndom)
+        *ndom = v ? v->nd : 0;
+    if (ntrack)
+        *ntrack = v ? v->ntrack : 0;
 }

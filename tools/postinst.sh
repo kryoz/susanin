@@ -64,7 +64,7 @@ if [ ! -f "$CONF" ] && [ -f "$SHARE/susanin.conf.example" ]; then
 		say "создан конфиг $CONF (можно не править руками: susanin-agent config set)"
 fi
 
-cfg_val() { sed -n "s/^$1=[ \t]*//p" "$CONF" 2>/dev/null | tail -n1; }
+cfg_val() { sed -n "s/^[[:space:]]*${1}[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" "$CONF" 2>/dev/null | tail -n1; }
 
 cfg_set() { # cfg_set <ключ> <значение> <причина>
 	[ -f "$CONF" ] || return 0
@@ -73,8 +73,8 @@ cfg_set() { # cfg_set <ключ> <значение> <причина>
 		return 0
 	fi
 	# Агента нет (первая установка до раскладки бинарника) — пишем сами.
-	if grep -q "^$1=" "$CONF" 2>/dev/null; then
-		sed -i "s|^$1=.*|$1=$2|" "$CONF" 2>/dev/null || true
+	if grep -Eq "^[[:space:]]*${1}[[:space:]]*=" "$CONF" 2>/dev/null; then
+		sed -i "s|^[[:space:]]*${1}[[:space:]]*=.*|$1=$2|" "$CONF" 2>/dev/null || true
 	else
 		printf '%s=%s\n' "$1" "$2" >>"$CONF"
 	fi
@@ -86,7 +86,7 @@ cfg_set() { # cfg_set <ключ> <значение> <причина>
 # молча ничего не делает, и веб-панель/Xray кажутся «не включёнными».
 ensure_key() { # ensure_key <ключ> <значение>
 	[ -f "$CONF" ] || return 0
-	grep -q "^$1=" "$CONF" 2>/dev/null || printf '%s=%s\n' "$1" "$2" >>"$CONF"
+	grep -Eq "^[[:space:]]*${1}[[:space:]]*=" "$CONF" 2>/dev/null || printf '%s=%s\n' "$1" "$2" >>"$CONF"
 }
 if [ -f "$CONF" ]; then
 	ensure_key web_enable 0
@@ -114,6 +114,9 @@ if [ -f "$CONF" ]; then
 	ensure_key learn_min_bytes 2000
 	ensure_key confirm_min_bytes 512
 	ensure_key learn_strict 0
+	ensure_key stall_confirm 2
+	ensure_key synfail_quorum 3
+	ensure_key synfail_window 120
 	ensure_key precision ""
 	ensure_key cdn_ranges_file /opt/susanin/etc/cdn_ranges.txt
 	ensure_key cdn_ranges_url https://www.cloudflare.com/ips-v4
@@ -151,8 +154,9 @@ if [ -f "$CONF" ]; then
 	ensure_key udp_relay_port 1081
 	ensure_key socks_addr 127.0.0.1
 	ensure_key socks_port 1080
-	ensure_key log_level info
-	ensure_key xray_loglevel warning
+	ensure_key log_level warn
+	ensure_key lang ru
+	ensure_key xray_loglevel error
 	ensure_key egress_failback 1
 	ensure_key egress_failback_debounce 30
 	ensure_key egress_race 0
@@ -167,8 +171,15 @@ if [ -f "$CONF" ]; then
 	ensure_key dns_sniff_iface ""
 	ensure_key dns_hijack 0
 	ensure_key dns_hijack_target ""
+	ensure_key dns_lan 0
+	ensure_key dns_lan_upstream "8.8.8.8,1.1.1.1"
+	ensure_key dns_lan_fallback 1
+	ensure_key dns_lan_smart 1
+	ensure_key sni_sniff 0
 	ensure_key vpn_always_cdn_prefix 0
 	ensure_key pin_reassert 1
+	ensure_key vpin_check 1
+	ensure_key vpin_interval 600
 	ensure_key auto_direct 1
 	ensure_key direct_pref_ttl 3600
 	ensure_key media_enabled 0
@@ -202,7 +213,7 @@ autodetect() {
 	# egress: интерфейса из конфига нет в системе. tproxy — псевдоимя Xray,
 	# его в /sys/class/net не бывает по замыслу (egress_is_tproxy).
 	_eg=$(cfg_val egress_interface)
-	_d_eg=$(printf '%s\n' "$_d" | sed -n 's/^egress_interface=//p' | head -n1)
+	_d_eg=$(printf '%s\n' "$_d" | sed -n 's/^[[:space:]]*egress_interface[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' | tail -n1)
 	if [ -n "$_d_eg" ] && [ "$_eg" != tproxy ]; then
 		if [ -z "$_eg" ] || [ ! -e "/sys/class/net/${_eg%%,*}" ]; then
 			cfg_set egress_interface "$_d_eg" "интерфейса «${_eg:-не задан}» нет"
@@ -211,7 +222,7 @@ autodetect() {
 
 	# lan_interfaces: ни одного живого интерфейса из списка.
 	_la=$(cfg_val lan_interfaces)
-	_d_la=$(printf '%s\n' "$_d" | sed -n 's/^lan_interfaces=//p' | head -n1)
+	_d_la=$(printf '%s\n' "$_d" | sed -n 's/^[[:space:]]*lan_interfaces[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' | tail -n1)
 	if [ -n "$_d_la" ] && [ -n "$_la" ]; then
 		_alive=0
 		for _i in $(printf '%s' "$_la" | tr ',' ' '); do
@@ -294,23 +305,35 @@ fi
 # --- списки: создаём, при обновлении дополняем ------------------------------
 # Дополняем ТОЛЬКО отсутствующими строками: порядок и правки пользователя целы,
 # комментарии из пакета не переносим, перед изменением — один бэкап `.bak`.
+# Строки сверяются по ИМЕНИ без префикса мягкости '?' (vpn_always и vpn_never):
+# «?domain» и «domain» — одна и та же запись, поэтому жёсткий двойник из поставки
+# к мягкой пользовательской строке не дописывается, а форма строки пользователя
+# не меняется. Нормализация та же, что в install.sh/update.sh: без комментариев,
+# пробелов и CR.
 merge_list() { # merge_list <файл пользователя> <файл пакета> <метка>
 	_u="$1"
 	_p="$2"
 	_lbl="$3"
 	[ -f "$_u" ] && [ -f "$_p" ] || return 0
 	_tmp="$_u.merge.$$"
+	_keys="$_u.keys.$$"
 	cp "$_u" "$_tmp" 2>/dev/null || return 0
+	sed 's/#.*//' "$_u" | tr -d ' \t\r' | sed 's/^?//' | grep -v '^$' | sort -u >"$_keys" || true
 	_added=0
 	_hdr=0
 	while IFS= read -r _line; do
-		case "$_line" in '' | '#'*) continue ;; esac
-		grep -qxF "$_line" "$_tmp" 2>/dev/null && continue
+		_e=$(printf '%s' "$_line" | sed 's/#.*//' | tr -d ' \t\r')
+		[ -n "$_e" ] || continue
+		_k="$_e"
+		# Внутри ветки первый символ заведомо '?', поэтому глоб '?' снимает его.
+		case "$_k" in '?'*) _k=${_k#?} ;; esac
+		grep -qxF "$_k" "$_keys" 2>/dev/null && continue
 		if [ "$_hdr" -eq 0 ]; then
 			printf '\n# === добавлено при обновлении пакета (%s) ===\n' "$_lbl" >>"$_tmp"
 			_hdr=1
 		fi
-		printf '%s\n' "$_line" >>"$_tmp"
+		printf '%s\n' "$_e" >>"$_tmp"
+		printf '%s\n' "$_k" >>"$_keys"
 		_added=$((_added + 1))
 	done <"$_p"
 	if [ "$_added" -gt 0 ]; then
@@ -320,6 +343,7 @@ merge_list() { # merge_list <файл пользователя> <файл пак
 	else
 		rm -f "$_tmp"
 	 fi
+	rm -f "$_keys"
 }
 # --keep-lists (установщик): существующие списки не трогаем вовсе, merge не делаем.
 if [ "${SUSANIN_KEEP_LISTS:-0}" = 1 ]; then
@@ -337,7 +361,8 @@ for _l in vpn_always vpn_never; do
 	[ "${SUSANIN_KEEP_LISTS:-0}" = 1 ] && continue
 	merge_list "$PREFIX/etc/$_l.txt" "$SHARE/$_l.txt" "$_l"
 done
-rm -f "$PREFIX/etc/vpn_always.txt".merge.* "$PREFIX/etc/vpn_never.txt".merge.* 2>/dev/null || true
+rm -f "$PREFIX/etc/vpn_always.txt".merge.* "$PREFIX/etc/vpn_never.txt".merge.* \
+	"$PREFIX/etc/vpn_always.txt".keys.* "$PREFIX/etc/vpn_never.txt".keys.* 2>/dev/null || true
 # Бэкапы списков старого формата (<список>.bak-ГГГГММДД-ЧЧММСС): правки через
 # панель плодили десятки копий, теперь бэкап один.
 rm -f "$PREFIX/etc/vpn_always.txt".bak-[0-9]* \
@@ -350,11 +375,36 @@ if [ ! -f "$PREFIX/etc/cdn_ranges.txt" ] && [ -f "$SHARE/cdn_ranges.txt" ]; then
 	say "CDN-диапазоны: $PREFIX/etc/cdn_ranges.txt"
 fi
 
-# --- миграции значений по умолчанию -----------------------------------------
-# promo_per_min: в 0.4.0 дефолт поднят 30 → 120. Меняем ТОЛЬКО прежний дефолт.
-if [ "$(cfg_val promo_per_min)" = "30" ]; then
-	cfg_set promo_per_min 120 "новый дефолт 0.4.0"
+# --- MIGRATION-BEGIN (тест tests/test-installer-sync.sh вырезает этот участок;
+# границы менять только вместе с тестом) ---------------------------------------
+# Миграции значений по умолчанию. Self-contained (только $PREFIX и sed): блок
+# вырезается тестом и исполняется в чистом окружении. Меняем ТОЛЬКО прежние
+# дефолты; уровни, выбранные оператором (debug/trace/quiet/none), остаются.
+# Агент читает log_level при старте движка — нужен restart.
+if [ -f "$PREFIX/etc/susanin.conf" ]; then
+	_pp=$(sed -n "s/^[[:space:]]*promo_per_min[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" \
+	          "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+	if [ "$_pp" = "30" ]; then
+		sed -i "s|^[[:space:]]*promo_per_min[[:space:]]*=.*|promo_per_min=120|" \
+			"$PREFIX/etc/susanin.conf" 2>/dev/null \
+			&& say "promo_per_min: 30 -> 120 (новый дефолт 0.4.0)"
+	fi
+	_ll=$(sed -n "s/^[[:space:]]*log_level[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" \
+	          "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+	if [ "$_ll" = "info" ]; then
+		sed -i "s|^[[:space:]]*log_level[[:space:]]*=.*|log_level=warn|" \
+			"$PREFIX/etc/susanin.conf" 2>/dev/null \
+			&& say "log_level: info -> warn (новый дефолт v0.5.0)"
+	fi
+	_xl=$(sed -n "s/^[[:space:]]*xray_loglevel[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" \
+	          "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+	if [ "$_xl" = "warning" ]; then
+		sed -i "s|^[[:space:]]*xray_loglevel[[:space:]]*=.*|xray_loglevel=error|" \
+			"$PREFIX/etc/susanin.conf" 2>/dev/null \
+			&& say "xray_loglevel: warning -> error (новый дефолт v0.5.0)"
+	fi
 fi
+# --- MIGRATION-END -------------------------------------------------------------
 
 # --- короткий вызов `susanin …` ---------------------------------------------
 if [ -d /opt/bin ] && [ ! -e /opt/bin/susanin ]; then

@@ -67,7 +67,27 @@ CONF_FILE=${SUSANIN_CONF:-/opt/susanin/etc/susanin.conf}
 cfg_val() { # cfg_val <ключ> [значение по умолчанию]
     _v=""
     if [ -r "$CONF_FILE" ]; then
-        _v=$(awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$CONF_FILE" 2>/dev/null || true)
+        # Разбор совпадает с C (config.c: config_line_split): пробелы вокруг '='
+        # допустимы, комментарии пропускаются, а при дубле побеждает ПОСЛЕДНЯЯ
+        # строка. Прежний `$1==k` не видел «key = value» и брал первую строку —
+        # то есть скрипт и агент могли читать один файл по-разному.
+        _v=$(awk -v k="$1" '
+            {
+                l = $0
+                sub(/^[ \t]+/, "", l)
+                if (l == "" || l ~ /^#/) next
+                i = index(l, "=")
+                if (i == 0) next
+                key = substr(l, 1, i - 1)
+                sub(/[ \t]+$/, "", key)
+                if (key != k) next
+                val = substr(l, i + 1)
+                sub(/^[ \t]+/, "", val)
+                sub(/[ \t\r]+$/, "", val)
+                got = val
+            }
+            END { if (got != "") print got }
+        ' "$CONF_FILE" 2>/dev/null || true)
     fi
     if [ -n "$_v" ]; then printf '%s' "$_v"; else printf '%s' "${2:-}"; fi
 }
@@ -89,6 +109,7 @@ LAN=$(printf '%s' "$LAN" | tr ',' ' ')
 [ -n "${SUSANIN_MSS_CLAMP_LAN:-}" ]  || MSS_CLAMP_LAN=$(cfg_val mss_clamp_lan "$MSS_CLAMP_LAN")
 [ -n "${SUSANIN_DNS_HIJACK:-}" ]     || DNS_HIJACK=$(cfg_val dns_hijack "$DNS_HIJACK")
 [ -n "${SUSANIN_DNS_HIJACK_TARGET:-}" ] || DNS_HIJACK_TARGET=$(cfg_val dns_hijack_target "$DNS_HIJACK_TARGET")
+[ -n "${SUSANIN_DNS_LAN:-}" ]        && DNS_LAN="$SUSANIN_DNS_LAN" || DNS_LAN=$(cfg_val dns_lan 0)
 # Порты демон выставляет только когда режим включён — повторяем ту же логику.
 if [ -z "${SUSANIN_TPROXY_PORT:-}" ]; then
     if [ "$(cfg_val egress_type interface)" = "tproxy" ]; then
@@ -657,6 +678,177 @@ dns_hijack_clean() {
         done || true
 }
 
+# DNS клиентов LAN через туннель (dns_lan=1): DNAT 53 на локальный форвардер
+# агента (порт 5399). Так ответы приходят из туннеля, а не с прямого пути, где
+# провайдер подменяет/фильтрует DNS. Правила живут в отдельных цепях — искать и
+# снимать их можно по имени цепи, без -m comment (на части прошивок его нет).
+DNS_LAN_PORT=5399
+DNS_LAN_CHAIN=SUSANIN_DNSLAN
+DNS_LAN_IN_CHAIN=SUSANIN_DNSLAN_IN
+DNS_LAN_PRIVATE="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8"
+# Сторож правил: снимает DNAT, если форвардер агента перестал слушать порт.
+# Иначе смерть агента при живом роутере оставляет весь LAN без DNS.
+TOOLS=${SUSANIN_TOOLS:-/opt/susanin/tools}
+DNS_LAN_GUARD=/opt/susanin/var/dnslan-guard.pid
+
+_dns_lan_ifaces() {
+    _out=""
+    for _i in $LAN; do
+        case "$_i" in
+            br*|eth*|ra*|wlan*|bond*) ;;
+            *) continue ;;
+        esac
+        case " $_out " in
+            *" $_i "*) ;;
+            *) _out="$_out $_i" ;;
+        esac
+    done
+    printf '%s' "$_out" | sed 's/^ *//'
+}
+
+_dns_lan_dest() {
+    for _i in $(_dns_lan_ifaces); do
+        _a=$("$IPCMD" -4 -o addr show dev "$_i" 2>/dev/null | \
+             awk '$3 == "inet" { sub(/\/.*/, "", $4); print $4; exit }')
+        [ -n "$_a" ] && { printf '%s:%d' "$_a" "$DNS_LAN_PORT"; return 0; }
+    done
+    return 0
+}
+
+dns_lan_clean() {
+    _dnslan_guard_stop
+    while "ipt" -t nat -D PREROUTING -j "$DNS_LAN_CHAIN" >/dev/null 2>&1; do :; done
+    "ipt" -t nat -F "$DNS_LAN_CHAIN" >/dev/null 2>&1 || true
+    "ipt" -t nat -X "$DNS_LAN_CHAIN" >/dev/null 2>&1 || true
+    while "ipt" -t filter -D INPUT -j "$DNS_LAN_IN_CHAIN" >/dev/null 2>&1; do :; done
+    "ipt" -t filter -F "$DNS_LAN_IN_CHAIN" >/dev/null 2>&1 || true
+    "ipt" -t filter -X "$DNS_LAN_IN_CHAIN" >/dev/null 2>&1 || true
+}
+
+_dnslan_guard_pid() {
+    cat "$DNS_LAN_GUARD" 2>/dev/null || true
+}
+
+_dns_lan_guard_alive() {
+    _gp=$(_dnslan_guard_pid)
+    [ -n "$_gp" ] && kill -0 "$_gp" 2>/dev/null
+}
+
+_dnslan_guard_stop() {
+    _gp=$(_dnslan_guard_pid)
+    [ -n "$_gp" ] || return 0
+    rm -f "$DNS_LAN_GUARD"
+    # Сторож сам вызывает dns-lan-down: себя не убиваем, он выйдет сам.
+    if [ "${SUSANIN_DNSLAN_GUARD_PID:-}" = "$_gp" ]; then return 0; fi
+    kill -TERM "$_gp" 2>/dev/null || true
+}
+
+_dnslan_guard_start() {
+    _dns_lan_guard_alive && return 0
+    rm -f "$DNS_LAN_GUARD"
+    [ -f "$TOOLS/dnslan-guard.sh" ] || return 0
+    # Отвязанный процесс: все fd — на /dev/null, иначе агент, читающий вывод
+    # datapath.sh через pipe, будет ждать EOF от сторожа.
+    SUSANIN_TOOLS="$TOOLS" SUSANIN_DNS_LAN_PORT="$DNS_LAN_PORT" \
+        sh "$TOOLS/dnslan-guard.sh" </dev/null >/dev/null 2>&1 &
+}
+
+_dns_lan_socket_inode() {
+    _hex=$(printf '%04X' "$DNS_LAN_PORT")
+    awk -v p=":$_hex" '$2 ~ p"$" && $4 == "07" { print $10; exit }' /proc/net/udp 2>/dev/null
+}
+
+# Слушает именно агент? Порт мог остаться у процесса, унаследовавшего сокет
+# (Xray запускается агентом через exec): тогда новый агент не может забиндиться,
+# форвардер молчит, а DNAT слал бы DNS клиентов в мёртвый сокет — правила при
+# этом выглядят исправными, потому что порт «слушается».
+_dns_lan_owned_by_agent() {
+    _ino=$(_dns_lan_socket_inode)
+    [ -n "$_ino" ] || return 1
+    _ap=$(cat /opt/susanin/var/susanin-agent.pid 2>/dev/null || true)
+    [ -n "$_ap" ] || return 0        # pid-файла нет — судить не по чему
+    kill -0 "$_ap" 2>/dev/null || return 0
+    for _f in /proc/"$_ap"/fd/*; do
+        [ "$(readlink "$_f" 2>/dev/null)" = "socket:[$_ino]" ] || continue
+        return 0
+    done
+    return 1
+}
+
+_dns_lan_listening() {
+    [ -n "$(_dns_lan_socket_inode)" ] || return 1
+    _dns_lan_owned_by_agent
+}
+
+dns_lan_rules() {
+    dns_lan_clean
+    [ "$DNS_LAN" = "1" ] || return 0
+    # DNAT на мёртвый форвардер = DNS у всех клиентов. Поэтому ставим правила
+    # только если агент уже слушает порт.
+    if ! _dns_lan_listening; then
+        if [ -n "$(_dns_lan_socket_inode)" ]; then
+            say "dns_lan: порт $DNS_LAN_PORT слушает НЕ агент (унаследован Xray?) — DNAT не ставлю; нужен перезапуск Xray/агента"
+        else
+            say "dns_lan: форвардер не слушает порт $DNS_LAN_PORT — DNAT не ставлю"
+        fi
+        return 0
+    fi
+    _dst=$(_dns_lan_dest)
+    _ifaces=$(_dns_lan_ifaces)
+    if [ -z "$_dst" ] || [ -z "$_ifaces" ]; then
+        say "dns_lan=1, но не нашёл LAN-адрес/интерфейсы — DNS клиентов не трогаю"
+        return 0
+    fi
+    if ! _msg=$("ipt" -t nat -N "$DNS_LAN_CHAIN" 2>&1); then
+        say "dns_lan: цепь $DNS_LAN_CHAIN не создана: ${_msg:-неизвестная ошибка}"
+        return 0
+    fi
+    # Роутер обычно и есть «приватное назначение» (192.168.x.x): его сеть из
+    # исключений убираем, иначе RETURN выше DNAT съедал все запросы клиентов.
+    _dstip=${_dst%:*}
+    case "$_dstip" in
+        10.*) _skip_net="10.0.0.0/8" ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) _skip_net="172.16.0.0/12" ;;
+        192.168.*) _skip_net="192.168.0.0/16" ;;
+        *) _skip_net="" ;;
+    esac
+    _n=0
+    _err=""
+    for _i in $_ifaces; do
+        # Приватные назначения не перехватываем: RETURN должен стоять выше DNAT.
+        for _net in $DNS_LAN_PRIVATE; do
+            [ "$_net" = "$_skip_net" ] && continue
+            "ipt" -t nat -A "$DNS_LAN_CHAIN" -i "$_i" -p udp --dport 53 \
+                -d "$_net" -j RETURN >/dev/null 2>&1 || true
+        done
+        if _msg=$("ipt" -t nat -A "$DNS_LAN_CHAIN" -i "$_i" -p udp --dport 53 \
+                -j DNAT --to-destination "$_dst" 2>&1); then
+            _n=$((_n + 1))
+        else
+            [ -n "$_err" ] || _err="$_msg"
+        fi
+    done
+    if [ "$_n" -gt 0 ]; then
+        "ipt" -t nat -I PREROUTING 1 -j "$DNS_LAN_CHAIN" >/dev/null 2>&1 || true
+    fi
+    # Порт форвардера — только из LAN, снаружи закрыт.
+    if "ipt" -t filter -N "$DNS_LAN_IN_CHAIN" >/dev/null 2>&1; then
+        for _i in $_ifaces; do
+            "ipt" -t filter -A "$DNS_LAN_IN_CHAIN" -i "$_i" -p udp \
+                --dport "$DNS_LAN_PORT" -j ACCEPT >/dev/null 2>&1 || true
+        done
+        "ipt" -t filter -A "$DNS_LAN_IN_CHAIN" -p udp --dport "$DNS_LAN_PORT" \
+            -j DROP >/dev/null 2>&1 || true
+        "ipt" -t filter -I INPUT 1 -j "$DNS_LAN_IN_CHAIN" >/dev/null 2>&1 || true
+    fi
+    if [ "$_n" -gt 0 ]; then
+        say "dns_lan: DNS клиентов ($_ifaces) -> $_dst через туннель (правил: $_n)"
+        _dnslan_guard_start
+    else
+        say "dns_lan=1, но правила не добавлены: ${_err:-неизвестная ошибка}"
+    fi
+}
+
 dns_hijack_rules() {
     dns_hijack_clean
     [ "$DNS_HIJACK" = "1" ] || return 0
@@ -714,6 +906,7 @@ command_up() {
     ensure_table
     forward_accept_rules
     dns_hijack_rules
+    dns_lan_rules
     ipv6_block_rules
     quic_block_rules
     mss_clamp_rules
@@ -739,6 +932,7 @@ command_down() {
     tproxy_clean || true
     forward_accept_clean || true
     dns_hijack_clean || true
+    dns_lan_clean || true
     ipv6_block_clean || true
     quic_block_clean || true
     mss_clamp_clean || true
@@ -793,6 +987,19 @@ command_status() {
         echo "dns_hijack: 0 в конфиге, но наши правила DNAT 53 остались ($_dh) — снимутся при следующем up/down"
     else
         echo "dns_hijack: off"
+    fi
+    _dl=$("ipt" -t nat -S "$DNS_LAN_CHAIN" 2>/dev/null | grep -c '^-A' || true)
+    if [ "$DNS_LAN" = "1" ]; then
+        echo "dns_lan: on (клиенты LAN -> $(_dns_lan_dest); правил=$_dl)"
+        if _dns_lan_guard_alive; then
+            echo "dns_lan guard: on (pid=$(_dnslan_guard_pid))"
+        else
+            echo "dns_lan guard: НЕ запущен (при смерти агента DNAT останется — DNS клиентов пропадёт)"
+        fi
+    elif [ "${_dl:-0}" -gt 0 ] 2>/dev/null; then
+        echo "dns_lan: 0 в конфиге, но правила остались ($_dl) — снимутся при следующем up/down"
+    else
+        echo "dns_lan: off"
     fi
     if [ "${TPROXY_PORT:-0}" -gt 0 ] 2>/dev/null; then
         n=$("ipt" -t nat -S PREROUTING 2>/dev/null | grep -c 'REDIRECT --to-ports' || true)
@@ -911,12 +1118,21 @@ case "${1:-}" in
         ;;
     down) command_down ;;
     status) command_status ;;
+    # DNS клиентов отдельно от остального датаплейна: сторож снимает только эти
+    # две цепи, не трогая tproxy/ipset.
+    dns-lan-up) dns_lan_rules ;;
+    dns-lan-down) dns_lan_clean ;;
+    dns-lan-status)
+        _dl=$("ipt" -t nat -S "$DNS_LAN_CHAIN" 2>/dev/null | grep -c '^-A' || true)
+        echo "dns_lan: rules=${_dl:-0} guard=$(_dns_lan_guard_alive && echo on || echo off)"
+        [ "${_dl:-0}" -gt 0 ] 2>/dev/null
+        ;;
     flush) command_flush ;;
     egress) command_egress "${2:-}" ;;
     add) command_add "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     del) command_del "${2:-}" "${3:-}" "${4:-}" ;;
     *)
-        echo "usage: $0 {up|down|status|flush|egress <iface>|add <ip> [<port>] <tcp|udp> <test|ok>|del <ip> [<port>] <tcp|udp>}" >&2
+        echo "usage: $0 {up|down|status|flush|egress <iface>|dns-lan-up|dns-lan-down|dns-lan-status|add <ip> [<port>] <tcp|udp> <test|ok>|del <ip> [<port>] <tcp|udp>}" >&2
         echo "  (порт обязателен при SUSANIN_PORT_AWARE=1; ok_net/never/direct всегда по адресу)" >&2
         exit 2 ;;
 esac

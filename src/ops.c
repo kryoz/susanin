@@ -3,11 +3,14 @@
 #include "backend.h"
 #include "cdn.h"
 #include "classifier.h"
+#include "dns_lan.h"
+#include "dns_sniff.h"
 #include "log.h"
 #include "release.h"
 #include "state.h"
 #include "vpn_always.h"
 #include "vpn_never.h"
+#include "vpin.h"
 #include "version.h"
 
 #include <arpa/inet.h>
@@ -68,7 +71,7 @@ static int run_capture(const char *exe, char *const argv[], char *out, size_t ou
         dup2(p[1], 1);
         if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
         close(p[1]);
-        execv(exe, argv);
+        execvp(exe, argv);
         _exit(127);
     }
     close(p[1]);
@@ -77,7 +80,7 @@ static int run_capture(const char *exe, char *const argv[], char *out, size_t ou
         ssize_t r;
         while ((r = read(p[0], tmp, sizeof(tmp))) > 0) {
             size_t take = (size_t)r;
-            if (n < outsz - 1) {
+            if (outsz > 1 && n < outsz - 1) {
                 size_t room = outsz - 1 - n;
                 if (take > room)
                     take = room;
@@ -151,7 +154,7 @@ static int cap_count_digits(const char *exe, char *const argv[])
         dup2(p[1], 1);
         if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
         close(p[1]);
-        execv(exe, argv);
+        execvp(exe, argv);
         _exit(127);
     }
     close(p[1]);
@@ -269,6 +272,37 @@ static int dp_actual_tproxy(const char *ipt, const char *ip,
     return cap_contains(ipt, a, "--to-ports");
 }
 
+/* Снимок счётчиков снифера: движок пишет его в путь, зависящий от disk_mode
+ * (в soft — tmpfs, чтобы не трогать носитель). Читаем сначала путь текущего
+ * режима, затем второй: файл мог остаться от запуска с другим режимом.
+ * Возврат 1 — строка прочитана и обрезана от переводов строки. */
+static int sniff_snapshot(const susanin_config *cfg, char *out, size_t n)
+{
+    const char *paths[2];
+    int i;
+
+    if (!out || n == 0)
+        return 0;
+    out[0] = '\0';
+    paths[0] = dns_sniff_stats_path(cfg);
+    paths[1] = !strcmp(paths[0], DNS_SNIFF_STATS_FILE)
+                   ? DNS_SNIFF_SOFT_STATS_FILE : DNS_SNIFF_STATS_FILE;
+    for (i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f)
+            continue;
+        if (fgets(out, (int)n, f)) {
+            size_t l = strlen(out);
+            while (l && (out[l - 1] == '\n' || out[l - 1] == '\r'))
+                out[--l] = '\0';
+        }
+        fclose(f);
+        if (out[0])
+            return 1;
+    }
+    return 0;
+}
+
 int ops_status(const susanin_config *cfg, const char *conf_path)
 {
     const char *ipt = tool("iptables");
@@ -311,6 +345,59 @@ int ops_status(const susanin_config *cfg, const char *conf_path)
            cfg->kernel_egress[0] ? cfg->kernel_egress : "-",
            cfg->pin_reassert, cfg->xray_watchdog, cfg->auto_direct,
            cfg->media_enabled);
+    {
+        /* Очередь и счётчики решений живут в памяти движка, а `status` —
+         * отдельный процесс: читаем снимок (тот же путь, что и со счётчиками
+         * dns_sniff). Первая строка снимка — готовая строка статуса. */
+        char vp[512] = "";
+        FILE *vf = fopen(VPIN_STATS_FILE, "r");
+        if (vf) {
+            if (fgets(vp, sizeof(vp), vf)) {
+                size_t l = strlen(vp);
+                while (l && (vp[l - 1] == '\n' || vp[l - 1] == '\r'))
+                    vp[--l] = '\0';
+            }
+            fclose(vf);
+        }
+        if (vp[0])
+            printf("%s\n", vp);
+        else
+            printf("vpin: check=%d interval=%ds (снимка нет — цикл аудита "
+                   "не отработал или disk_mode=soft)\n",
+                   cfg->vpin_check, cfg->vpin_interval);
+    }
+    if (cfg->dns_sniff || cfg->sni_sniff) {
+        /* Снимок пишет движок: счётчики живут в его памяти, а этот процесс —
+         * отдельный, и наивно читать их у себя. Путь зависит от disk_mode
+         * (в soft движок пишет в tmpfs), поэтому снимок ищется по обоим
+         * путям. Строка сводки длинная (разбивка по интерфейсам) — буфер с
+         * запасом. */
+        char sl[512] = "";
+        if (sniff_snapshot(cfg, sl, sizeof(sl)))
+            printf("dns_sniff: %s\n", sl);
+        else
+            printf("dns_sniff: (снимка нет — цикл снифера ещё не отработал; "
+                   "при read-only носителе запись снимка невозможна)\n");
+        {
+            char dl[192] = "";
+            FILE *dlf = fopen(dns_lan_state_path(cfg), "r");
+
+            if (dlf) {
+                if (fgets(dl, (int)sizeof(dl), dlf)) {
+                    size_t l = strlen(dl);
+                    while (l && (dl[l - 1] == '\n' || dl[l - 1] == '\r'))
+                        dl[--l] = '\0';
+                }
+                fclose(dlf);
+            }
+            if (dl[0])
+                printf("dns_lan: %s\n", dl);
+            else if (cfg->dns_lan)
+                printf("dns_lan: (снимка нет — цикл ещё не отработал)\n");
+            else
+                printf("dns_lan: off (dns_lan=0)\n");
+        }
+    }
     if (cfg->port_aware)
         printf("port_aware=1 (экспериментально): ok/test — пары ip:port (матч dst,dst); "
                "ok_net/never/direct — по адресу. Наборы занимают больше памяти — "
@@ -528,7 +615,7 @@ int ops_reset(const susanin_config *cfg, const char *arg)
         /* reset/forget НЕ снимает «напрямую»: иначе адрес из vpn_never снова
          * уедет в VPN при обучении. Удаляем только кэш обучения и покрывающие
          * префиксы (нормальная pin-запись списка остаётся в наборе). */
-        reset_covering_nets(cfg, &st, ips[i]);
+        removed += reset_covering_nets(cfg, &st, ips[i]);
         backend_ct_flush_ip(ips[i]);
         printf("[susanin] reset %s%s: %s removed=%d, ipsets cleared, conntrack flushed\n",
                zone ? "zone " : "", arg, ips[i], removed);
@@ -664,6 +751,34 @@ int ops_complain(const susanin_config *cfg, const char *arg)
         vn_free(vn);
     return 0;
 }
+/* Стоит ли адрес в очереди аудита пинов — по снимку движка (строки
+ * "q <ip> <vpn|direct> <port>"). Геттеры vpin_* в этом процессе вернули бы
+ * пустую очередь: `why` — отдельный процесс, очередь живёт в движке. */
+static const char *vpin_queue_of(const char *ip)
+{
+    static const char *res[3] = {
+        "нет в очереди",
+        "ЕСТЬ (проверяется путь через туннель)",
+        "ЕСТЬ (проверяется возврат на прямой путь)"
+    };
+    FILE *f = fopen(VPIN_STATS_FILE, "r");
+    char ln[128];
+    int found = 0;
+
+    while (f && fgets(ln, sizeof(ln), f)) {
+        char qip[16], qs[16];
+        unsigned qp;
+        if (sscanf(ln, "q %15s %15s %u", qip, qs, &qp) == 3 &&
+            strcmp(qip, ip) == 0) {
+            found = qs[0] == 'v' ? 1 : 2;
+            break;
+        }
+    }
+    if (f)
+        fclose(f);
+    return res[found];
+}
+
 /* `susanin why <ip|domain>` — почему адрес маршрутизируется так, а не иначе:
  * какая запись списка его накрывает, в каких наборах и кэшах он лежит.
  * (поиск «почему адрес не учится» занял два часа, потому что
@@ -740,6 +855,17 @@ int ops_why(const susanin_config *cfg, const char *arg)
     stv_never = state_has(&st.never, ip, now);
     state_free(&st);
     printf("  state ok/never: %s/%s\n", stv_ok ? "ЕСТЬ" : "нет", stv_never ? "ЕСТЬ" : "нет");
+    printf("  vpin-аудит: %s\n", vpin_queue_of(ip));
+    if (cfg->dns_sniff || cfg->sni_sniff) {
+        /* Сводка снифера рядом с выводом по адресу: в disk_mode=soft журнала
+         * нет, и снимок движка — единственный способ увидеть, доходит ли
+         * DNS-разбор до таблицы (имена счётчиков — в справке `status`). */
+        char sn[512] = "";
+        if (sniff_snapshot(cfg, sn, sizeof(sn)))
+            printf("  dns_sniff: %s\n", sn);
+        else
+            printf("  dns_sniff: (снимка счётчиков нет)\n");
+    }
 
     printf("  вывод: ");
     if (in_never || in_direct || stv_never)
@@ -842,7 +968,7 @@ static void json_str(char *dst, size_t n, const char *s)
     size_t j = 0;
     if (!n)
         return;
-    for (; s && *s && j + 7 < n; s++) {
+    for (; s && *s && j + 6 < n; s++) {
         unsigned char c = (unsigned char)*s;
         if (c == '"' || c == '\\') {
             dst[j++] = '\\';
@@ -967,7 +1093,7 @@ int ops_status_json(const susanin_config *cfg, const char *conf_path,
              rcnt, esc);
     }
 
-    /* r7.5: носитель только для чтения (смерть флешки/сбойjournal) — агент
+    /* r7.5: носитель только для чтения (смерть флешки/сбой journal) — агент
      * не может писать pid/лог/state; в панели это должно быть видно сразу. */
     japp(buf, n, &used, "\"storage_ro\":%s,",
          access("/opt/susanin/var", W_OK) == 0 ? "false" : "true");
@@ -1035,33 +1161,29 @@ int ops_config_json(const susanin_config *cfg, const char *conf_path, char *buf,
     fp = conf_path ? fopen(conf_path, "r") : NULL;
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
-            char *eq, *p, *q;
-            size_t l;
-            l = strlen(line);
-            while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r' ||
-                             line[l - 1] == ' ' || line[l - 1] == '\t'))
-                line[--l] = '\0';
-            p = line;
-            while (*p == ' ' || *p == '\t')
-                p++;
-            if (*p == '\0' || *p == '#')
+            char kk[96], ke[256], ve[2048];
+            char *q = NULL;
+            const char *k = kk, *v = "";
+
+            /* Разбор общий с агентом (config_line_split). Собственная
+             * укороченная версия здесь оставляла пробел в имени ключа, и для
+             * строки «web_token = SECRET» сравнение с "web_token" не срабатывало
+             * — секрет ушел бы в JSON панели открытым текстом. */
+            if (config_line_split(line, kk, sizeof(kk), &q) != 0)
                 continue;
-            eq = strchr(p, '=');
-            if (!eq)
-                continue;
-            *eq = '\0';
-            q = eq + 1;
-            {
-                char ke[256], ve[2048];
-                const char *k = p;
-                const char *v = q;
-                if (!strcmp(k, "web_token"))
-                    v = "";  /* секрет не отдаём */
-                json_str(ke, sizeof(ke), k);
-                json_str(ve, sizeof(ve), v);
-                japp(buf, n, &used, "%s\"%s\":\"%s\"", first ? "" : ",", ke, ve);
-                first = 0;
+            if (q) {
+                size_t l;
+                v = q;
+                l = strlen(v);
+                while (l && (v[l - 1] == '\n' || v[l - 1] == '\r'))
+                    ((char *)v)[--l] = '\0';
             }
+            if (!strcmp(k, "web_token"))
+                v = "";  /* секрет не отдаём */
+            json_str(ke, sizeof(ke), k);
+            json_str(ve, sizeof(ve), v);
+            japp(buf, n, &used, "%s\"%s\":\"%s\"", first ? "" : ",", ke, ve);
+            first = 0;
         }
         fclose(fp);
     }

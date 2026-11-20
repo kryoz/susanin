@@ -4,19 +4,23 @@
 #include "cdn.h"
 #include "classifier.h"
 #include "conntrack.h"
+#include "dns_lan.h"
 #include "dns_sniff.h"
 #include "health.h"
+#include "lang.h"
 #include "log.h"
 #include "release.h"
 #include "state.h"
 #include "udp_relay.h"
 #include "vpn_always.h"
 #include "vpn_never.h"
+#include "vpin.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -143,6 +147,11 @@ static void clients_audit(const susanin_config *cfg, const ct_flow *flows, int n
     int tot[32], vpn[32], dir[32];
     int cnt = 0, i, j, used = 0;
     FILE *f;
+
+    /* Пустой список — это тоже результат: ниже body сравнивается с прошлым
+     * значением через strcmp, и без инициализации он читал мусор стека
+     * (а при cnt == 0 цикл записи ни разу не выполнялся). */
+    body[0] = '\0';
     if (now - last < 15)
         return;
     last = now;
@@ -154,22 +163,22 @@ static void clients_audit(const susanin_config *cfg, const ct_flow *flows, int n
             if (fl->src4 && clf_is_private4(fl->src4)) {
                 char u24[20];
                 char *dot3;
-                int j;
+                int jj;
                 snprintf(u24, sizeof(u24), "%s", fl->src);
                 dot3 = strrchr(u24, '.');
                 if (dot3) {
                     dot3[1] = '0';
                     dot3[2] = '\0';
                 }
-                for (j = 0; j < unc_n; j++)
-                    if (!strcmp(unc[j], u24))
+                for (jj = 0; jj < unc_n; jj++)
+                    if (!strcmp(unc[jj], u24))
                         break;
-                if (j == unc_n && j < 8) {
-                    snprintf(unc[j], sizeof(unc[j]), "%s", u24);
+                if (jj == unc_n && jj < 8) {
+                    snprintf(unc[jj], sizeof(unc[jj]), "%s", u24);
                     unc_n++;
                 }
-                if (j < unc_n && now - unc_at[j] >= 3600) {
-                    unc_at[j] = now;
+                if (jj < unc_n && now - unc_at[jj] >= 3600) {
+                    unc_at[jj] = now;
                     slogf(SL_INFO, "AUTO-SUSANIN: подсеть %s — потоки из LAN, "
                           "не покрытой lan_subnets (клиенты там не обрабатываются; "
                           "добавьте подсеть в lan_subnets)", u24);
@@ -487,7 +496,7 @@ static void probe_job_start(const susanin_config *cfg, int n)
              * fail-open/failover-механизм. */
             char buf[512], *save = NULL, *tok;
             int ok = 0, total = 0, lat = 0, naddr = 0;
-            int port = cfg->health_tcp_port > 0 ? cfg->health_tcp_port : 443;
+            int port = cfg->health_tcp_port > 0 ? cfg->health_tcp_port : CFG_DEF_HEALTH_TCP_PORT;
             struct timespec t0, t1;
             snprintf(buf, sizeof(buf), "%s", cfg->health_probe);
             clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -526,7 +535,7 @@ static void probe_job_start(const susanin_config *cfg, int n)
                 /* Резервный путь через Xray: проверяем апстрим по SOCKS. */
                 char pb[512], *save = NULL, *tok;
                 int naddr = 0;
-                int tport = cfg->health_tcp_port > 0 ? cfg->health_tcp_port : 443;
+                int tport = cfg->health_tcp_port > 0 ? cfg->health_tcp_port : CFG_DEF_HEALTH_TCP_PORT;
                 clock_gettime(CLOCK_MONOTONIC, &t0);
                 snprintf(pb, sizeof(pb), "%s", cfg->health_probe);
                 for (tok = strtok_r(pb, ",", &save); tok && naddr < 3;
@@ -564,7 +573,7 @@ static void probe_job_start(const susanin_config *cfg, int n)
                                             cfg->health_tcp_port)) {
                     slogf(SL_DEBUG, "health %s: ICMP 0/%d, TCP %d — считаю живым",
                           cfg->egress_list[i], total,
-                          cfg->health_tcp_port > 0 ? cfg->health_tcp_port : 443);
+                          cfg->health_tcp_port > 0 ? cfg->health_tcp_port : CFG_DEF_HEALTH_TCP_PORT);
                     ok = total;
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -630,6 +639,328 @@ static void probe_job_poll(const susanin_config *cfg, int *up, int *miss,
             pj_pid = 0;
         }
     }
+}
+
+/* --- Аудит пинов, поставленных автообучением (VPIN) ----------------------
+ * Автообучение уводит адрес в VPN по одной улике (FAST-детект «SYN без
+ * ответа»/DPI-сигнал) и дальше не проверяет, что через туннель адрес вообще
+ * работает. На живых кейсах это давало «залипшие» адреса: прямой путь живой,
+ * туннель до адреса мёртв или в разы медленнее — а трафик идёт через VPN,
+ * потому что пин стоит и сам не снимется (D1 откладывает возврат на час).
+ *
+ * Здесь: адрес, выученный классификатором (vpin_note), через vpin_interval
+ * проверяется ЧЕРЕЗ ТУННЕЛЬ — на тот же порт, куда ходил подтверждающий
+ * поток. Не отвечает два промаха подряд или медленнее VPIN_SLOW_MS — пин
+ * снимается, адрес уходит напрямую с мягким «прямо» (susanin_direct),
+ * чтобы не выучиться обратно тем же FAST-детектом. «Пробовать нечем»
+ * (Xray лёг, SOCKS не слушает) промахом не считается: иначе рестарт Xray
+ * снимал бы пины пачкой. Если туннель хорош —
+ * адрес остаётся в VPN и позже (через два интервала) проверяется, не ожил ли
+ * прямой путь: тогда пин снимается уже по хорошей новости.
+ *
+ * Ручные пины vpn_always сюда не попадают: vpin_note() зовёт только
+ * классификатор, у ручных пинов другой путь. */
+#define VPIN_TIMEOUT_MS 2500
+#define VPIN_SLOW_MS    1800
+#define VPIN_BATCH      4
+/* Запасной порт пробы, если поток-улика не оставил порт (0 в слоте). */
+#define VPIN_PROBE_FALLBACK_PORT 443
+/* Одно измерение не решает судьбу пина: снимаем только после двух промахов
+ * подряд (первый мог быть transient), перепроверка — через половину
+ * интервала, но не чаще раза в 30 с. */
+#define VPIN_FAILS_TO_UNPIN 2
+#define VPIN_RETRY_MIN_S    30
+/* Q_DIRECT: трижды «прямой мёртв» подряд — адрес, видимо, легитимно живёт
+ * только в VPN; снимаем слот из аудита, иначе проверка прямого пути
+ * перезапускалась бы вечно (постоянные fork'и). */
+#define VPIN_DIRECT_MAXFAIL 3
+
+/* Состояния пробы: 0 = адрес не отвечает, 1 = отвечает, 2 = мерить нечем
+ * (SOCKS не слушает / датаплейн вниз). На «2» родитель ничего не снимает —
+ * это состояние инфраструктуры, а не адреса. */
+enum { VPIN_PROBE_DEAD = 0, VPIN_PROBE_OK = 1, VPIN_PROBE_NA = 2 };
+
+static pid_t vq_pid = 0;
+static int vq_fd = -1;
+static time_t vq_start = 0;
+static char vq_buf[1024];
+static size_t vq_len = 0;
+
+static int vq_retry_iv(const susanin_config *cfg)
+{
+    int iv = cfg->vpin_interval / 2;
+    return iv > VPIN_RETRY_MIN_S ? iv : VPIN_RETRY_MIN_S;
+}
+
+static void vq_stop(void);   /* defined below; нужен выключению аудита в vq_tick */
+
+/* Снять пин и вернуть адрес на прямой путь мягко (susanin_direct). */
+static void vq_unpin(susanin_state *stp, const susanin_config *cfg, const char *ip, time_t now)
+{
+    int udp;
+    for (udp = 0; udp < 2; udp++) {
+        state_remove(st_ok(stp, udp), ip);
+        state_remove(st_test(stp, udp), ip);
+        backend_ipset_del(cfg, udp, 0, ip);
+        backend_ipset_del(cfg, udp, 1, ip);
+    }
+    /* Живые соединения держат старую метку: без сброса долгоживущий сокет
+     * (WebSocket/pull) остался бы на мёртвом пути до собственного таймаута. */
+    backend_ct_flush_ip(ip);
+    if (cfg->direct_pref_ttl > 0) {
+        backend_set_add(cfg, "susanin_direct", ip, cfg->direct_pref_ttl);
+        state_add(&stp->direct, ip, now, cfg->direct_pref_ttl, 0);
+    }
+}
+
+/* Вердикт привязан к адресу и запрошенному состоянию, а не к индексу слота:
+ * между fork пробы и сбором результатов слот могли вытеснить новым адресом
+ * (очередь конечна), и прежнее «применить к idx» снимало бы чужой пин.
+ * Слот не найден или состояние сменилось — вердикт отбрасываем в skip. */
+static void vq_apply(susanin_state *stp, const susanin_config *cfg,
+                     const char *ip, int state, int ok, int lat, time_t now)
+{
+    int i = vpin_find(ip, state);
+    int nf;
+
+    if (i < 0) {
+        vpin_bump(3);
+        return;
+    }
+    if (state == VPIN_Q_VPN) {
+        if (ok == VPIN_PROBE_NA) {
+            /* Мерить было нечем (Xray лёг / SOCKS не слушает / датаплейн
+             * вниз): это не новость про адрес. Снимаем только «срок проверки
+             * просрочен», никаких снятий пина. */
+            vpin_bump(3);
+            vpin_set(i, VPIN_Q_VPN, now);
+            return;
+        }
+        if (ok == VPIN_PROBE_OK && lat <= VPIN_SLOW_MS) {
+            vpin_set(i, VPIN_Q_DIRECT, now);
+            return;
+        }
+        nf = vpin_fail(i, now, vq_retry_iv(cfg));
+        if (nf < VPIN_FAILS_TO_UNPIN) {
+            slogf(SL_DEBUG, "VPIN: %s — %s через туннель (%d мс), промах %d/%d, "
+                  "перепроверка через %d с", ip,
+                  ok == VPIN_PROBE_OK ? "медленно" : "нет ответа", lat, nf,
+                  VPIN_FAILS_TO_UNPIN, vq_retry_iv(cfg));
+            return;
+        }
+        /* Снятие пина — решение с трафик-эффектом: при дефолтном
+         * log_level=warn оно обязано быть видно в логе. */
+        vpin_bump(ok == VPIN_PROBE_OK ? 1 : 0);
+        slogf(SL_WARN, "VPIN: %s — %s через туннель (%d мс), два промаха подряд, "
+              "возвращаю напрямую", ip,
+              ok == VPIN_PROBE_OK ? "медленно" : "нет ответа", lat);
+        vq_unpin(stp, cfg, ip, now);
+        vpin_free_idx(i);
+        return;
+    }
+    /* Q_DIRECT: ожил ли прямой путь. */
+    if (ok == VPIN_PROBE_NA) {
+        vpin_bump(3);
+        vpin_set(i, VPIN_Q_DIRECT, now);
+        return;
+    }
+    if (ok == VPIN_PROBE_OK) {
+        vpin_bump(2);
+        slogf(SL_WARN, "VPIN: %s — прямой путь снова жив, снимаю VPN-пин", ip);
+        vq_unpin(stp, cfg, ip, now);
+        vpin_free_idx(i);
+        return;
+    }
+    nf = vpin_fail(i, now, 0);
+    if (nf >= VPIN_DIRECT_MAXFAIL) {
+        /* Прямой стабильно мёртв: адрес легитимно живёт только в VPN,
+         * бессмысленно вечно перезапускать пробы. */
+        slogf(SL_DEBUG, "VPIN: %s — прямой мёртв %d раз подряд, снимаю с аудита",
+              ip, nf);
+        vpin_free_idx(i);
+    }
+}
+
+static void vq_collect(susanin_state *stp, const susanin_config *cfg, time_t now)
+{
+    if (vq_fd >= 0) {
+        for (;;) {
+            ssize_t r = read(vq_fd, vq_buf + vq_len, sizeof(vq_buf) - vq_len - 1);
+            char *p;
+            if (r <= 0)
+                break;
+            vq_len += (size_t)r;
+            vq_buf[vq_len] = '\0';
+            p = vq_buf;
+            for (;;) {
+                char *nl = strchr(p, '\n');
+                char ip[16];
+                int stt, ok, lat;
+                if (!nl)
+                    break;
+                *nl = '\0';
+                if (sscanf(p, "%15s %d %d %d", ip, &stt, &ok, &lat) == 4)
+                    vq_apply(stp, cfg, ip, stt, ok, lat, now);
+                p = nl + 1;
+            }
+            vq_len = strlen(p);
+            memmove(vq_buf, p, vq_len + 1);
+            if (vq_len + 1 >= sizeof(vq_buf))
+                vq_len = 0;
+        }
+    }
+    if (vq_pid > 0) {
+        int wst;
+        pid_t w = waitpid(vq_pid, &wst, WNOHANG);
+        int hung = (now - vq_start) > 60;
+        if (w == vq_pid || hung) {
+            if (w != vq_pid) {
+                kill(vq_pid, SIGKILL);
+                waitpid(vq_pid, &wst, 0);
+            }
+            if (vq_fd >= 0)
+                close(vq_fd);
+            vq_fd = -1;
+            vq_pid = 0;
+        }
+    }
+}
+
+/* Снимок очереди/счётчиков для `status` и `why`: это отдельные процессы,
+ * память движка им недоступна (тот же путь, что и со счётчиками dns_sniff).
+ * Пишем только при изменении; в disk_mode=soft не пишем вовсе — смысл режима
+ * в отсутствии записей на носитель. */
+static void vq_status_write(const susanin_config *cfg)
+{
+    static char last[3584];
+    char buf[3584], wp[64];
+    int m;
+
+    if (!strcmp(cfg->disk_mode, "soft"))
+        return;
+    m = vpin_format(buf, sizeof(buf), cfg->vpin_check, cfg->vpin_interval);
+    if (m <= 0 || !strcmp(buf, last))
+        return;
+    snprintf(last, sizeof(last), "%s", buf);
+    snprintf(wp, sizeof(wp), "%s.tmp", VPIN_STATS_FILE);
+    {
+        FILE *f = fopen(wp, "w");
+        if (!f)
+            return;
+        fprintf(f, "%s\n", buf);
+        fclose(f);
+        rename(wp, VPIN_STATS_FILE);
+    }
+}
+
+static void vq_child(const susanin_config *cfg, const int *idx, int n, int fd)
+{
+    int k;
+    /* «Нечем мерить» решаем здесь, в ребёнке: backend_ready() — это форки
+     * iptables/ip, а главный цикл блокировать нельзя. Локальный SOCKS —
+     * дверь в туннель Xray: если его некому слушать или правила датаплейна
+     * сняты, ответ пробы ничего не говорит про адрес. */
+    int socks_port = cfg->socks_port > 0 ? cfg->socks_port : CFG_DEF_SOCKS_PORT;
+    int vpn_measurable = backend_local_listen(socks_port) && backend_ready(cfg);
+
+    for (k = 0; k < n; k++) {
+        const char *ip = vpin_ip(idx[k]);
+        int stt = vpin_state(idx[k]);
+        unsigned port = (unsigned)vpin_port(idx[k]);
+        struct timespec t0, t1;
+        int ok, lat;
+        char line[64];
+        if (!ip)
+            continue;
+        /* Пробуем тот порт, на котором адрес подтвердил жизнь (улика из
+         * потока), а не 443: IPTV/медиа-сервисы на 8000/1935/554 на 443
+         * молчат, и «нет ответа» означало бы снятие живого пина. */
+        if (port == 0)
+            port = VPIN_PROBE_FALLBACK_PORT;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (stt == VPIN_Q_VPN)
+            ok = vpn_measurable
+                     ? health_probe_via_socks(cfg, ip, (int)port, VPIN_TIMEOUT_MS)
+                     : VPIN_PROBE_NA;
+        else
+            ok = health_probe_tcp_direct(ip, port, VPIN_TIMEOUT_MS) ? 1 : 0;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        lat = (int)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+        /* Строка привязана к адресу и запрошенному состоянию: родитель
+         * сверит их со своей очередью (слот за время пробы мог смениться). */
+        snprintf(line, sizeof(line), "%s %d %d %d\n", ip, stt, ok, lat);
+        if (write(fd, line, strlen(line)) < 0)
+            break;
+    }
+}
+
+static void vq_tick(susanin_state *stp, const susanin_config *cfg, time_t now)
+{
+    int idx[VPIN_BATCH], n, fd[2];
+    pid_t pid;
+    int vpn_iv, direct_iv;
+
+    if (!cfg->vpin_check) {
+        /* Аудит выключен (в т.ч. Reload-ом): незавершённого ребёнка
+         * обязательно пожинать — иначе зомби висит в таблице процессов
+         * до выхода движка. Снимок пишем и тут: `status` не должен
+         * показывать устаревшее «check=1». */
+        if (vq_pid > 0)
+            vq_stop();
+        vq_status_write(cfg);
+        return;
+    }
+    vq_status_write(cfg);
+    if (vq_pid > 0) {
+        vq_collect(stp, cfg, now);
+        return;
+    }
+    vpn_iv = cfg->vpin_interval;
+    /* Без переполнения signed: парсер клампится в INT_MAX, и «vpn_iv * 2»
+     * на большом интервале давало бы отрицательный direct_iv — все Q_DIRECT
+     * становились due каждый проход цикла. */
+    direct_iv = vpn_iv > INT_MAX / 2 ? INT_MAX : vpn_iv * 2;
+    n = vpin_due(now, vpn_iv, direct_iv, idx, VPIN_BATCH);
+    if (n <= 0)
+        return;
+    /* Никакой фильтрации Q_VPN постфактум: в режиме без туннельной пробы
+     * vpin_note кладёт записи сразу в Q_DIRECT, а при смене режима
+     * vpin_set_tunnel_probe переводит существующие. Прежний фильтр
+     * оставлял отброшенные Q_VPN вечно due и вытеснял Q_DIRECT из batch. */
+    if (pipe(fd) != 0)
+        return;
+    pid = fork();
+    if (pid < 0) {
+        close(fd[0]);
+        close(fd[1]);
+        return;
+    }
+    if (pid == 0) {
+        close(fd[0]);
+        vq_child(cfg, idx, n, fd[1]);
+        _exit(0);
+    }
+    close(fd[1]);
+    (void)fcntl(fd[0], F_SETFL, O_NONBLOCK);
+    vq_fd = fd[0];
+    vq_pid = pid;
+    vq_start = now;
+    vq_len = 0;
+}
+
+static void vq_stop(void)
+{
+    if (vq_pid > 0) {
+        int wst;
+        kill(vq_pid, SIGKILL);
+        waitpid(vq_pid, &wst, 0);
+        vq_pid = 0;
+    }
+    if (vq_fd >= 0) {
+        close(vq_fd);
+        vq_fd = -1;
+    }
+    vq_len = 0;
 }
 
 /* Есть ли УЖЕ процесс Xray с НАШИМ конфигом. Нужен, чтобы watchdog не поднимал
@@ -711,13 +1042,139 @@ static long mem_available_kb(void)
     return kb;
 }
 
+/* Маркер штатной остановки. «Чисто ли завершился прошлый запуск» раньше
+ * выяснялось по строке "engine stopped" в хвосте лога, но при log_level=warn
+ * (значение по умолчанию) эта строка уровня INFO не пишется — и каждый штатный
+ * перезапуск выглядел аварией («прошлый запуск не завершался штатно»).
+ * Маркер — файл со сроком жизни до следующего старта; в soft-режиме он лежит
+ * в tmpfs, чтобы не трогать носитель. */
+static char g_stop_mark[128];
+
+static void stop_mark_path(const susanin_config *cfg)
+{
+    snprintf(g_stop_mark, sizeof(g_stop_mark), "%s",
+             (cfg && !strcmp(cfg->disk_mode, "soft"))
+                 ? "/tmp/susanin-agent.stop"
+                 : "/opt/susanin/var/agent.stop");
+}
+
+static int stop_mark_take(void)
+{
+    FILE *f;
+
+    if (!g_stop_mark[0])
+        return 0;
+    f = fopen(g_stop_mark, "r");
+    if (!f)
+        return 0;
+    fclose(f);
+    unlink(g_stop_mark);
+    return 1;
+}
+
+static void stop_mark_set(void)
+{
+    FILE *f;
+
+    if (!g_stop_mark[0])
+        return;
+    f = fopen(g_stop_mark, "w");
+    if (!f)
+        return;
+    fputs("clean\n", f);
+    fclose(f);
+}
+
+/* Что было в конце прошлого запуска. Нужено потому, что после обрыва питания
+ * или OOM-убийства первая строка нового лога — единственное, что оператор
+ * видит, а последняя строка старого («почему всё встало») остаётся необработанной
+ * где-то в середине файла. Читаем только то, что было в файле ДО нас. */
+static void log_prev_run(off_t upto, int clean_hint)
+{
+    char buf[4096];
+    char l1[256], l2[256];
+    size_t got = 0, len;
+    off_t from;
+    int clean = 0, n = 0;
+    char *p;
+    FILE *f;
+
+    if (upto <= 0 || !g_agentlog[0])
+        return;
+    f = fopen(g_agentlog, "rb");
+    if (!f)
+        return;
+    from = upto - (off_t)sizeof(buf);
+    if (from < 0)
+        from = 0;
+    if (fseek(f, (long)from, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (!got)
+        return;
+    buf[got] = '\0';
+    if (strstr(buf, "engine stopped") || clean_hint)
+        clean = 1;
+
+    /* две последние непустые строки того запуска (идём с конца) */
+    l1[0] = l2[0] = '\0';
+    p = buf + got;
+    while (p > buf && n < 2) {
+        char *e = p;
+        char *dst;
+
+        while (p > buf && *(p - 1) != '\n')
+            p--;
+        if (e - p > 1) {
+            dst = (n == 0) ? l1 : l2;
+            len = (size_t)(e - p);
+            if (len >= sizeof(l1))
+                len = sizeof(l1) - 1;
+            memcpy(dst, p, len);
+            dst[len] = '\0';
+            n++;
+        }
+        if (p > buf)
+            p--;                       /* пропустить перевод строки */
+    }
+
+    if (clean)
+        slogf(SL_INFO, "прошлый запуск завершён штатно; его последняя строка: %s", l1);
+    else
+        slogf(SL_WARN, "прошлый запуск не завершался штатно (обрыв питания, kill или "
+              "зависание). Строки того запуска: [%s]%s%s",
+              l1, l2[0] ? " | " : "", l2);
+}
+
+/* Сколько device работает: по /proc/uptime. Отделяет «упал сервис» от
+ * «перезагрузилось устройство» — без этого в логе эти два случая выглядят
+ * одинаково («engine started»). */
+static void log_boot_age(void)
+{
+    double up = 0;
+    FILE *f = fopen("/proc/uptime", "r");
+
+    if (f) {
+        if (fscanf(f, "%lf", &up) != 1)
+            up = 0;
+        fclose(f);
+    }
+    slogf(SL_INFO, "uptime устройства: %.0f с%s", up,
+          up < 120 ? " (устройство только что загрузилось)" : "");
+}
+
 /* Обрезка лога Xray до max_kb. На роутере без swap большой лог — это прямая
  * потеря памяти: /tmp/xray.log вырос до 15 МБ в tmpfs, свободная
  * память ушла ниже watermark и OOM-killer убил сам Xray (интернет встал).
  * max_kb <= 0 — не трогаем. */
+#define XRAY_LOG_PATH "/opt/susanin/var/xray.log"
+
 static void xray_log_trim(int max_kb)
 {
-    const char *path = "/opt/susanin/var/xray.log";
+    const char *path = XRAY_LOG_PATH;
     struct stat st;
     int fd;
 
@@ -769,7 +1226,11 @@ static void kid_track(pid_t p)
             return;
         }
     }
-    g_xray_kids[0] = p;     /* кольцо: самый старый слот освобождаем новым */
+    {
+        int st;
+        (void)waitpid(g_xray_kids[0], &st, WNOHANG);  /* не копим зомби при вытеснении */
+        g_xray_kids[0] = p;
+    }
 }
 
 /* Вызывается из главного цикла: собираем завершившихся детей без блокировки.
@@ -797,6 +1258,26 @@ static void write_xray_pidfile(pid_t pid)
         fprintf(f, "%d\n", (int)pid);
         fclose(f);
     }
+}
+
+/* Перед exec закрыть все fd, унаследованные от агента.
+ *
+ * Долгоживущий Xray (и шелл S93, из которого он стартует) иначе забирает наши
+ * сокеты: DNS-форвардер клиентов (порт 5399), UDP-релей, снифферы. Порт
+ * остаётся занятым даже после перезапуска агента — новый агент не может
+ * забиндиться, форвардер молчит, а DNAT продолжает слать клиентам DNS в мёртвый
+ * сокет. Правила при этом выглядят исправными: порт-то «слушается». Поэтому
+ * наследственные fd закрываем, а нужные (stdout/stderr на лог) уже
+ * перенаправлены через dup2 до вызова. */
+static void close_inherited_fds(void)
+{
+    long max = sysconf(_SC_OPEN_MAX);
+    int fd;
+
+    if (max < 0 || max > 4096)
+        max = 4096;
+    for (fd = 3; fd < (int)max; fd++)
+        close(fd);
 }
 
 /* Прямой запуск Xray без shell: fork/execl. Это FALLBACK: на роутере
@@ -845,6 +1326,7 @@ static int spawn_xray_direct(const susanin_config *cfg)
          * запуске через S93: настройка из susanin.conf молча игнорировалась. */
         setenv("GOGC", cfg->xray_gogc[0] ? cfg->xray_gogc : "50", 1);
         setenv("GOMEMLIMIT", cfg->xray_gomemlimit[0] ? cfg->xray_gomemlimit : "64MiB", 1);
+        close_inherited_fds();
         execl("/opt/sbin/xray", "xray", "run", "-config",
               "/opt/susanin/etc/xray-tproxy.json", (char *)NULL);
         _exit(127);
@@ -879,6 +1361,7 @@ static void spawn_xray_init(const char *action)
                 close(fd);
         }
     }
+    close_inherited_fds();
     execl("/bin/sh", "sh", "/opt/etc/init.d/S93xray-tproxy", action, (char *)NULL);
     _exit(127);
 }
@@ -1072,6 +1555,54 @@ static int engine_pick_start_egress(const susanin_config *cfg)
     return 0;   /* tproxy уже активен по конфигу — переключать нечего */
 }
 
+/* Значения, которые код прочтёт иначе, чем задумано, должны быть видны в логе,
+ * а не в поведении: молчаливый кламп, «агрегация выключилась из-за
+ * отрицательного порога» или «метрики неразличимы из-за mask=0» обнаруживаются
+ * только по факту простоя. stage — откуда проверяем (старт/reload), чтобы в
+ * логе было понятно, каким конфигом живёт процесс.
+ *
+ * Проверка не меняет ни одного значения: право молча подменять конфиг
+ * оператора — это ровно тот класс ошибок, который мы убираем. */
+static void cfg_check(const susanin_config *cfg, const char *stage)
+{
+    char prob[2048];
+    const char *p = prob;
+    int n;
+
+    n = config_validate(cfg, prob, sizeof(prob));
+    if (n <= 0)
+        return;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        char one[512];
+
+        if (len >= sizeof(one))
+            len = sizeof(one) - 1;
+        memcpy(one, p, len);
+        one[len] = '\0';
+        slogf(SL_WARN, "конфиг (%s): %s", stage, one);
+        if (!nl)
+            break;
+        p = nl + 1;
+    }
+}
+
+/* Нижняя граница интервала аудита — 30 с: проба — это ребёнок с сетевыми
+ * таймаутами по 2.5 с, интервал 0/1 превращал бы цикл в вечную гонку fork'ов.
+ * Клампим ОДИН раз при старте/перечитывании и говорим об этом в логе — молча
+ * подменять конфиг оператора нельзя, а кламппить каждый проход бессмысленно
+ * (замечание о значении печатает config_validate). */
+static void vpin_interval_fix(susanin_config *cfg)
+{
+    if (cfg->vpin_interval < VPIN_RETRY_MIN_S) {
+        slogf(SL_WARN, "vpin_interval=%d: минимальный период аудита пинов %d с — "
+              "дальше работает %d", cfg->vpin_interval, VPIN_RETRY_MIN_S,
+              VPIN_RETRY_MIN_S);
+        cfg->vpin_interval = VPIN_RETRY_MIN_S;
+    }
+}
+
 int engine_run(susanin_config *cfg, const char *conf_path)
 {
     susanin_state st;
@@ -1088,10 +1619,15 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     time_t last_save = 0;
     time_t last_recon = 0;
     time_t last_dpfast = 0;
+    time_t dp_unk_since = 0;   /* с какого момента датаплейн не удаётся проверить */
     time_t next_dp_try = 0;
     time_t last_force = 0;
     time_t last_never = 0;
     int never_pending = 0;
+    /* Явный Reload: списки перечитываются в этом же проходе, но сами refresh-и
+     * молчат, когда меняться нечему. Флаг нужен, чтобы по одному разу сказать
+     * оператору, что именно перечитано (или почему не перечитано). */
+    int just_reloaded = 0;
     time_t last_trim = 0;
     time_t last_sweep = 0;
     time_t last_nsweep = 0;
@@ -1101,12 +1637,13 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     time_t last_release = 0;
     time_t next_xray_try = 0;
     time_t last_logrot = 0;
+    off_t log_prev_size = 0;   /* размер лога до наших записей (для разбора прошлого запуска) */
+    time_t last_xlogrot = 0;   /* рантайм-ротация xray.log (раз в минуту) */
     int xray_tries = 0;
     int stuck_tries = 0;      /* подряд «процесс есть, но порт не слушается» */
     int idle_mult = 1;        /* адаптивный период проходов классификатора (1 или 2) */
     int idle_cnt = 0;         /* подряд проходов без событий обучения */
     time_t last_dnssniff = 0;
-    time_t last_snifdiag = 0;
     time_t last_prof = 0;
     int force_pending = 0;
     const char *state_path = "/opt/susanin/var/susanin.state";
@@ -1116,8 +1653,18 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     signal(SIGHUP, on_hup);     /* reload конфига */
     {
         const char *lf = getenv("SUSANIN_LOG");
-        /* disk_mode=soft: файл лога не ведём (минимум записей на носитель). */
-        if (lf && *lf && strcmp(cfg->disk_mode, "soft") != 0) {
+        struct stat lst;
+        int soft = (strcmp(cfg->disk_mode, "soft") == 0);
+        off_t prev_sz = (!soft && lf && *lf && stat(lf, &lst) == 0) ? lst.st_size : 0;
+
+        /* disk_mode=soft означает, что ЛОГА НЕТ (см. TROUBLESHOOTING.md,
+         * USER_GUIDE.md): вывод демона и панели уводится в /dev/null на уровне
+         * susanin.sh, поэтому здесь не открываем свой fd и не запоминаем путь:
+         * ротация файла, который никто не пишет, трогала бы носитель впустую.
+         * Именно этого режима и не хватало: раньше редирект оболочки был
+         * безусловный, и soft давал худшее сочетание — флешка стирается
+         * записями, которые панель отказывается показывать. */
+        if (lf && *lf && !soft) {
             int fd = open(lf, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd >= 0) {
                 dup2(fd, 1);
@@ -1127,24 +1674,36 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                 snprintf(g_agentlog, sizeof(g_agentlog), "%s", lf);
             }
         }
+        log_prev_size = prev_sz;
     }
     slog_init(cfg->log_level);
+    lang_set(cfg->lang);   /* язык журнала: ru|en|zh */
     backend_batch_enable(cfg->ipset_batch);
     if (g_agentlog[0] && path_on_tmpfs(g_agentlog))
         slogf(SL_WARN, "log: %s лежит на tmpfs (это RAM!): рост логов отнимает память, "
                        "при reboot улики исчезают. Держите лог на flash (так дешевле "
                        "для носителя, чем кажется) или disk_mode=soft", g_agentlog);
     if (strcmp(cfg->disk_mode, "soft") == 0)
-        slogf(SL_INFO, "disk_mode=soft: log file off, state not saved, no backups");
+        /* В soft это сообщение уходит в /dev/null — по определению режима.
+         * Остаётся для случая, когда soft включён, а логи всё же пишутся
+         * вручную (перенаправленный запуск без оболочки). */
+        slogf(SL_INFO, "disk_mode=soft: лог не ведётся (вывод в /dev/null), "
+              "state не сохраняется (кроме soft_state_interval), бэкапов нет");
     if (cfg->ok_ttl == 0)
         slogf(SL_WARN, "ok_ttl=0: выученные адреса не истекают (наборы будут расти); "
                        "рекомендуется конечный TTL, напр. ok_ttl=21600");
     if (cfg->udp_relay)
         udp_relay_start(cfg);
-    if (cfg->dns_sniff)
+    if (cfg->dns_sniff || cfg->sni_sniff)
         dns_sniff_start(cfg);
+    if (cfg->dns_lan)
+        dns_lan_start(cfg);
 
     state_init(&st);
+    vpin_reset();
+    /* Режим туннельной пробы: локальный SOCKS (а значит, и смысл Q_VPN)
+     * бывает только в tproxy; остальное очереди сообщает сам движок. */
+    vpin_set_tunnel_probe(strcmp(cfg->egress_type, "tproxy") == 0, time(NULL));
     dns_sniff_set_state(&st);   /* пины dns_sniff переживают re-provision/рестарт */
     ctx.cfg = cfg;
     ctx.st = &st;
@@ -1227,6 +1786,11 @@ int engine_run(susanin_config *cfg, const char *conf_path)
     if (cfg->vpn_never_file[0])
         nv = vn_new();
     slogf(SL_INFO, "engine started (egress=%s table=%d)", cfg->egress_interface, cfg->routing_table);
+    log_boot_age();
+    stop_mark_path(cfg);
+    log_prev_run(log_prev_size, stop_mark_take());
+    cfg_check(cfg, "старт");
+    vpin_interval_fix(cfg);
     if (va && tunnel_up) {
         last_force = time(NULL);
         backend_batch_begin();
@@ -1250,38 +1814,192 @@ int engine_run(susanin_config *cfg, const char *conf_path)
         kids_poll();     /* пожинать детей прямого запуска Xray/S93 (без зомби) */
         udp_relay_tick();    /* работник жив? перезапуск убитого/упавшего (B1) */
 
-        if (cfg->dns_sniff) {
-            dns_sniff_poll();
-            /* Без счётчиков «dom= пустой» нераспознаваемо: так выглядит и «нет
-             * DNS в поле зрения», и «не доходит до сокета», и «не парсится».
-             * Раз в минуту — одна строка, где видно каждое звено цепочки. */
-            if (now - last_snifdiag >= 60) {
-                char sd[160];
-                last_snifdiag = now;
-                dns_sniff_diag(sd, sizeof(sd));
-                slogf(SL_DEBUG, "dns_sniff: %s", sd);
+        if (cfg->dns_sniff || cfg->sni_sniff) {
+            static time_t sn_at;
+            char sn[512];
+
+            /* Один poll за проход: раньше dns_sniff_poll() вызывался дважды
+             * при dns_sniff=1 (второй — пережиток, когда SNI жил отдельным
+             * вызовом), и каждый кадр вычитывался из сокетов в два захода. */
+            dns_sniff_poll();   /* DNS-ответы и SNI из TLS ClientHello */
+            dns_lan_poll();     /* DNS клиентов: в туннель через SOCKS-Xray */
+            /* Раз в 5 минут: сводка на DEBUG, снимок для status/why и не более
+             * одного WARN. Прежнее одно условие «пакеты идут, сохранено 0»
+             * сливало три разные поломки в одну и допускало вывод про
+             * «направление захвата», который счётчики не доказывали: тот же
+             * «0 сохранено» дают не-DNS-трафик и битый разбор ответов.
+             * Случай «кадров нет вовсе» предупреждением не отмечаем: это
+             * может быть тишина в доме, а различить его помогают status/why.
+             * Контур обслуживания — общий для DNS- и SNI-снифинга. */
+            if (!sn_at) {
+                sn_at = now;
+                /* Снимок и на первом проходе: счётчики обнулены после
+                 * рестарта, а иначе status/why до пяти минут показывали бы
+                 * прошлый запуск. */
+                dns_sniff_stats_write(cfg);
+            } else if (now - sn_at >= 300) {
+                sn_at = now;
+                dns_sniff_stats(sn, sizeof(sn));
+                slogf(SL_DEBUG, "dns_sniff: %s", sn);
+                dns_sniff_stats_write(cfg);   /* снимок для панели и why */
+                /* WARN — только по DNS-контуру: при dns_sniff=0 ответов и
+                 * записей из них ждать нечего, предупреждение было бы ложью. */
+                if (cfg->dns_sniff) {
+                    dns_sniff_counters cn;
+                    char ifs[128], qs[128];
+                    int i, nu = 0, qu = 0;
+
+                    dns_sniff_get_counters(&cn);
+                    ifs[0] = qs[0] = '\0';
+                    for (i = 0; i < cn.niface; i++) {
+                        if (!cn.name[i][0])
+                            continue;
+                        if (nu < (int)sizeof(ifs) - 32)
+                            nu += snprintf(ifs + nu, sizeof(ifs) - nu,
+                                           nu ? ",%s" : "%s", cn.name[i]);
+                        if (cn.iface_queries[i] && qu < (int)sizeof(qs) - 32)
+                            qu += snprintf(qs + qu, sizeof(qs) - qu,
+                                           qu ? ",%s" : "%s", cn.name[i]);
+                    }
+                    if (!nu)
+                        snprintf(ifs, sizeof(ifs), "-");
+                    if (cn.answers > 0 && cn.parse_fail > 0 && cn.stored == 0)
+                        /* Ответы вытаскиваем из сокета, а в таблицу не
+                         * попадает ни одной пары, и разбор при этом ругался на
+                         * битые сообщения — настоящая поломка разбора. Без
+                         * parse_fail>0 тот же ноль дают честные ответы без
+                         * A-записей (NXDOMAIN, только AAAA), и WARN врал бы. */
+                        slogf(SL_WARN, "dns_sniff: ответы приходят (%lu), в таблицу "
+                              "не лёг ни один (parse_fail=%lu) — разбор не доходит "
+                              "до таблицы: %s", cn.answers, cn.parse_fail, sn);
+                    else if (cn.queries > 0 && cn.answers == 0)
+                        /* Вот здесь предположение про интерфейс/направление
+                         * уместно: запросы на перечисленных видим, ответы на
+                         * них — нет. */
+                        slogf(SL_WARN, "dns_sniff: запросы видим (%lu, с %s), "
+                              "ответов нет; слушаем %s — проверить, проходят ли "
+                              "ответы через эти интерфейсы: %s",
+                              cn.queries, qs[0] ? qs : "-", ifs, sn);
+                    else if (cn.frames > 0 && cn.queries == 0 && cn.answers == 0)
+                        /* Формулировка без упрёка в «не то направление»:
+                         * направление по этим числам не доказать. */
+                        slogf(SL_WARN, "dns_sniff: на захвате ни запросов, ни "
+                              "ответов DNS (frames=%lu, udp53=%lu): слушаем %s — "
+                              "там нет трафика UDP/53 (DoT/DoH/QUIC) либо "
+                              "выбраны не те интерфейсы: %s",
+                              cn.frames, cn.udp53, ifs, sn);
+                }
             }
         }
+
+        if (cfg->dns_lan) {
+            static time_t dl_at, dl_snap;
+            if (!dl_snap || now - dl_snap >= 60) {
+                dl_snap = now;
+                dns_lan_write_snapshot(cfg);
+            }
+            if (!dl_at)
+                dl_at = now;
+            else if (now - dl_at >= 300) {
+                char dl[192];
+                dl_at = now;
+                dns_lan_stats(dl, sizeof(dl));
+                slogf(SL_INFO, "dns_lan: %s", dl);
+            }
+        }
+
+        vq_tick(&st, cfg, now);   /* аудит пинов автообучения: жив ли путь через туннель */
 
         if (g_reload) {
             susanin_config nc;
             g_reload = 0;
             if (conf_path && config_load(conf_path, &nc) == 0) {
+                char old_level[24];
+                int old_sl;
+                snprintf(old_level, sizeof(old_level), "%s", cfg->log_level);
+                old_sl = slog_level();
                 *cfg = nc;
                 backend_batch_enable(cfg->ipset_batch);
+                /* Уровень применялся только при старте процесса: правка
+                 * log_level в конфиге и Reload оставляли прежний поток —
+                 * «сделал тише, а оно пишет». slog_init дешёвый и побочных
+                 * эффектов не имеет. */
+                slog_init(cfg->log_level);
+                lang_set(cfg->lang);
+                if (slog_level() != old_sl)
+                    slogf(SL_WARN, "log_level: %s -> %s (применено без перезапуска)",
+                          old_level[0] ? old_level : "(пусто)",
+                          cfg->log_level[0] ? cfg->log_level : "(пусто)");
                 slogf(SL_INFO, "config reloaded: %s", conf_path);
+                cfg_check(cfg, "reload");
+                vpin_interval_fix(cfg);
+                /* Смена режима egress меняет и смысл записей аудита:
+                 * без tproxy туннельную пробу мерить нечем. */
+                vpin_set_tunnel_probe(strcmp(cfg->egress_type, "tproxy") == 0, now);
+                /* Модули списков создавались только при старте службы. Если
+                 * vpn_always_file/vpn_never_file появился (или исчез) в уже
+                 * работающем процессе, Reload обязан отреагировать: иначе
+                 * настройка из панели не применялась никогда, и даже сводка
+                 * после Reload не печаталась — молчание казалось успехом. */
+                if (!va && cfg->vpn_always_file[0]) {
+                    va = va_new();
+                    if (va) {
+                        va_mark_dirty(va);
+                        last_force = 0;
+                        slogf(SL_INFO, "vpn_always: модуль поднят reload-ом");
+                    } else {
+                        slogf(SL_ERROR, "vpn_always: не выделено памяти, "
+                              "список не активен до перезапуска");
+                    }
+                } else if (va && !cfg->vpn_always_file[0]) {
+                    /* Порядок важен: сначала refresh (он при пустом пути снимает
+                     * пины), потом освобождение модуля — иначе адреса остались
+                     * бы в susanin_ok_* бессрочно. */
+                    backend_batch_begin();
+                    force_pending = va_refresh(va, cfg);
+                    backend_batch_end();
+                    va_free(va);
+                    va = NULL;
+                    slogf(SL_INFO, "vpn_always: путь очищен, пины сняты, модуль выключен");
+                }
+                if (!nv && cfg->vpn_never_file[0]) {
+                    nv = vn_new();
+                    if (nv) {
+                        vn_mark_dirty(nv);
+                        last_never = 0;
+                        slogf(SL_INFO, "vpn_never: модуль поднят reload-ом");
+                    } else {
+                        slogf(SL_ERROR, "vpn_never: не выделено памяти, "
+                              "список не активен до перезапуска");
+                    }
+                } else if (nv && !cfg->vpn_never_file[0]) {
+                    int nch = 0;
+                    backend_batch_begin();
+                    never_pending = vn_refresh2(nv, cfg, &nch);
+                    backend_batch_end();
+                    vn_free(nv);
+                    nv = NULL;
+                    slogf(SL_INFO, "vpn_never: путь очищен, пины сняты, модуль выключен");
+                }
                 /* Работник udp-relay держит конфиг, с которым запущен:
                  * при смене значимых полей — перезапуск, при выключении
                  * udp_relay — остановка. */
                 udp_relay_reload(cfg);
+                /* Снифер同样 мог быть включён/выключен уже в работающем
+                 * процессе: раньше ключ применялся только при старте службы. */
+                dns_sniff_reload(cfg);
+    dns_lan_reload(cfg);
                 /* W6: перечитать настройку индикатора релиза; при включении —
                  * проверка в ближайшие 30 с, а не через 12 ч. */
                 release_init(cfg);
                 last_release = now;
                 if (cfg->release_check && cfg->release_check_interval > 30)
                     last_release -= (time_t)(cfg->release_check_interval - 30);
-                /* Пробы и их окно — заново: адреса/пороги могли измениться. */
+                /* Пробы и их окно — заново: адреса/пороги могли измениться.
+                 * Аудит пинов — тем же порядком: работающий ребёнок держит
+                 * старый конфиг и старый пайп, после Reload он невалиден. */
                 probe_job_stop();
+                vq_stop();
                 eg_reset();
                 {
                     char perr[256];
@@ -1321,6 +2039,7 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                 }
                 last_force = 0;
                 last_never = 0;
+                just_reloaded = 1;
             } else {
                 slogf(SL_ERROR, "config reload failed: %s",
                       conf_path ? conf_path : "?");
@@ -1344,9 +2063,24 @@ int engine_run(susanin_config *cfg, const char *conf_path)
             if (now - last[3] >= cfg->health_interval)
                 need_scan = 1;
             if (need_scan) {
+                static unsigned long ol_rep;
+                static time_t ol_at;
+                unsigned long ol;
+
                 L.n = 0;
                 if (conntrack_scan("/proc/net/nf_conntrack", collect, &L) < 0)
                     slogf(SL_DEBUG, "conntrack scan failed");
+                /* Счётчик без читателя — мёртвый код: ровно так же год назад
+                 * жил dns_sniff_count(). Сообщаем не чаще раза в 5 минут, но
+                 * дельту копят, чтобы не потерять ни одного случая. */
+                ol = conntrack_overlong();
+                if (ol > ol_rep && (!ol_at || now - ol_at >= 300)) {
+                    slogf(SL_WARN, "conntrack: %lu записей длиннее %d байт — эти "
+                          "потоки не были разобраны и не участвовали в обучении",
+                          ol - ol_rep, CT_LINE_MAX);
+                    ol_rep = ol;
+                    ol_at = now;
+                }
             }
         }
 
@@ -1532,7 +2266,12 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                             : 300;
             if (every > 0 && now - last_save >= every) {
                 last_save = now;
-                state_save(state_path, &st);
+                /* Без этого «обучение не переживает рестарт» выглядело бы как
+                 * поломка логики: state просто не записан (полный носитель,
+                 * севшая флешка, EBUSY). */
+                if (state_save(state_path, &st) != 0)
+                    slogf(SL_WARN, "state: сохранить %s не удалось — после "
+                          "рестарта обучения начнётся с нуля", state_path);
             }
         }
 
@@ -1549,7 +2288,12 @@ int engine_run(susanin_config *cfg, const char *conf_path)
             release_check_now(cfg);
         }
 
-        if (cfg->dns_sniff && tunnel_up && now - last_dnssniff >= 10) {
+        /* Обслуживание снифинга ( пины по спискам, дооткрытие появившихся
+         * интерфейсов, аудит «RU в VPN») нужно обоим источникам имени: и DNS,
+         * и SNI. Раньше контур висел на dns_sniff, и при sni_sniff=1 снятие
+         * устаревших пинов не работало вовсе. */
+        if ((cfg->dns_sniff || cfg->sni_sniff) && tunnel_up &&
+            now - last_dnssniff >= 10) {
             last_dnssniff = now;
             dns_sniff_reconcile(cfg);
         }
@@ -1600,8 +2344,10 @@ int engine_run(susanin_config *cfg, const char *conf_path)
          * в таблице тоже нет, и проверка давала бы ложное «data plane missing»
          * с перепровижном каждые 5 c и падением dp_ok на 60 c. */
         if (dp_ok && tunnel_up && now - last_dpfast >= 1) {
+            int unk = 0;
             last_dpfast = now;
-            if (!backend_ready(cfg)) {
+            if (!backend_ready_ex(cfg, &unk)) {
+                dp_unk_since = 0;
                 slogf(SL_WARN, "data plane missing (fast check), re-provisioning");
                 if (backend_provision(cfg) == 0) {
                     backend_mark_reprov("rules missing (fast re-provision)");
@@ -1622,10 +2368,27 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                     next_dp_try = now + 60;
                 }
                 last_recon = now;   /* не дублировать в общем reconcile */
+            } else if (unk) {
+                /* Проверить не удалось: правила могут быть сняты, а мы этого не
+                 * видим. Перепровижнивать по «не знаю» нельзя (гон при залёгшем
+                 * локе), но и молчать нельзя: прежняя версия на этом же rc=4
+                 * возвращала «готово» и окно fail-open становилось неограниченно
+                 * по времени. Поэтому — предупреждение раз в 5 минут, а не
+                 * каждое молчание цикла. */
+                if (!dp_unk_since)
+                    dp_unk_since = now;
+                else if (now - dp_unk_since >= 300) {
+                    slogf(SL_WARN, "датаплейн не проверялся %u с: xtables-lock занят — "
+                          "пропажу правил увидеть нельзя",
+                          (unsigned)(now - dp_unk_since));
+                    dp_unk_since = now;
+                }
+            } else {
+                dp_unk_since = 0;
             }
         }
 
-        if (now - last_recon >= (cfg->dp_check_interval > 0 ? cfg->dp_check_interval : 15)) {
+        if (now - last_recon >= (cfg->dp_check_interval > 0 ? cfg->dp_check_interval : CFG_DEF_DP_CHECK_INTERVAL)) {
             int tproxy = (strcmp(cfg->egress_type, "tproxy") == 0);
             int tp_ok = !tproxy || backend_local_listen(cfg->tproxy_port);
             last_recon = now;
@@ -1737,9 +2500,14 @@ int engine_run(susanin_config *cfg, const char *conf_path)
             }
         }
 
+        /* Периоды списков берём с той же подстановкой, что и модули: голый
+         * vpn_always_interval=0 давал `now - last >= 0`, то есть перечитывание
+         * и резолв списков на КАЖДОМ проходе цикла — при том, что проверка
+         * конфига трактует 0 как «взять действующий default». */
         if (tunnel_up && va &&
             (force_pending ||
-             now - last_force >= (time_t)cfg->vpn_always_interval ||
+             now - last_force >= (time_t)(cfg->vpn_always_interval > 0
+                        ? cfg->vpn_always_interval : CFG_DEF_VPN_LIST_INTERVAL) ||
              va_changed(va, cfg))) {
             time_t prev = last_force;
             last_force = now;
@@ -1752,7 +2520,8 @@ int engine_run(susanin_config *cfg, const char *conf_path)
 
         if (nv &&
             (never_pending ||
-             now - last_never >= (time_t)cfg->vpn_never_interval ||
+             now - last_never >= (time_t)(cfg->vpn_never_interval > 0
+                        ? cfg->vpn_never_interval : CFG_DEF_VPN_LIST_INTERVAL) ||
              vn_changed(nv, cfg))) {
             time_t prev = last_never;
             int nchanged = 0;
@@ -1768,12 +2537,62 @@ int engine_run(susanin_config *cfg, const char *conf_path)
                 last_never = prev;
         }
 
+        /* Сводка по обоим спискам — ОДНА точка, после того как оба refresh
+         * отработаны. Раньше печать стояла внутри ветки «сводка», из-за чего
+         * слово «перечитан» появлялось и когда va_refresh вышел по раннему
+         * return (пустой путь), и когда список ещё только применяется
+         * (домены не все разрешены), и когда nv/va вообще не созданы — то
+         * есть наблюдаемость, ради которой сводку и заводили, сама же и
+         * вводила в заблуждение. */
+        if (just_reloaded) {
+            int nd = 0, nip = 0, nnet = 0, nnd = 0, nnt = 0;
+
+            if (!cfg->vpn_always_file[0])
+                slogf(SL_INFO, "vpn_always: список не задан (vpn_always_file пуст)");
+            else if (!va)
+                slogf(SL_WARN, "vpn_always: модуль не создан (не выделена память) — "
+                      "список не активен до перезапуска");
+            else if (!tunnel_up)
+                slogf(SL_INFO, "vpn_always: отложен до подъёма туннеля (fail-open)");
+            else {
+                va_counts(va, &nd, &nip, &nnet);
+                if (force_pending)
+                    slogf(SL_INFO, "vpn_always: применяется (доменов=%d, запинено пока "
+                          "ip=%d net=%d; остальные — в следующих проходах)",
+                          nd, nip, nnet);
+                else
+                    slogf(SL_INFO, "vpn_always: применён (доменов=%d, запинено ip=%d net=%d)",
+                          nd, nip, nnet);
+            }
+
+            if (!cfg->vpn_never_file[0])
+                slogf(SL_INFO, "vpn_never: список не задан (vpn_never_file пуст)");
+            else if (!nv)
+                slogf(SL_WARN, "vpn_never: модуль не создан (не выделена память) — "
+                      "список не активен до перезапуска");
+            else {
+                vn_counts(nv, &nnd, &nnt);
+                if (never_pending)
+                    slogf(SL_INFO, "vpn_never: применяется (доменов=%d, direct пока=%d; "
+                          "остальные — в следующих проходах)", nnd, nnt);
+                else
+                    slogf(SL_INFO, "vpn_never: применён (доменов=%d, direct=%d)",
+                          nnd, nnt);
+            }
+        }
+        just_reloaded = 0;
+
         /* Ротация логов по размеру в рантайме: раньше — только
          * при старте службы; долгий аптайм + INFO/debug = раздутый файл
          * (в tmpfs — прямая потеря RAM). Агент чистит и свой лог, и web-лог:
          * писатели с O_APPEND продолжают с нового EOF. */
         if (now - last_logrot >= 300) {
             last_logrot = now;
+            /* Свой и web-лог вращаем только там, где они есть: в soft вывод
+             * процессов идёт в /dev/null (смысл режима по документации — лог не
+             * ведётся), и крутить файл, который никто не пишет, значило бы
+             * трогать носитель впустую. xray.log ниже — исключение намеренное:
+             * его пишет Xray, и его лимит защищает память, а не наблюдения. */
             if (strcmp(cfg->disk_mode, "soft") != 0) {
                 if (g_agentlog[0])
                     log_rotate_if_big(g_agentlog, 4096, 1024);
@@ -1781,14 +2600,35 @@ int engine_run(susanin_config *cfg, const char *conf_path)
             }
         }
 
-        usleep(200000);
+        /* xray.log раньше урезался только при спавне Xray. Долгоживой Xray с
+         * поднятым loglevel раздувал tmpfs ровно тем способом, из-за которого
+         * порог и появился (OOM-killer убивает Xray — интернет в доме встаёт).
+         * Здесь ротация чаще и с сохранением хвоста: обнуление файла теряло и
+         * тот контекст, ради которого лог и читают. */
+        if (cfg->xray_log_max_kb > 0 && now - last_xlogrot >= 60) {
+            long keep = cfg->xray_log_max_kb / 4;
+
+            last_xlogrot = now;
+            log_rotate_if_big(XRAY_LOG_PATH, cfg->xray_log_max_kb,
+                              keep > 0 ? keep : 64);
+        }
+
+        /* Обычный тик — 200 мс. Пока идёт обмен DNS-форвардера с туннелем,
+         * спим короче: каждый шаг обмена — RTT, и на 200 мс ответ ждался бы
+         * секундами. Это только на время запроса, не постоянная нагрузка. */
+        usleep(dns_lan_busy() ? 20000 : 200000);
     }
 
     probe_job_stop();
     udp_relay_stop();
+    dns_lan_stop();
     dns_sniff_stop();
-    state_save(state_path, &st);
+    vq_stop();
+    vpin_reset();
+    if (state_save(state_path, &st) != 0)
+        slogf(SL_WARN, "state: сохранить %s при остановке не удалось", state_path);
     slogf(SL_INFO, "engine stopped");
+    stop_mark_set();             /* штатная остановка — для следующего старта */
     va_free(va);
     vn_free(nv);
     state_free(&st);

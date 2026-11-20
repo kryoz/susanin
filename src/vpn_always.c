@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "vpn_always.h"
+#include "entryparse.h"
 #include "backend.h"
 #include "cdn.h"
 #include "classifier.h"
@@ -46,6 +47,7 @@ typedef struct {
     int fails;              /* подряд неудачных резолвов (backoff) */
     int is_net;             /* строка файла — CIDR (a.b.c.d/n), не домен */
     int wild;               /* *.domain: домен и все поддомены */
+    int soft;               /* ?domain: мягкая запись — не пинить, ru_guard не запирает */
     time_t next_try;        /* когда перепроверять домен */
 } va_dom;
 
@@ -96,64 +98,10 @@ static void trim_line(char *s)
         *--p = '\0';
 }
 
-static void lower_str(char *s)
-{
-    for (; *s; s++)
-        *s = (char)tolower((unsigned char)*s);
-}
-
-/* Валидно: IPv4 (пинится как есть), CIDR a.b.c.d/n (в susanin_ok_net) или
- * DNS-имя из [a-z0-9.-]. */
-static int valid_cidr(const char *s, char *out, size_t n)
-{
-    char buf[48], *slash, *e;
-    struct in_addr a;
-    long pre;
-    if (strlen(s) >= sizeof(buf))
-        return 0;
-    snprintf(buf, sizeof(buf), "%s", s);
-    slash = strchr(buf, '/');
-    if (!slash)
-        return 0;
-    *slash = '\0';
-    if (inet_pton(AF_INET, buf, &a) != 1)
-        return 0;
-    errno = 0;
-    pre = strtol(slash + 1, &e, 10);
-    if (e == slash + 1 || *e != '\0' || errno != 0 || pre < 0 || pre > 32)
-        return 0;
-    snprintf(out, n, "%s", s);
-    return 1;
-}
-
-static int valid_name(const char *s, char *out, size_t n)
-{
-    struct in_addr a;
-    const char *p;
-    size_t len = strlen(s);
-    if (len == 0 || len >= n)
-        return 0;
-    if (inet_pton(AF_INET, s, &a) == 1) {
-        snprintf(out, n, "%s", s);
-        return 1;
-    }
-    if (strchr(s, '/'))
-        return valid_cidr(s, out, n);
-    if (len > 253)
-        return 0;
-    for (p = s; *p; p++) {
-        char c = *p;
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-              c == '.' || c == '-'))
-            return 0;
-    }
-    snprintf(out, n, "%s", s);
-    return 1;
-}
 
 /* Читает файл, дедуплицирует имена. -1 если файл недоступен. */
 static int file_load(const char *path, char names[][256], int wilds[],
-                     int maxnames)
+                     int softs[], int maxnames)
 {
     FILE *fp = fopen(path, "r");
     char line[VA_LINE];
@@ -162,17 +110,11 @@ static int file_load(const char *path, char names[][256], int wilds[],
         return -1;
     while (fgets(line, sizeof(line), fp)) {
         char buf[256];
-        const char *p = line;
-        int i, wild = 0;
+        int i, wild = 0, soft = 0;
         trim_line(line);
         if (line[0] == '\0' || line[0] == '#')
             continue;
-        if (line[0] == '*' && line[1] == '.') {
-            wild = 1;
-            p = line + 2;
-        }
-        lower_str((char *)p);
-        if (!valid_name(p, buf, sizeof(buf)))
+        if (!entry_parse(line, buf, sizeof(buf), &wild, NULL, &soft))
             continue;
         if (n >= maxnames) {
             /* Раньше здесь был просто break: список молча обрезался, и записи из
@@ -192,8 +134,26 @@ static int file_load(const char *path, char names[][256], int wilds[],
             break;
         }
         for (i = 0; i < n; i++)
-            if (strcmp(names[i], buf) == 0 && wilds[i] == wild)
+            if (strcmp(names[i], buf) == 0 && wilds[i] == wild) {
+                /* Ключ дедупа — вся смысловая пара: одна и та же зона может
+                 * стоять в файле и жёстко, и мягко. Прежний дедуп смотрел
+                 * только name+wild, и «побеждала первая строка»: порядок в
+                 * файле молча решал, будет ли адрес пиниться. Теперь жёсткая
+                 * запись сильнее (она явно требует VPN), вторая игнорируется
+                 * с WARN — чтобы оператор увидел конфликт, а не искал его
+                 * по трафику. */
+                if (softs[i] != soft) {
+                    if (!soft && softs[i])
+                        softs[i] = 0;    /* новая жёсткая снимает мягкую */
+                    slogf(SL_WARN, "vpn_always: \"%s%s%s\" проигнорирована — "
+                          "для этой зоны уже есть %s запись%s",
+                          soft ? "?" : "", wild ? "*." : "", buf,
+                          softs[i] ? "мягкую" : "жёсткую",
+                          (!soft && !softs[i]) ? " (переопределяет её)" : "");
+                    break;
+                }
                 break;
+            }
         if (i == n) {
             size_t l = strlen(buf) + 1;
             if (l > sizeof(names[n]))
@@ -201,6 +161,7 @@ static int file_load(const char *path, char names[][256], int wilds[],
             memcpy(names[n], buf, l);
             names[n][sizeof(names[n]) - 1] = '\0';
             wilds[n] = wild;
+            softs[n] = soft;
             n++;
         }
     }
@@ -208,18 +169,19 @@ static int file_load(const char *path, char names[][256], int wilds[],
     return n;
 }
 
-static va_dom *dom_find(vpn_always *v, const char *name)
+static va_dom *dom_find(vpn_always *v, const char *name, int wild)
 {
     int i;
     for (i = 0; i < v->nd; i++)
-        if (strcmp(v->dom[i].name, name) == 0)
+        if (strcmp(v->dom[i].name, name) == 0 && v->dom[i].wild == wild)
             return &v->dom[i];
     return NULL;
 }
 
 /* Согласует список доменов с файлом: новые — next_try=0 (резолвить сразу),
  * удалённые выкидываются вместе с их IP. */
-static void doms_reconcile(vpn_always *v, char names[][256], int wilds[], int n)
+static void doms_reconcile(vpn_always *v, char names[][256], int wilds[],
+                           int softs[], int n)
 {
     /* VA_MAXDOM × sizeof(va_dom) = 400 КБ при лимите 512 — держим в куче, а не
      * на стеке: на роутере с 128 МБ RAM такой стек ни к чему. */
@@ -228,11 +190,36 @@ static void doms_reconcile(vpn_always *v, char names[][256], int wilds[], int n)
     if (!keep)
         return;                 /* нет памяти — оставляем список как был */
     for (i = 0; i < n && i < VA_MAXDOM; i++) {
-        va_dom *old = dom_find(v, names[i]);
+        va_dom *old = dom_find(v, names[i], wilds[i]);
         va_dom *d = &keep[nk++];
-        if (old && old->wild == wilds[i])
+        if (old && old->wild == wilds[i]) {
             *d = *old;
-        else {
+            /* Флаг мягкости перечитанного файла обязан применяться и к
+             * уже живой записи: иначе правка «domain» -> «?domain» в файле
+             * не действовала до рестарта демона (IP продолжал резолвиться и
+             * пиниться в ok), тогда как dns_sniff со своим кэшем правку уже
+             * видел — два модуля одного процесса расходились.
+             * Снятие прежних IP-пинов делает шаг «desired» этого же прохода:
+             * файл менялся -> v->dirty=1 -> пины, пропавшие из desired,
+             * снимаются без гистерезиса. Обратный переход (?domain ->
+             * domain) чиним сбросом срока: домен резолвится в ближайшем
+             * проходе, а не после чужого next_try. */
+            if (d->soft != softs[i]) {
+                d->soft = softs[i];
+                d->fails = 0;
+                d->fail_logged = 0;
+                if (d->soft)
+                    slogf(SL_INFO, "vpn_always: %s%s — запись стала мягкой: "
+                          "не резолвим, пины снимаем",
+                          d->wild ? "*." : "", d->name);
+                else {
+                    d->next_try = 0;
+                    slogf(SL_INFO, "vpn_always: %s%s — запись стала жёсткой: "
+                          "перерезолвим в ближайшем проходе",
+                          d->wild ? "*." : "", d->name);
+                }
+            }
+        } else {
             size_t l;
             memset(d, 0, sizeof(*d));
             l = strlen(names[i]) + 1;
@@ -242,6 +229,7 @@ static void doms_reconcile(vpn_always *v, char names[][256], int wilds[], int n)
             d->name[sizeof(d->name) - 1] = '\0';
             d->is_net = strchr(d->name, '/') ? 1 : 0;
             d->wild = wilds[i];
+            d->soft = softs[i];
             d->next_try = 0;
         }
     }
@@ -493,14 +481,16 @@ static int dns_query_many(const char *server, char names[][256], int n,
                 int ii;
                 unsigned char rb[2048];
                 int rn;
-                if (!(pfds[j].revents & POLLIN))
+                if (!(pfds[j].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
                     continue;
                 ii = idxs[j];
-                rn = (int)recv(fds[ii], rb, sizeof(rb), 0);
-                if (rn >= 12) {
-                    int c = parse_a(rb, rn, idh[ii], idl[ii], out[ii], VA_MAXIP);
-                    if (c >= 0)
-                        counts[ii] = c;
+                if (pfds[j].revents & POLLIN) {
+                    rn = (int)recv(fds[ii], rb, sizeof(rb), 0);
+                    if (rn >= 12) {
+                        int c = parse_a(rb, rn, idh[ii], idl[ii], out[ii], VA_MAXIP);
+                        if (c >= 0)
+                            counts[ii] = c;
+                    }
                 }
                 close(fds[ii]);
                 fds[ii] = -1;
@@ -746,9 +736,11 @@ int va_changed(vpn_always *v, const susanin_config *cfg)
 {
     struct stat st;
     int had;
-    if (!v || !cfg->vpn_always_file[0])
+    if (!v)
         return 0;
     had = v->seen_exists;
+    if (!cfg->vpn_always_file[0])
+        return had ? 1 : 0;         /* путь обнулили — пины надо снять */
     if (stat(cfg->vpn_always_file, &st) != 0)
         return had ? 1 : 0;       /* файл исчез — нужно снять пины */
     if (!had)
@@ -823,7 +815,7 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
     int nfail = 0, nex = 0, npriv = 0;
     char exa[3][64] = { "", "", "" };
     long long t0 = now_ms();
-    int interval = cfg->vpn_always_interval > 0 ? cfg->vpn_always_interval : 300;
+    int interval = cfg->vpn_always_interval > 0 ? cfg->vpn_always_interval : CFG_DEF_VPN_LIST_INTERVAL;
     /* Бюджет одного прохода: по умолчанию 250 мс (см. vpn_refresh_budget_ms).
      * Раньше жёсткие 4000 мс держали главный цикл — в это время классификатор
      * не работал и метки не ставились. 0 в конфиге = прежние 4 с. */
@@ -832,9 +824,15 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
                            : (long long)VA_BUDGET_MS;
     char (*desired)[16];
     char (*desired_net)[40];
+    int nofile;
 
-    if (!v || !cfg->vpn_always_file[0])
+    if (!v)
         return 0;
+    /* Пустой vpn_always_file означает то же, что удалённый файл: функция
+     * выключена, и уже запиненные адреса обязаны быть сняты. Прежний ранний
+     * return оставлял их в susanin_ok_tcp/ok_net с timeout 0, то есть
+     * бессрочно: после обнуления пути в конфиге адреса уходили в VPN навсегда. */
+    nofile = !cfg->vpn_always_file[0];
 
     /* Hysteresis считает интервалы, а не вызовы: va_refresh зовётся многократно
      * за один интервал (добор доменов по бюджету времени). */
@@ -845,11 +843,13 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
             v->epoch = epoch;
     }
 
-    if (stat(cfg->vpn_always_file, &st) != 0) {
+    if (nofile || stat(cfg->vpn_always_file, &st) != 0) {
         /* Файла нет — функция выключена. Если раньше был список — снимаем. */
         if (v->seen_exists) {
             v->seen_exists = 0;
             v->nd = 0;
+            v->seen_mtime = 0;   /* при возврате файла перечитаем независимо от mtime/size */
+            v->seen_size = 0;
             while (v->ntrack > 0) {
                 backend_ok_pin_del(cfg, v->track[0]);
                 slogf(SL_INFO, "vpn_always: unpin %s (file removed)",
@@ -864,8 +864,11 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
             }
         } else if (!v->warned) {
             v->warned = 1;
-            slogf(SL_INFO, "vpn_always: %s absent (disabled)",
-                  cfg->vpn_always_file);
+            if (nofile)
+                slogf(SL_INFO, "vpn_always: список не задан (функция выключена)");
+            else
+                slogf(SL_INFO, "vpn_always: %s absent (disabled)",
+                      cfg->vpn_always_file);
         }
         return 0;
     }
@@ -875,13 +878,15 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
         v->seen_size != st.st_size) {
         char (*names)[256] = calloc(VA_MAXDOM, sizeof(*names));
         int *wilds = calloc(VA_MAXDOM, sizeof(*wilds));
-        if (names && wilds) {
-            int nf = file_load(cfg->vpn_always_file, names, wilds, VA_MAXDOM);
+        int *softs = calloc(VA_MAXDOM, sizeof(*softs));
+        if (names && wilds && softs) {
+            int nf = file_load(cfg->vpn_always_file, names, wilds, softs, VA_MAXDOM);
             if (nf >= 0)
-                doms_reconcile(v, names, wilds, nf);
+                doms_reconcile(v, names, wilds, softs, nf);
         }
         free(names);
         free(wilds);
+        free(softs);
         v->seen_mtime = st.st_mtime;
         v->seen_size = st.st_size;
         /* Файл изменился: снимаем устаревшие пины СРАЗУ (dirty обходит
@@ -915,7 +920,7 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
         for (i = 0; i < v->nd && nb < VA_PAR; i++) {
             va_dom *d = &v->dom[i];
             struct in_addr lit;
-            if (d->is_net || d->wild || d->next_try > now)
+            if (d->is_net || d->wild || d->soft || d->next_try > now)
                 continue;
             if (inet_pton(AF_INET, d->name, &lit) == 1)
                 continue;
@@ -962,7 +967,7 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
         long long spent = now_ms() - t0;
         long left;
         int to;
-        if (d->next_try > now)
+        if (d->next_try > now || d->soft)
             continue;
         if (d->is_net) {
             /* CIDR — пинится как есть, без DNS */
@@ -1022,6 +1027,8 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
     /* 2) желаемый набор = объединение IP доменов + CIDR-строк списка */
     for (i = 0; i < v->nd; i++) {
         int k;
+        if (v->dom[i].soft)
+            continue;
         if (v->dom[i].is_net) {
             int j;
             for (j = 0; j < ndesn; j++)
@@ -1219,4 +1226,17 @@ int va_refresh(vpn_always *v, const susanin_config *cfg)
     free(desired);
     free(desired_net);
     return pending;
+}
+
+/* Состояние списка для наблюдаемости: refresh сам ничего не печатает, когда
+ * меняться нечему, и по логу нельзя было утверждать, что список перечитан
+ * (в частности — после явного Reload). */
+void va_counts(const vpn_always *v, int *ndom, int *nip, int *nnet)
+{
+    if (ndom)
+        *ndom = v ? v->nd : 0;
+    if (nip)
+        *nip = v ? v->ntrack : 0;
+    if (nnet)
+        *nnet = v ? v->ntracknet : 0;
 }

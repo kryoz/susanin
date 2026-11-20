@@ -19,20 +19,27 @@ say() { echo "[susanin] $*"; }
 die() { echo "[susanin] ERROR: $*" >&2; exit 1; }
 
 # Дополнить существующий список новыми строками из пакета. Ничего не удаляем и
-# не перезаписываем: добавляем только те «чистые» строки (домены/IP/CIDR), которых
-# ещё нет. Идемпотентно: повторный запуск ничего не меняет.
+# не перезаписываем: добавляем только те «чистые» строки (домен / *.домен /
+# ?домен / IPv4 / CIDR), которых ещё нет.
+# Записи сверяются по ИМЕНИ без префикса мягкости '?': «?domain» и «domain» — одна
+# и та же запись, поэтому смягчение пользователя жёстким двойником из поставки не
+# отменяется, а его форма строки не переписывается.
+# Идемпотентно: повторный запуск ничего не меняет.
 merge_list() { # merge_list <user_file> <package_file> <label>
     _uf="$1"; _pf="$2"; _label="$3"
     [ -f "$_uf" ] && [ -f "$_pf" ] || return 0
-    _tmp=$(mktemp 2>/dev/null) || _tmp="/tmp/susanin-merge.$$"
-    sed 's/#.*//' "$_uf" | tr -d ' \t\r' | grep -v '^$' | sort -u > "$_tmp" || true
+    _keys=$(mktemp 2>/dev/null) || _keys="/tmp/susanin-keys.$$"
+    sed 's/#.*//' "$_uf" | tr -d ' \t\r' | sed 's/^?//' | grep -v '^$' | sort -u > "$_keys" || true
     _added=0
     while IFS= read -r _line; do
         _e=$(printf '%s' "$_line" | sed 's/#.*//' | tr -d ' \t\r')
         if [ -z "$_e" ]; then
             continue
         fi
-        if grep -qxF "$_e" "$_tmp"; then
+        _k="$_e"
+        # Внутри ветки первый символ заведомо '?', поэтому глоб '?' снимает его.
+        case "$_k" in '?'*) _k=${_k#?} ;; esac
+        if grep -qxF "$_k" "$_keys"; then
             continue
         fi
         if [ "$_added" -eq 0 ]; then
@@ -41,10 +48,10 @@ merge_list() { # merge_list <user_file> <package_file> <label>
             fi
         fi
         printf '%s\n' "$_e" >> "$_uf"
-        printf '%s\n' "$_e" >> "$_tmp"
+        printf '%s\n' "$_k" >> "$_keys"
         _added=$((_added + 1))
     done < "$_pf"
-    rm -f "$_tmp"
+    rm -f "$_keys"
     if [ "$_added" -gt 0 ]; then
         say "$_label: добавлено новых строк: $_added"
     fi
@@ -115,7 +122,7 @@ CONF_FOR_FETCH="$PREFIX/etc/susanin.conf"
 # r7.2: локальный SOCKS доступен? Только tproxy-конфиг и слушающийся socks-in
 # (127.0.0.1:1080 = 0x0438, состояние LISTEN 0A в /proc/net/tcp).
 susanin_socks_avail() {
-    _et=$(sed -n 's/^egress_type=//p' "$CONF_FOR_FETCH" 2>/dev/null | head -n1)
+    _et=$(sed -n 's/^[[:space:]]*egress_type[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF_FOR_FETCH" 2>/dev/null | tail -n1)
     [ "$_et" = "tproxy" ] || return 1
     awk '$2 ~ /:0438$/ && $4 == "0A" { f=1 } END { exit !f }' /proc/net/tcp 2>/dev/null
 }
@@ -151,6 +158,13 @@ if [ "$VERSION" = latest ]; then
 else
     BASE="https://github.com/$REPO/releases/download/$VERSION"
 fi
+# Только те архитектуры, для которых CI собирает бинарник
+# (.github/workflows/release.yml). Проверка до загрузки, чтобы не показывать
+# «скачивание не удалось» там, где сборки для этой платформы просто нет.
+case "$ARCH" in
+    mipsel|mips|aarch64|armv7|x86_64) : ;;
+    *) die "для архитектуры '$ARCH' готовых сборок нет (есть: mipsel, mips, aarch64, armv7, x86_64); обновите вручную: sh tools/update.sh --arch mipsel" ;;
+esac
 ASSET="susanin-keenetic-deploy-$ARCH.tar.gz"
 TMP=$(mktemp -d /tmp/susanin-upd.XXXXXX)
 
@@ -287,56 +301,67 @@ fi
 rm -f "$PREFIX/etc/vpn_always.txt".bak-[0-9]* \
       "$PREFIX/etc/vpn_never.txt".bak-[0-9]* 2>/dev/null || true
 
+# --- MIGRATION-BEGIN (тест tests/test-installer-sync.sh вырезает этот участок;
+# --- границы менять только вместе с тестом) -----------------------------------
 # Дописать отсутствующие дефолтные ключи (старый конфиг мог их не содержать).
-# Новые ключи добавляются со значениями по умолчанию; существующие не трогаем.
+# Перечень ключей и их значения берёт сам агент (`config sync`): рукописный
+# список в этом скрипте неминуемо отстаёт от кода — в нём не было ru_guard*,
+# tz, test_net_*, frozen_net_*, port_aware, ipset_batch, proxy_* и др., а
+# lan_interfaces, lan_subnets и media_ports остались с прежними дефолтами, так
+# что обновлённый роутер получал устаревшие настройки молча. Существующие
+# строки не перезаписываются: значение пользователя важнее дефолта.
 if [ -f "$PREFIX/etc/susanin.conf" ]; then
-    for kv in web_enable=0 web_listen= web_port=8087 web_token= \
-              egress_type=interface tproxy_port=12345 \
-              discover_exclude=wdtt0,wdttraw0,tun0,tap0 \
-              fast_syn_min_op=2 ok_max_entries=4096 ok_evict_misses=3 promo_per_min=120 \
-              soft_state_interval=12 \
-              egress_interface=nwg0 egress_address=10.8.1.1 lan_interfaces=br0 lan_subnets= \
-              routing_table=100 mark_test=0x10000000 mark_ok=0x20000000 mark_mask=0x30000000 \
-              ip_rule_priority_start=2000 fast_interval=1 soft_interval=1 judge_interval=1 \
-              health_interval=5 ok_ttl=21600 ok_refresh_below=3 test_ttl=1 cooldown_ttl=5 \
-              cooldown_ok_ttl=30 watch_ttl=8 watch_retry_below=4 health_probe=1.1.1.1,8.8.8.8 \
-              udp_relay=0 udp_relay_port=1081 socks_addr=127.0.0.1 socks_port=1080 \
-              log_level=info xray_loglevel=warning \
-              learn_exclude_ports=22,23,53,135,137,138,139,445,500,554,853,1433,1723,3306,3389,4500,5432,5900,6379,7547,8567,9100,11211,27017 \
-              vpn_always_file=/opt/susanin/etc/vpn_always.txt vpn_always_dns= \
-              vpn_always_interval=300 \
-              vpn_never_file=/opt/susanin/etc/vpn_never.txt vpn_never_interval=300 \
-              lan_server_interfaces= dp_check_interval=15 \
-              learn_min_op=10 learn_min_bytes=2000 confirm_min_bytes=512 learn_strict=0 \
-              precision= \
-              cdn_ranges_file=/opt/susanin/etc/cdn_ranges.txt \
-              cdn_ranges_url=https://www.cloudflare.com/ips-v4 \
-              cdn_ranges_interval=86400 cdn_prefix_learn=1 cdn_prefix_ttl=3600 \
-              cdn_prefix_max=24 aggregate_confirm=2 ipv6_block=1 \
-              quic_block=1 \
-              egress_failback=1 egress_failback_debounce=30 egress_race=0 \
-              xray_gogc=50 xray_gomemlimit=64MiB xray_watchdog=1 \
-              kernel_offload=0 kernel_egress= kernel_offload_max=24 \
-              dns_sniff=0 dns_sniff_ttl=300 dns_sniff_iface= pin_reassert=1 \
-              dns_hijack=0 dns_hijack_target= vpn_always_cdn_prefix=0 \
-              mss_clamp=0 mss_clamp_lan=0 profile_failover=1 \
-              auto_direct=1 direct_pref_ttl=3600 \
-              media_enabled=0 media_ports=80,443,554,1935,8080,8443 media_min_bytes=1048576 \
-              media_ratio=8 media_min_rate=150000 media_min_age=12 media_ttl=21600 media_prefix_max=24 \
-              health_mode=icmp health_tcp_port=443; do
-        k=${kv%%=*}; d=${kv#*=}
-        grep -q "^${k}=" "$PREFIX/etc/susanin.conf" 2>/dev/null \
-            || printf '%s=%s\n' "$k" "$d" >> "$PREFIX/etc/susanin.conf"
-    done
+    # Путь конфига передаём явно: у агента он по умолчанию /opt/susanin, а
+    # обновление может идти в другой --prefix — иначе sync правил бы не тот
+    # файл, что обновляется. Временное имя уникально: две сессии обновления не
+    # должны затирать вывод друг друга.
+    _sync_out=$(mktemp "${TMPDIR:-/tmp}/susanin-sync.XXXXXX" 2>/dev/null || echo "")
+    if [ -n "$_sync_out" ] &&
+       SUSANIN_CONF="$PREFIX/etc/susanin.conf" \
+           "$PREFIX/bin/susanin-agent" config sync >"$_sync_out" 2>/dev/null; then
+        say "конфиг: $(tr '\n' ' ' < "$_sync_out" 2>/dev/null)"
+    else
+        say "ВНИМАНИЕ: config sync не выполнился (старый бинарник?) —" \
+            "отсутствующие ключи не дописаны, проверьте susanin.conf вручную"
+    fi
+    [ -n "$_sync_out" ] && rm -f "$_sync_out"
 
     # Миграция значений по умолчанию (0.4.0): promo_per_min 30 -> 120.
     # Меняем только прежний дефолт; своё значение пользователя не трогаем.
-    _pp=$(sed -n 's/^promo_per_min=//p' "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+    # Форма с пробелами («promo_per_min = 30») читается агентом как обычный
+    # ключ, поэтому и миграция должна её видеть.
+    _pp=$(sed -n 's/^[[:space:]]*promo_per_min[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' \
+              "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
     if [ "$_pp" = "30" ]; then
-        sed -i 's/^promo_per_min=.*/promo_per_min=120/' "$PREFIX/etc/susanin.conf" 2>/dev/null \
+        sed -i 's|^[[:space:]]*promo_per_min[[:space:]]*=.*|promo_per_min=120|' \
+            "$PREFIX/etc/susanin.conf" 2>/dev/null \
             && say "promo_per_min: 30 -> 120 (новый дефолт)"
     fi
 fi
+
+# --- миграция уровня записи ---------------------------------------------------
+# Новый дефолт — минимум записей (log_level=warn, xray_loglevel=error). Прежние
+# значения по умолчанию меняются только если стоят как были; debug/quiet/none,
+# выбранные оператором, остаются как есть. Форма «key = value» читается агентом
+# как обычный ключ, поэтому и миграция должна её видеть.
+if [ -f "$PREFIX/etc/susanin.conf" ]; then
+    _ll=$(sed -n 's/^[[:space:]]*log_level[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' \
+              "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+    if [ "$_ll" = "info" ]; then
+        sed -i 's|^[[:space:]]*log_level[[:space:]]*=.*|log_level=warn|' \
+            "$PREFIX/etc/susanin.conf" 2>/dev/null \
+            && say "log_level: info -> warn (новый дефолт: минимум записей)"
+    fi
+    _xl=$(sed -n 's/^[[:space:]]*xray_loglevel[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' \
+              "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+    if [ "$_xl" = "warning" ]; then
+        sed -i 's|^[[:space:]]*xray_loglevel[[:space:]]*=.*|xray_loglevel=error|' \
+            "$PREFIX/etc/susanin.conf" 2>/dev/null \
+            && say "xray_loglevel: warning -> error (новый дефолт)"
+    fi
+fi
+
+# --- MIGRATION-END -------------------------------------------------------------
 
 # Данные CDN (cdn_ranges.txt): ставим, если файла ещё нет; существующий не трогаем.
 if [ -f "$DIR/cdn_ranges.txt" ] && [ ! -f "$PREFIX/etc/cdn_ranges.txt" ]; then

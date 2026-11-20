@@ -6,6 +6,7 @@
 #include "health.h"
 #include "profiles.h"
 #include "vpn_never.h"
+#include "vpin.h"
 #include "log.h"
 
 #include <arpa/inet.h>
@@ -558,9 +559,10 @@ static int test_age(const state_set *st, const susanin_config *cfg,
 #define DIRECT_PROBE_MAX 20
 #define DIRECT_PROBE_PER_SEC 2
 #define DOK_TTL_OK     300   /* «прямой путь отвечает»: не заворачивать, с */
-#define DOK_TTL_BUDGET 30    /* бюджет проб исчерпан: короткая отметка (r6:
-                              * раньше 120 с «замораживали» обучение на волне
-                              * фан-аута Lampa/ТВ на десятки хостов в минуту) */
+/* Отметки «проба не выполнена» больше нет: отсутствие проверки не может
+ * оформляться как её положительный результат (см. sf_note и ветку бюджета).
+ * Ранее такая отметка на волне фан-аута ТВ-плеера на десятки хостов в минуту
+ * замораживала обучение целиком. */
 #define DOK_MAX        256
 
 /* Негативный кэш «прямой путь отвечает»: адрес не заворачиваем и повторно не
@@ -646,7 +648,7 @@ static unsigned long cmin_bytes(const susanin_config *c)
 typedef struct { char cidr[64]; char last[AG_HIST][64]; int n; time_t at; } agslot;
 static agslot ag[AG_CONF];
 
-/* Вариант с явным порогом (frozen-наследию нужен свой, выше media/CDN). */
+/* Вариант с явным порогом для общей таблицы cdn/media (aggregate_confirm). */
 static int ag_confirm_n(int want, const char *cidr, const char *addr)
 {
     int i, k, free_i = -1, oldest = 0;
@@ -693,6 +695,56 @@ static int ag_confirm(const susanin_config *cfg, const char *cidr, const char *a
                         cidr, addr);
 }
 
+/* r4.2 (frozen): отдельная таблица подтверждений. Порог frozen_net_min_ips
+ * отличается от aggregate_confirm (cdn/media), а общий счётчик по ключу-cidr
+ * давал бы перекрёстное срабатывание: подтверждения CDN/media доводили бы
+ * счётчик до чужого (меньшего) порога и сеть агрегировалась бы раньше времени. */
+#define FR_CONF 64
+#define FR_HIST 3
+#define FR_WINDOW_S 600
+typedef struct { char cidr[64]; char last[FR_HIST][64]; int n; time_t at; } frslot;
+static frslot fr[FR_CONF];
+
+static int fr_confirm_n(int want, const char *cidr, const char *addr)
+{
+    int i, k, free_i = -1, oldest = 0;
+    if (want < 1)
+        want = 1;
+    time_t now = time(NULL);
+    for (i = 0; i < FR_CONF; i++) {
+        if (fr[i].cidr[0] && !strcmp(fr[i].cidr, cidr)) {
+            if (now - fr[i].at > FR_WINDOW_S) {
+                fr[i].n = 0;
+                for (k = 0; k < FR_HIST; k++)
+                    fr[i].last[k][0] = '\0';
+            }
+            for (k = 0; k < FR_HIST; k++)
+                if (fr[i].last[k][0] && !strcmp(fr[i].last[k], addr)) {
+                    fr[i].at = now;
+                    return fr[i].n >= want;
+                }
+            for (k = FR_HIST - 1; k > 0; k--)
+                memcpy(fr[i].last[k], fr[i].last[k - 1], sizeof(fr[i].last[k]));
+            snprintf(fr[i].last[0], sizeof(fr[i].last[0]), "%s", addr);
+            fr[i].n++;
+            fr[i].at = now;
+            return fr[i].n >= want;
+        }
+        if (!fr[i].cidr[0] && free_i < 0)
+            free_i = i;
+        if (fr[i].at < fr[oldest].at)
+            oldest = i;
+    }
+    i = free_i >= 0 ? free_i : oldest;
+    snprintf(fr[i].cidr, sizeof(fr[i].cidr), "%s", cidr);
+    for (k = 0; k < FR_HIST; k++)
+        fr[i].last[k][0] = '\0';
+    snprintf(fr[i].last[0], sizeof(fr[i].last[0]), "%s", addr);
+    fr[i].n = 1;
+    fr[i].at = now;
+    return want <= 1;
+}
+
 /* r4.2: ТСПУ замораживает не адреса, а целые
  * сети хостингов (Hetzner/OVH/DO/Vultr/M247...). Если N РАЗНЫХ IP одного
  * префикса подтвердились как «нужен VPN» — заморозка сетевая: заносим префикс
@@ -727,7 +779,7 @@ static void frozen_net_aggregate(classifier_ctx *ctx, const ct_flow *f)
         return;
     snprintf(cidr, sizeof(cidr), "%s/%d", ab, pre);
     want = cfg->frozen_net_min_ips >= 1 ? cfg->frozen_net_min_ips : 3;
-    if (!ag_confirm_n(want, cidr, f->dst)) {
+    if (!fr_confirm_n(want, cidr, f->dst)) {
         slogf(SL_DEBUG, "FROZEN-NET: %s копит подтверждения (нужно %d разных IP)",
               cidr, want);
         return;
@@ -824,7 +876,7 @@ static void test_net_aggregate(classifier_ctx *ctx, const ct_flow *f, time_t now
     if (state_has(&ctx->st->net, cidr, now))
         return;
     want = cfg->test_net_min_ips >= 1 ? cfg->test_net_min_ips : 2;
-    win = cfg->test_net_window > 0 ? cfg->test_net_window : 60;
+    win = cfg->test_net_window > 0 ? cfg->test_net_window : CFG_DEF_TEST_NET_WINDOW;
     if (!tn_confirm(want, win, cidr, f->dst)) {
         slogf(SL_DEBUG, "TEST-NET: %s копит подтверждения (нужно %d разных IP за %d с)",
               cidr, want, win);
@@ -835,7 +887,7 @@ static void test_net_aggregate(classifier_ctx *ctx, const ct_flow *f, time_t now
         slogf(SL_DEBUG, "TEST-NET: не агрегирую %s — адрес в vpn_never", f->dst);
         return;
     }
-    ttl = cfg->test_net_ttl > 0 ? cfg->test_net_ttl : 600;
+    ttl = cfg->test_net_ttl > 0 ? cfg->test_net_ttl : CFG_DEF_TEST_NET_TTL;
     backend_net_add(cfg, cidr, ttl);
     state_touch(&ctx->st->net, cidr, now, ttl);
     slogf(SL_INFO, "TEST-NET: %s -> vpn (%d IP в test за %d с, последний %s, ttl=%ds)",
@@ -1019,6 +1071,8 @@ static void media_aggregate(classifier_ctx *ctx, const ct_flow *f)
     if (inet_pton(AF_INET, f->dst, &a) != 1)
         return;
     pre = cfg->media_prefix_max > 0 ? cfg->media_prefix_max : 24;
+    if (pre < 8)
+        pre = 8;
     if (pre > 32)
         pre = 32;
     ah = ntohl(a.s_addr);
@@ -1074,19 +1128,6 @@ static void trace_refused(const ct_flow *f, const char *stage,
     slogf(SL_TRACE, "%s ref=%s", tr, cause);
 }
 
-/* Сильное клиентское доказательство дропа SYN (2026-11-02, решение владельца
- * по refused:budget=505/сутки): столько ретранслитов — уже не «медленный
- * сервер», а дроп (DPI/блэкхол). Проба тут не нужна и вредна вдвойне: на
- * дропающем хосте она молчит все 1200 мс, вешая цикл, и расходует бюджет
- * ровно на тех кандидатах, что гарантированно блокированы. Порог: удвоенный
- * fast_syn_min_op, но не меньше 4 ретранслитов (~3-4 с попыток клиента). */
-static int syn_evidence_strong(const susanin_config *cfg, const ct_flow *f)
-{
-    int v = 2 * (cfg->fast_syn_min_op > 0 ? cfg->fast_syn_min_op : 2);
-    if (v < 4)
-        v = 4;
-    return f->op >= (unsigned long)v;
-}
 /* Счётчик событий обучения за проход: промоушен в test, подтверждение (ok),
  * кулдаун, взятие под наблюдение (watch). Движок читает и обнуляет его через
  * clf_take_events() и держит обычный темп сканирования, пока события есть;
@@ -1100,33 +1141,342 @@ unsigned clf_take_events(void)
     return n;
 }
 
-/* Пропуск обучения — INFO, но не чаще раза в 10 минут на адрес. С r7.4a
- * виден и LAN-источник («кто запросил») — без него диагностика ТВ/приложений
- * вслепую. Таблица на 16 адресов: при волне пропусков (например, «бюджет проб
- * исчерпан» на фан-ауте источника) адреса чередуются, и с одним «последним»
- * слотом строка писалась бы каждый проход — по сути каждую секунду. */
-#define SKIP_SLOTS 16
+/* Пропуск обучения — это НЕ событие, а отсутствие решения, поэтому в
+ * постоянный лог он не пишется вовсе. Прежняя версия давала 30 111 строк за
+ * час наблюдения (98 % всего лога, ~85 строк/с непрерывной записи на ext4 на
+ * USB-накопителе), и именно эта запись была заметным источником iowait на
+ * слабом роутере.
+ *
+ * Причина, по которой строки считались необходимыми, отменена самой правкой
+ * выше: «проба не выполнена: бюджет» и «недавно проверено: прямой жив» были
+ * единственным способом увидеть, что адрес не уехал в VPN из-за голодания
+ * прямой пробы. Теперь гибель соединений клиента сама по себе достаточное
+ * основание завернуть адрес, и голодание бюджета больше не является причиной
+ * простоя — то есть цена (постоянная запись на flash) осталась, а польза ушла.
+ *
+ * Что осталось для диагностики:
+ *  - поштучная строка на SL_DEBUG — включается сознательно при разборе;
+ *  - `susanin-agent why <ip>`: пересчитывает вердикт по наборам, state и
+ *    спискам и объясняет, почему адрес идёт так, без единой строки в логе. */
+static const char *const sk_names[] = {
+    "недавно проверено: прямой жив",
+    "проба не выполнена: бюджет",
+    "vpn_never",
+    "recently vpn_never",
+    "ru-guard"
+};
+enum { SK_DOK, SK_BUDGET, SK_NEVER, SK_RECENT, SK_RU };
+#define SK_N ((int)(sizeof(sk_names) / sizeof(sk_names[0])))
+
 static void skip_note(const char *src, const char *ip, unsigned port,
-                      time_t now, const char *why)
+                      time_t now, int why)
 {
-    static char last_ip[SKIP_SLOTS][64];
-    static time_t last_at[SKIP_SLOTS];
-    static int sn_next;
-    int i, hit = -1, oldest = 0;
-    for (i = 0; i < SKIP_SLOTS; i++) {
-        if (!strcmp(last_ip[i], ip)) { hit = i; break; }
-        if (last_at[i] < last_at[oldest]) oldest = i;
-    }
-    if (hit < 0)
-        hit = (last_at[oldest] && now - last_at[oldest] < 600)
-                  ? sn_next   /* все слоты свежие — пишем кругом */
-                  : oldest;   /* есть протухший — переиспользуем его */
-    else if (now - last_at[hit] < 600)
+    (void)now;
+    if (why < 0 || why >= SK_N)
         return;
-    sn_next = (hit + 1) % SKIP_SLOTS;
-    snprintf(last_ip[hit], sizeof(last_ip[hit]), "%.63s", ip);
-    last_at[hit] = now;
-    slogf(SL_INFO, "AUTO-SUSANIN: skip %s -> %s:%u (%s)", src, ip, port, why);
+    slogf(SL_DEBUG, "AUTO-SUSANIN: skip %s -> %s:%u (%s)",
+          src, ip, port, sk_names[why]);
+}
+
+/* Учёт погибших соединений: сколько РАЗНЫХ СОЕДИНЕНИЙ (src:порт источника)
+ * потеряли SYN на один и тот же dst:port внутри synfail_window.
+ *
+ * Почему соединения, а не «разные LAN-хосты»: ixbt и IPTV-плеер — это ОДИН
+ * клиент, который ретраит одно и то же назначение. Требование «разные
+ * источники» было бы недостижимо ровно в тех случаях, ради которых механизм
+ * и вводится. При этом одно залипшее соединение с бесконечными ретрансмитами
+ * — слабое основание, поэтому считаем число различных соединений.
+ *
+ * Счётчик нужен потому, что решение зависело от прямой пробы, а проба — это
+ * connect() с самого роутера, тогда как умирает поток клиента. Проба к тому
+ * же ограничена общим бюджетом (10/мин на весь роутер), и при её нехватке
+ * прежняя версия записывала адрес в негативный кэш как «прямой жив» — то есть
+ * отсутствие проверки оформлялось как проверка с положительным результатом.
+ * За час наблюдения на стенде: 12 настоящих проб против 30111 отметок
+ * «прямой жив». Лечение отключалось ровно под нагрузкой, когда оно нужно. */
+#define SF_SLOTS 128
+#define SF_FLOWS CFG_SYNFAIL_QUORUM_MAX
+/* src — это ct_flow::src[64], плюс ":" и порт до 10 цифр: 75 с завершающим
+ * нулём. Меньший буфер обрезал бы ключ молча, и одно и то же соединение
+ * начало бы считаться разными. */
+#define SF_FLOWLEN 80
+typedef struct {
+    char key[64];              /* dst или dst:port (как pair_key) */
+    time_t first, last;
+    char flow[SF_FLOWS][SF_FLOWLEN]; /* "src:sport" учтённых в окне соединений */
+    unsigned nflow;
+} sf_slot;
+static sf_slot sf_tab[SF_SLOTS];
+
+static sf_slot *sf_slot_get(const char *key)
+{
+    int i, free_i = -1, oldest = 0;
+    for (i = 0; i < SF_SLOTS; i++) {
+        if (!sf_tab[i].key[0]) {
+            if (free_i < 0)
+                free_i = i;
+            continue;
+        }
+        if (!strcmp(sf_tab[i].key, key))
+            return &sf_tab[i];
+        if (sf_tab[i].last < sf_tab[oldest].last)
+            oldest = i;
+    }
+    if (free_i >= 0)
+        return &sf_tab[free_i];
+    return &sf_tab[oldest];      /* таблица замкнутая: вытесняем самый старый */
+}
+
+/* 1 = quorum набран: можно заворачивать в VPN без прямой пробы.
+ *
+ * Окно — от первого учтённого события (s->first), и сброс тоже по нему.
+ * Прежняя пара условий (сброс по s->last, вердикт по s->first) запирала
+ * механизм: при непрерывных гибелях SYN last обновляется каждый проход,
+ * сброс не наступает, а now-first растёт, поэтому после первого окна вердикт
+ * становился 0 навсегда — то есть ПЕРВЫЙ перевод адреса работал, а повторный
+ * (после возврата адреса в direct) уже нет. Замер на стенде: 11 срабатываний
+ * в первом окне и 0 дальше.
+ *
+ * Окно кувыркающееся, а не скользящее: гибели на границе окон попадают в
+ * разные, поэтому в худшем случае обнаружение занимает до 2*synfail_window.
+ * Скользящее окно потребовало бы хранить момент каждого соединения; при
+ * дефолтных 3/120 с лишная точность не окупается лишним кодом и памятью.
+ *
+ * Вердикт по nflow, а не по накопленному счётчику: nflow ограничен размером
+ * кольца и не растёт, когда уже запомненное соединение видно снова. Порог
+ * выше SF_FLOWS был бы недостижим как «разных соединений», поэтому он
+ * клампится (о клампе говорится при загрузке конфига, а не молча). */
+static int sf_note(const susanin_config *cfg, const char *key,
+                   const char *flow, time_t now)
+{
+    sf_slot *s;
+    int i, q, win = cfg->synfail_window > 0 ? cfg->synfail_window : CFG_DEF_SYNFAIL_WINDOW;
+
+    if (cfg->synfail_quorum <= 0)
+        return 0;                    /* механизм выключен — прежнее поведение */
+    q = cfg->synfail_quorum > SF_FLOWS ? SF_FLOWS : cfg->synfail_quorum;
+
+    s = sf_slot_get(key);
+    if (!s->key[0] || strcmp(s->key, key) != 0 || now - s->first > win) {
+        /* Новый ключ или окно истекло: счёт начинается заново. */
+        snprintf(s->key, sizeof(s->key), "%.63s", key);
+        s->first = now;
+        s->nflow = 0;
+    }
+    s->last = now;
+    for (i = 0; i < (int)s->nflow; i++)
+        if (!strcmp(s->flow[i], flow))
+            break;                   /* это соединение уже учтено */
+    if (i >= (int)s->nflow) {
+        if (s->nflow < SF_FLOWS) {
+            snprintf(s->flow[s->nflow], sizeof(s->flow[0]), "%.*s",
+                     (int)sizeof(s->flow[0]) - 1, flow);
+            s->nflow++;
+        } else {
+            /* Кольцо заполнено: сдвигаем и запоминаем новое. nflow при этом
+             * остаётся SF_FLOWS — то есть «не менее SF_FLOWS разных
+             * соединений в окне» по-прежнему правда, и quorum (≤ SF_FLOWS)
+             * уже заведомо набран. */
+            memmove(s->flow[0], s->flow[1],
+                    (SF_FLOWS - 1) * sizeof(s->flow[0]));
+            snprintf(s->flow[SF_FLOWS - 1], sizeof(s->flow[0]), "%.*s",
+                     (int)sizeof(s->flow[0]) - 1, flow);
+        }
+    }
+    return (int)s->nflow >= q;
+}
+
+/* Подтверждение stall-сигналов: «рукопожатие прошло, ClientHello отправлен,
+ * в ответ — ни байта». Прежде одного такого наблюдения хватало, чтобы увести
+ * адрес в чужой выход, но медленный первый байт — нормальная форма антиботов
+ * и тяжёлых страниц: такому сайту чужой выход вредит сильнее (403/капча), чем
+ * ожидание по прямому пути. Первое наблюдение — только постановка пары под
+ * наблюдение (st_watch, тот же ключ и тот же TTL, что у FREEZE/late-stall
+ * веток); решение — когда признак пережил stall_confirm окон детектора.
+ *
+ * Счёт идёт по окнам, а не по пакетам и не по числу параллельных потоков:
+ * тот же принцип, что у sf_note для SYN-кворума. Проход опознаётся по метке
+ * времени наблюдения (одна секунда — одно окно), иначе разговорчивый клиент
+ * с десятью сокетами до одного сайта набрал бы весь кворум за один проход. */
+#define SC_SLOTS 128
+typedef struct {
+    char key[64];              /* dst или dst:port (как pair_key) */
+    time_t first, last;
+    int n;                     /* различных окон с признаком */
+} sc_slot;
+static sc_slot sc_tab[SC_SLOTS];
+static int sc_live;            /* занятых слотов: пока ноль, проверка на здоровую
+                                * передачу в clr_fast ничего не трогает */
+
+static sc_slot *sc_slot_find(const char *key)
+{
+    int i;
+    for (i = 0; i < SC_SLOTS; i++)
+        if (sc_tab[i].key[0] && !strcmp(sc_tab[i].key, key))
+            return &sc_tab[i];
+    return NULL;
+}
+
+static sc_slot *sc_slot_get(const char *key)
+{
+    int i, free_i = -1, oldest = 0;
+    for (i = 0; i < SC_SLOTS; i++) {
+        if (!sc_tab[i].key[0]) {
+            if (free_i < 0)
+                free_i = i;
+            continue;
+        }
+        if (!strcmp(sc_tab[i].key, key))
+            return &sc_tab[i];
+        if (sc_tab[i].last < sc_tab[oldest].last)
+            oldest = i;
+    }
+    if (free_i >= 0) {
+        sc_live++;
+        return &sc_tab[free_i];
+    }
+    return &sc_tab[oldest];    /* таблица замкнутая: вытесняем самое старое
+                                * наблюдение, счётчик занятых не меняется */
+}
+
+static void sc_slot_release(sc_slot *s)
+{
+    s->key[0] = '\0';
+    s->n = 0;
+    sc_live--;
+}
+
+/* Серия переживает не дольше watch_ttl без нового окна — те же часы, что у
+ * самой watch-записи, чтобы счётчик и состояние не противоречили друг
+ * другу. watch_ttl=0 в этом месте — действующий default, см. config.h. */
+static int sc_window(const susanin_config *cfg)
+{
+    return cfg->watch_ttl > 0 ? cfg->watch_ttl : CFG_DEF_WATCH_TTL;
+}
+
+/* Число различных окон признака для пары (1 =series только начата). */
+static int sc_note(const susanin_config *cfg, const char *key, time_t now)
+{
+    sc_slot *s = sc_slot_get(key);
+    int win = sc_window(cfg);
+
+    if (!s->key[0] || strcmp(s->key, key) != 0 || now - s->last > win) {
+        /* Новый ключ или серия остыла: счёт начинается заново. */
+        snprintf(s->key, sizeof(s->key), "%.63s", key);
+        s->first = now;
+        s->last = now;
+        s->n = 1;
+    } else if (now != s->last) {
+        /* Новое окно. Та же метка времени — тот же проход: повторные
+         * наблюдения пары в одном проходе счёт не накручивают. */
+        s->last = now;
+        s->n++;
+    }
+    return s->n;
+}
+
+/* Набран ли уже SYN-кворум для назначения — read-only взгляд на sf_tab.
+ * Сами stall-наблюдения туда не пишутся: гибели SYN — улика другого сигнала
+ * (соединения клиента реально умирают), оформлять тишину как их гибель
+ * значит подделывать доказательство. */
+static int sf_quorum_seen(const susanin_config *cfg, const char *key, time_t now)
+{
+    int i, q, win = cfg->synfail_window > 0
+                       ? cfg->synfail_window : CFG_DEF_SYNFAIL_WINDOW;
+
+    if (cfg->synfail_quorum <= 0)
+        return 0;
+    q = cfg->synfail_quorum > SF_FLOWS ? SF_FLOWS : cfg->synfail_quorum;
+    for (i = 0; i < SF_SLOTS; i++) {
+        if (!sf_tab[i].key[0] || strcmp(sf_tab[i].key, key) != 0)
+            continue;
+        if (now - sf_tab[i].first > win)
+            return 0;               /* окно истекло: прежняя серия не в счёт */
+        return (int)sf_tab[i].nflow >= q;
+    }
+    return 0;
+}
+
+/* Ворота промоушена stall-сигналов. Возврат 1 — решение отложено, пара
+ * держится (или поставлена) под наблюдением; 0 — промоушен разрешён, и тогда
+ * в lb уточнённая лог-причина: «...-CONFIRMED» — решение после всей серии
+ * окон, «...+SYN-QUORUM» — кворум погибших соединений снял ожидание.
+ * Пустая lb — прежний мгновенный режим (stall_confirm<=1 без свежей отметки
+ * «прямой жив»): в логе он неотличим от прежнего поведения, что честно.
+ *
+ * Свежая отметка dok «прямой путь отвечает» — результат недавней пробы с
+ * роутера: пока она жива, одно наблюдение тишины её не перебивает, нужно
+ * минимум два окна даже в мгновенном режиме. Гибели SYN на то же назначение
+ * — альтернатива: прямой путь сломан по факту, а отметка устарела, та же
+ * сила доказательства, что в syn-ветке promote_test. */
+static int stall_hold(classifier_ctx *ctx, const char *kf, const char *dst,
+                      const char *reason, time_t now, char *lb, size_t lbn)
+{
+    const susanin_config *cfg = ctx->cfg;
+    sc_slot *s;
+    int need = cfg->stall_confirm >= 1 ? cfg->stall_confirm : 1;
+    int n;
+
+    if (dok_has(dst, now) && need < 2)
+        need = 2;
+
+    n = sc_note(cfg, kf, now);
+    if (n >= need) {
+        if (need > 1)
+            snprintf(lb, lbn, "%s-CONFIRMED", reason);
+        s = sc_slot_find(kf);
+        if (s)
+            sc_slot_release(s);   /* серия израсходована */
+        return 0;
+    }
+    if (sf_quorum_seen(cfg, kf, now)) {
+        snprintf(lb, lbn, "%s+SYN-QUORUM", reason);
+        s = sc_slot_find(kf);
+        if (s)
+            sc_slot_release(s);
+        return 0;
+    }
+    /* Ожидание следующего окна — не решение и не пропуск с вердиктом,
+     * поэтому только DEBUG; событие считаем: движок держит быстрый темп
+     * сканирования conntrack, а серия живёт ровно watch_ttl. Watch-запись
+     * ставится только здесь: в мгновенном режиме (stall_confirm<=1) решения
+     * ждать нечего, и оставленный «на будущее» watch ускорял бы чужие ветки
+     * (late-stall) по тому же назначению. */
+    state_touch(st_watch(ctx->st, 0), kf, now, sc_window(cfg));
+    slogf(SL_DEBUG, "STALL-WATCH: %s — окно %d/%d, решение после всей серии",
+          kf, n, need);
+    g_clf_events++;
+    return 1;
+}
+
+/* Здоровая передача снимает stall-наблюдение: ответ пошёл — тишина была
+ * переходящей, и серия не должна потом «дозреть» из устаревших окон.
+ * Watch-запись общая с FREEZE/late-stall, поэтому трогаем только пары,
+ * за которыми действительно числится stall-наблюдение: чужие наблюдения
+ * живут свои TTL. */
+static void stall_release(classifier_ctx *ctx, const char *kf)
+{
+    sc_slot *s = sc_slot_find(kf);
+    if (!s)
+        return;
+    sc_slot_release(s);
+    state_remove(st_watch(ctx->st, 0), kf);
+}
+
+/* Снять серии, которые не обновлялись дольше окна. Без этого занятые слоты
+ * копятся до SC_SLOTS (серия истекает, но ключ остаётся), sc_live никогда не
+ * возвращается к нулю, и проверка «пока таблица пуста — не трогаем поток»
+ * перестаёт экономить: pair_key и перебор всех слотов начинают выполняться на
+ * каждом TCP-потоке каждого прохода. */
+static void sc_purge(const susanin_config *cfg, time_t now)
+{
+    int i, win = sc_window(cfg);
+    if (!sc_live)
+        return;
+    for (i = 0; i < SC_SLOTS; i++) {
+        if (sc_tab[i].key[0] && now - sc_tab[i].last > (time_t)win)
+            sc_slot_release(&sc_tab[i]);
+    }
 }
 
 static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
@@ -1135,6 +1485,7 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
     int udp = is_udp(f);
     const susanin_config *cfg = ctx->cfg;
     char kf[64];
+    char lb[48];
     pair_key(kf, sizeof(kf), cfg, f);
     int syn = !strcmp(reason, "TCP-SYN");
     /* quic_block=1 дропает UDP/443 из LAN в mangle PREROUTING ПЕРВЫМ правилом,
@@ -1147,6 +1498,7 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
               f->dst, f->dport);
         return;
     }
+    const char *logreason = reason;
     /* Адрес СЕЙЧАС в vpn_never — он должен идти напрямую: не учим (иначе
      * vn_refresh/ipset и наш state расходятся, и sweep_direct рвёт его потоки).
      * Учитываем и список vpn_never, и пины DNS-снифинга (st.never). */
@@ -1154,7 +1506,7 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
         if (!rf_seen(f->dst, "never", now)) {
             nm_cnt[NM_NEVER]++;
             trace_refused(f, stage, reason, "never");
-            skip_note(f->src, f->dst, f->dport, now, "vpn_never");
+            skip_note(f->src, f->dst, f->dport, now, SK_NEVER);
         }
         return;
     }
@@ -1165,7 +1517,7 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
         if (!rf_seen(f->dst, "recent", now)) {
             nm_cnt[NM_RECENT]++;
             trace_refused(f, stage, reason, "recent");
-            skip_note(f->src, f->dst, f->dport, now, "recently vpn_never");
+            skip_note(f->src, f->dst, f->dport, now, SK_RECENT);
         }
         return;
     }
@@ -1177,9 +1529,12 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
     if (cfg->ru_guard) {
         char rgd[DNS_DOMAIN_MAX];
         rgd[0] = '\0';
+        /* Мягкая запись ?domain — исключение: RU-домену нужен VPN-фолбэк,
+         * иначе в волну ТСПУ он остаётся без рабочего пути. */
         if (dns_sniff_domain_of(f->dst, rgd, sizeof(rgd)) && rgd[0] &&
-            dns_sniff_is_ru_domain(cfg, rgd)) {
-            skip_note(f->src, f->dst, f->dport, now, "ru-guard");
+            dns_sniff_is_ru_domain(cfg, rgd) &&
+            !dns_sniff_is_soft_domain(cfg, rgd)) {
+            skip_note(f->src, f->dst, f->dport, now, SK_RU);
             return;
         }
     }
@@ -1190,49 +1545,73 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
      * Негативный кэш тоже относится только к этому случаю: он не должен
      * запрещать обучение по сигналам SNI (DPI-RST/CLOSE). */
     if (f->l4proto == 6 && f->dport > 0 && syn) {
-        /* dok — для ВСЕХ SYN-кандидатов, включая сильные (инцидент
-         * 2026-11-03: торрент-рой, ref=dok 55k за ночь): без него
-         * промоушен → ct_delete → новый коннект клиента → перепромоушен
-         * каждые ~70 с для каждого мёртвого пира, бесконечно. */
-        if (dok_has(f->dst, now)) {
-            if (!rf_seen(f->dst, "dok", now)) {
-                nm_cnt[NM_DOK]++;
-                trace_refused(f, stage, reason, "dok");
-                skip_note(f->src, f->dst, f->dport, now, "недавно проверено: прямой жив");
+        char fl[SF_FLOWLEN];
+        int evid;
+        snprintf(fl, sizeof(fl), "%s:%u", f->src, f->sport);
+        evid = sf_note(cfg, kf, fl, now);
+        if (evid) {
+            /* Гибель соединений клиента — более сильное доказательство, чем
+             * один connect() с роутера: блокируют трафик клиента, а не наш
+             * пробный сокет. Пробу и её бюджет пропускаем целиком. */
+            logreason = "TCP-SYN-QUORUM";
+        } else {
+            if (dok_has(f->dst, now)) {
+                if (!rf_seen(f->dst, "dok", now)) {
+                    nm_cnt[NM_DOK]++;
+                    trace_refused(f, stage, reason, "dok");
+                    skip_note(f->src, f->dst, f->dport, now, SK_DOK);
+                }
+                return;
             }
-            return;
-        }
-        if (!syn_evidence_strong(cfg, f)) {
-        if (!direct_probe_budget_ok(now)) {
-            /* Бюджет проб исчерпан: осознанно НЕ заворачиваем (короткая отметка),
-             * иначе защита отключалась бы ровно под нагрузкой. */
-            dok_add(f->dst, now, DOK_TTL_BUDGET);
-            if (!rf_seen(f->dst, "budget", now)) {
-                nm_cnt[NM_BUDGET]++;
-                trace_refused(f, stage, reason, "budget");
-                skip_note(f->src, f->dst, f->dport, now, "бюджет проб исчерпан");
+            if (!direct_probe_budget_ok(now)) {
+                /* Бюджет исчерпан: не заворачиваем — но и НЕ записываем адрес
+                 * в негативный кэш. Прежняя версия ставила отметку «прямой
+                 * жив» на 30 с без всякой проверки, и следующий проход брал
+                 * решение уже из неё: при фан-ауте ТВ и телефонов адрес не
+                 * пробовался никогда (за час наблюдения — 12 реальных проб
+                 * против 30111 отметок). Защита от перегрузки отключала
+                 * лечение ровно под нагрузкой, когда оно нужно. */
+                if (!rf_seen(f->dst, "budget", now)) {
+                    nm_cnt[NM_BUDGET]++;
+                    trace_refused(f, stage, reason, "budget");
+                    skip_note(f->src, f->dst, f->dport, now, SK_BUDGET);
+                }
+                return;
             }
-            return;
-        }
-        if (!direct_probe_sec_ok(now))
-            return;   /* лимит на секунду: решим в следующий проход, не заворачиваем */
-        if (health_probe_tcp_direct(f->dst, f->dport, DIRECT_PROBE_MS)) {
-            /* Отказ по «прямой жив» — самый дешёвый пропуск блокировки: TCP
-             * рукопожатие проходит и при DPI-блокировке по SNI. */
-            dok_add(f->dst, now, DOK_TTL_OK);
-            if (!rf_seen(f->dst, "direct", now)) {
-                nm_cnt[NM_DIRECT]++;
-                trace_refused(f, stage, reason, "direct");
-                slogf(SL_INFO, "AUTO-SUSANIN: %s skip %s -> %s:%u (прямой путь отвечает)",
-                      stage, f->src, f->dst, f->dport);
+            if (!direct_probe_sec_ok(now))
+                return;   /* лимит на секунду: решим в следующий проход, не заворачиваем */
+            if (health_probe_tcp_direct(f->dst, f->dport, DIRECT_PROBE_MS)) {
+                /* Отказ по «прямой жив» — самый дешёвый пропуск блокировки: TCP
+                 * рукопожатие проходит и при DPI-блокировке по SNI. */
+                dok_add(f->dst, now, DOK_TTL_OK);
+                if (!rf_seen(f->dst, "direct", now)) {
+                    nm_cnt[NM_DIRECT]++;
+                    trace_refused(f, stage, reason, "direct");
+                    slogf(SL_INFO, "AUTO-SUSANIN: %s skip %s -> %s:%u (прямой путь отвечает)",
+                          stage, f->src, f->dst, f->dport);
+                }
+                return;
             }
-            return;
-        }
         }
         /* Демпфер петли: отметка «недавно заворачивали» на 300 с.
          * Подтверждённые сюда не доходят (candidate_ok), TIMEOUT-кандидат
-         * заглушен вместо перепродвижения каждую минуту. */
+         * заглушен вместо перепродвижения каждую минуту.
+         * (инцидент 2026-11-03: торрент-рой — 55k re-promo за ночь). */
         dok_add(f->dst, now, DOK_TTL_OK);
+    }
+    /* Подтверждение stall-сигналов: «рукопожатие прошло, ответа нет» — см.
+     * stall_hold. Шлюз стоит после never/recently-never/ru_guard (под
+     * наблюдение не берём то, что в VPN не поедает никогда) и после
+     * syn-ветки: проба и негативный кэш в ней относятся только к «SYN ушёл
+     * без ответа», здесь же другое доказательство и другой порядок. Сигналы,
+     * опирающиеся на явный сброс (DPI-RST) или не дошедший handshake (QUIC,
+     * TCP-SYN/CLOSE), остаются мгновенными: подтверждать в них нечего. */
+    if (!strcmp(reason, "DPI-STALL") || !strcmp(reason, "TCP-CLOSE-EMPTY")) {
+        lb[0] = '\0';
+        if (stall_hold(ctx, kf, f->dst, reason, now, lb, sizeof(lb)))
+            return;
+        if (lb[0])
+            logreason = lb;
     }
     /* D1: снимаем «мягкое прямо» (DIRECT_PREF), иначе RETURN в цепочке не даст
      * адресу уйти в VPN, когда прямой путь снова деградировал. */
@@ -1252,10 +1631,10 @@ static void promote_test(classifier_ctx *ctx, const ct_flow *f, time_t now,
         dns_sniff_domain_of(f->dst, dm, sizeof(dm));
         if (dm[0])
             slogf(SL_INFO, "AUTO-SUSANIN: %s %s %s -> %s:%u (%s)",
-                  stage, reason, f->src, f->dst, f->dport, dm);
+                  stage, logreason, f->src, f->dst, f->dport, dm);
         else
             slogf(SL_INFO, "AUTO-SUSANIN: %s %s %s -> %s:%u",
-                  stage, reason, f->src, f->dst, f->dport);
+                  stage, logreason, f->src, f->dst, f->dport);
     }
     /* Вектор признаков решения: без него в датасете есть только вердикт.
      * Lookup домена — проход по таблице dns_sniff, поэтому только под
@@ -1350,6 +1729,7 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
 {
     const susanin_config *cfg = ctx->cfg;
     int i;
+    sc_purge(cfg, now);      /* истёкшие серии освобождают слоты (см. sc_purge) */
     for (i = 0; i < n; i++) {
         const ct_flow *f = &flows[i];
         if (f->l4proto != 6 && f->l4proto != 17) continue;
@@ -1403,7 +1783,8 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                 /* Post-handshake «тишина» по SNI: рукопожатие прошло (rp>=1),
                  * ClientHello отправлен (ob растёт), данных нет (rb<128), но
                  * соединение ещё ESTABLISHED (ТСПУ держит тишину). Ловим на FAST,
-                 * не дожидаясь SOFT. */
+                 * не дожидаясь SOFT. Решение — не по одному наблюдению:
+                 * stall-сигналы подтверждаются серией окон (stall_hold). */
                 promote_test(ctx, f, now, "FAST", "DPI-STALL");
             else if (strcmp(f->tcp_state, "CLOSE") == 0 && f->rp >= 1 &&
                      f->rb < 128 && f->ob >= lmin_bytes(cfg) &&
@@ -1414,11 +1795,21 @@ void clr_fast(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                  * HTTP-источники на замороженных сетях (порт 80!) не ловились
                  * вообще. Плюс direct-проба (после 0.4.4) помечает такие хосты
                  * «прямой жив» по успешному connect — CLOSE-EMPTY её не
-                 * слушает и учит адрес дальше. */
+                 * слушает и учит адрес дальше. И здесь решение — после серии
+                 * окон подтверждения (stall_hold). */
                 promote_test(ctx, f, now, "FAST", "TCP-CLOSE-EMPTY");
         } else if (f->l4proto == 17) {
             if (f->dport == 443 && f->op >= (cfg->learn_strict ? 8UL : 6UL) && f->rp == 0)
                 promote_test(ctx, f, now, "FAST", "QUIC");
+        }
+        /* Снятие stall-наблюдения по здоровой передаче: объём ответа — та же
+         * планка, что у judge (confirm_min_bytes). Пока таблица наблюдений
+         * пуста, проверка ничего не трогает: pair_key на каждом потоке
+         * горячего пути был бы платой за механизм без события. */
+        if (f->l4proto == 6 && sc_live && f->rb >= cmin_bytes(cfg)) {
+            char ws[64];
+            pair_key(ws, sizeof(ws), cfg, f);
+            stall_release(ctx, ws);
         }
     }
     nm_summary(now);
@@ -1435,6 +1826,13 @@ void clr_soft(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
         if (f->ctmark != 0 || ours(f, cfg)) continue;
         if (!from_lan4(cfg, f->src4)) continue;
         if (is_private4(f->dst4)) continue;
+        /* Тот же фильтр, что в clr_fast, и на том же месте. Без него
+         * learn_exclude_ports (DoT 853, IPsec 500/4500, скан-шум) действовал
+         * только на «быстрые» признаки: поток, дошедший до ESTABLISHED и
+         * зависший, всё равно уезжал в test/VPN. Проверка стоит ДО
+         * media_aggregate — иначе агрегация /24 успевала пинить префикс по
+         * потоку на заведомо исключаемом порту. */
+        if (port_excluded(cfg, f->dport) || port_excluded(cfg, f->sport)) continue;
 
         /* M1: media (IPTV/видео) — детект по форме потока, агрегация в VPN. */
         if ((f->l4proto == 6 && strcmp(f->tcp_state, "ESTABLISHED") == 0) ||
@@ -1519,7 +1917,8 @@ void clr_soft(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                  * адрес голосового сервера не попадал в susanin_test_udp, поток
                  * шёл напрямую и «маршрут не строился». */
                 unsigned long umin = (cfg->udp_min_op > 0)
-                                         ? (unsigned long)cfg->udp_min_op : 12UL;
+                                         ? (unsigned long)cfg->udp_min_op
+                                         : (unsigned long)CFG_LEGACY_UDP_MIN_OP;
                 if (f->dport != 443 && f->dport != 53 && f->dport != 67 &&
                     f->dport != 68 && f->dport != 123 &&
                     !port_excluded(cfg, f->dport) &&
@@ -1636,6 +2035,14 @@ void clr_judge(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                         slogf(SL_INFO, "AUTO-SUSANIN: CONFIRMED %s -> %s:%u label=%s",
                               f->src, f->dst, f->dport, lbl);
                 }
+                /* P5: адрес выучен автообучением — ставим в очередь проверки,
+                 * что через туннель он реально работает (см. vq_tick в engine.c).
+                 * Порт и протокол подтверждающего потока нужны самому аудиту:
+                 * проба идёт на тот же порт, где адрес показал жизнь (у
+                 * IPTV/медиа-сервисов это 8000/1935/554, где 443 может и не
+                 * быть). UDP движок очереди отбрасывает сам: TCP-проба про
+                 * UDP-поток ничего не знает. */
+                vpin_note(f->dst, (unsigned short)f->dport, f->l4proto == 17, now);
                 cdn_aggregate(ctx, f);
                 frozen_net_aggregate(ctx, f);
                 profile_auto_learn(ctx->cfg, f->dst);
@@ -1685,8 +2092,20 @@ void clr_judge(classifier_ctx *ctx, const ct_flow *flows, int n, time_t now)
                 g_clf_events++;
                 backend_ipset_del_port(cfg, udp, 1, f->dst, flow_port(cfg, f));
                 /* D1: адрес в VPN (ok) деградирует — пробуем «прямо» (мягкое
-                 * «прямо» с TTL). Если и прямой путь плох, обучение вернёт VPN. */
-                if (cfg->auto_direct && cfg->direct_pref_ttl > 0) {
+                 * «прямо» с TTL). Если и прямой путь плох, обучение вернёт VPN.
+                 *
+                 * Кроме media_ports: на видеопорту цена ошибки — не «чуть
+                 * медленнее», а чёрный экран на весь direct_pref_ttl, и ровно
+                 * так и происходило: адрес уже был в ok, а soft-direct выкидывал
+                 * его на прямой путь, где SYN режется. Снимается это только
+                 * веткой промоушена, до которой при блокированном прямом пути
+                 * дело может и не дойти.
+                 * (Отдельный случай «адрес запинен вручную в vpn_always» здесь
+                 * не закрыт: отличить ручной пин от выученного по ipset сейчас
+                 * нельзя — разница только в timeout, а его не отдаёт ни -q test,
+                 * ни -C. Это отдельная работа, а не молчаливое допущение.) */
+                if (cfg->auto_direct && cfg->direct_pref_ttl > 0 &&
+                    !media_port(cfg, f->dport)) {
                     backend_set_add(cfg, "susanin_direct", f->dst, cfg->direct_pref_ttl);
                     state_add(&ctx->st->direct, f->dst, now, cfg->direct_pref_ttl, 0);
                     slogf(SL_INFO, "D1: %s -> soft-direct (%ds)", f->dst,

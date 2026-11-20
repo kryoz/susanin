@@ -107,8 +107,8 @@ static void reply_text(int fd, int code, const char *msg, int head_only)
 {
     char body[256];
     int n = snprintf(body, sizeof(body), "%s\n", msg ? msg : "");
-    if (n < 0)
-        n = 0;
+    if (n < 0 || (size_t)n >= sizeof(body))
+        n = (int)sizeof(body) - 1;
     reply(fd, code, "text/plain; charset=utf-8", body, (size_t)n, head_only);
 }
 
@@ -321,7 +321,9 @@ static void serve_log(int fd, const susanin_config *cfg, const char *query, int 
     }
     if (query) {
         const char *p = strstr(query, "lines=");
-        if (p) {
+        /* Граница параметра: без неё «?xlines=50» читалось как lines=50 —
+         * тот же класс, что уже исправлен для token= и name=. */
+        if (p && (p == query || p[-1] == '&')) {
             int v = atoi(p + 6);
             if (v > 0 && v <= 1000)
                 want = v;
@@ -413,7 +415,10 @@ static void cookie_encode(const char *s, char *out, size_t n)
     out[j] = '\0';
 }
 
-static void cookie_decode(char *s)
+/* Раскодировка %XX — общая для cookie и для значения из query. Названа
+ * нейтрально: прежний «cookie_decode» вызывался только из разбора cookie, и
+ * токен из ?token= оставался незакодированным. */
+static void pct_decode(char *s)
 {
     char *r = s, *w = s;
     while (*r) {
@@ -498,7 +503,7 @@ static int cookie_value(const char *req, const char *name, char *out, size_t n)
             while (*p && *p != ';' && i + 1 < n)
                 out[i++] = *p++;
             out[i] = '\0';
-            cookie_decode(out);
+            pct_decode(out);
             return 1;
         }
         p = strchr(p, ';');
@@ -535,7 +540,7 @@ static int token_ok(const susanin_config *cfg, const char *req, const char *quer
      * и app.js (у <link>/<script> нет заголовков). */
     if (!is_write && query) {
         const char *p = strstr(query, "token=");
-        if (p) {
+        if (p && (p == query || p[-1] == '&')) {
             size_t i = 0;
             p += 6;
             while (p[i] && p[i] != '&' && i + 1 < sizeof(need)) {
@@ -543,6 +548,10 @@ static int token_ok(const susanin_config *cfg, const char *req, const char *quer
                 i++;
             }
             need[i] = '\0';
+            /* Браузер присылает токен закодированным (%3D, %20 и т.п.); без
+             * раскодировки сравнение с реальным токеном неизбежно провалилось
+             * бы — отказ доступа, который выглядит как «сломанная панель». */
+            pct_decode(need);
             if (token_eq(need, tok)) {
                 if (via_query)
                     *via_query = 1;
@@ -569,11 +578,21 @@ static void json_err(int fd, const char *msg)
     char b[512], esc[256];
     const char *s = msg ? msg : "";
     size_t j = 0;
-    for (; *s && j + 1 < sizeof(esc); s++) {
-        if (*s == '"' || *s == '\\')
-            esc[j++] = '\\';
+    /* Экранирование: побайтовая проверка «j + 1 <» не учитывала, что кавычка
+     * пишет ДВА байта, и на позиции 254 завершающий NUL попадал за конец
+     * массива. Теперь каждый путь проверяет нужный запас. */
+    for (; *s; s++) {
         if (*s == '\n')
             continue;
+        if (*s == '"' || *s == '\\') {
+            if (j + 2 >= sizeof(esc))
+                break;
+            esc[j++] = '\\';
+            esc[j++] = *s;
+            continue;
+        }
+        if (j + 1 >= sizeof(esc))
+            break;
         esc[j++] = *s;
     }
     esc[j] = '\0';
@@ -776,6 +795,13 @@ static int config_value_ok(const char *k, const char *v)
      * раньше он уходил в skipped, и панель не могла сохранить его вообще. */
     if (strncmp(k, "profile", 7) == 0 && k[7] >= '1' && k[7] <= '4' && k[8] == '_')
         return profile_field_ok(k, v);
+    /* Общий фильтр: управляющие символы недопустимы ни в одном значении —
+     * перевод строки означал бы инъекцию новой строки конфига. */
+    for (; *v; v++) {
+        unsigned char c = (unsigned char)*v;
+        if (c < 0x20 || c == 0x7f)
+            return 0;
+    }
     return 1;
 }
 
@@ -930,10 +956,24 @@ static int run_script(const char *arg)
     return rc;
 }
 
-static int valid_entry(const char *s)
+static int valid_entry(const char *s, int allow_soft)
 {
     if (!s || !*s || strlen(s) > 253)
         return 0;
+    /* Префикс '?' — мягкая запись («по умолчанию напрямую, VPN при деградации
+     * прямого пути»). Её разбирает движок (src/entryparse.c), и панель обязана
+     * пропускать такую строку в тот список, где она имеет смысл: иначе
+     * сохранение из редактора молча выбрасывает запись, а добавление из поля
+     * ввода отклоняется как «bad value». В vpn_never мягких записей нет —
+     * движок такую строку не читает как запись, поэтому и панель её не
+     * принимает. Один знак, только в начале. */
+    if (*s == '?') {
+        if (!allow_soft)
+            return 0;
+        s++;
+        if (!*s)
+            return 0;
+    }
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
         if (!(isalnum(c) || c == '.' || c == '-' || c == '_' || c == ':' ||
@@ -1133,9 +1173,10 @@ static int files_equal(const char *a, const char *b)
 /* Полная перезапись списка (Memo-редактор). Построчно: пустые строки и
  * '#'-комментарии сохраняем, валидные записи — через valid_entry(), битые
  * строки отбрасываем и считаем (панель показывает предупреждение). Запись
- * атомарная (.tmp + rename), бэкап — один <list>.bak (как в list_edit). */
-static int list_replace(const char *path, const char *text, int *kept,
-                        int *dropped, char *err, size_t errsz)
+ * атомарная (.tmp + rename), бэкап — один <list>.bak (как в list_edit).
+ * allow_soft — признак списка, в котором допустима мягкая запись «?domain». */
+static int list_replace(const char *path, const char *text, int allow_soft,
+                        int *kept, int *dropped, char *err, size_t errsz)
 {
     char tmp[600], bak[600];
     FILE *out;
@@ -1175,7 +1216,7 @@ static int list_replace(const char *path, const char *text, int *kept,
                     fputs("\n", out);
                 else if (*q == '#')
                     fprintf(out, "%s\n", q);      /* комментарий сохраняем */
-                else if (valid_entry(q)) {
+                else if (valid_entry(q, allow_soft)) {
                     fprintf(out, "%s\n", q);
                     (*kept)++;
                 } else {
@@ -1185,7 +1226,16 @@ static int list_replace(const char *path, const char *text, int *kept,
         }
         lines++;
         if (lines >= MAX_LIST_LINES) {
-            (*dropped)++;               /* лимит строк: остальное не принимаем */
+            if (nl && nl[1]) {          /* есть остаток — считаем его отброшенным */
+                const char *q = nl + 1;
+                while (*q) {
+                    const char *n2 = strchr(q, '\n');
+                    (*dropped)++;
+                    if (!n2)
+                        break;
+                    q = n2 + 1;
+                }
+            }
             break;
         }
         if (!nl)
@@ -1221,7 +1271,7 @@ static const char *list_path_from_query(const susanin_config *cfg, const char *q
         name[0] = '\0';
     if (query) {
         const char *p = strstr(query, "name=");
-        if (p) {
+        if (p && (p == query || p[-1] == '&')) {
             size_t i = 0;
             p += 5;
             while (p[i] && p[i] != '&' && i + 1 < namesz) {
@@ -1372,7 +1422,8 @@ static void handle_action(int fd, const susanin_config *cfg, const char *target,
         int kept = 0, dropped = 0, r;
         path = list_path_from_query(cfg, query, name, sizeof(name));
         if (!path || !path[0]) { json_err(fd, "bad list"); return; }
-        r = list_replace(path, body, &kept, &dropped, err, sizeof(err));
+        r = list_replace(path, body, !strcmp(name, "vpn_always"),
+                         &kept, &dropped, err, sizeof(err));
         if (r < 0) { json_err(fd, err); return; }
         {
             char extra[160];
@@ -1393,7 +1444,8 @@ static void handle_action(int fd, const susanin_config *cfg, const char *target,
         else if (!strcmp(b, "vpn_never"))
             path = cfg->vpn_never_file;
         if (!path || !path[0]) { json_err(fd, "bad list"); return; }
-        if (!form_get(body, "value", a, sizeof(a)) || !valid_entry(a)) { json_err(fd, "bad value"); return; }
+        if (!form_get(body, "value", a, sizeof(a)) ||
+            !valid_entry(a, !strcmp(b, "vpn_always"))) { json_err(fd, "bad value"); return; }
         if (!form_get(body, "op", op, sizeof(op))) { json_err(fd, "op required"); return; }
         if (!strcmp(op, "add") || !strcmp(op, "del")) {
             int r = list_edit(path, a, !strcmp(op, "add"), err, sizeof(err));
@@ -1480,9 +1532,22 @@ static void handle_conn(int fd, const susanin_config *cfg_in)
     }
 
     {
-        const char *cl = strstr(req, "Content-Length:");
-        if (!cl)
-            cl = strstr(req, "content-length:");
+        /* Поиск только по блоку заголовков: req вмещает и начало тела, а
+         * strstr по всему буферу нашёл бы «Content-Length:» внутри POST-данных
+         * (для запроса без этого заголовка) и взял бы длину из чужой строки. */
+        char *hdr_end = strstr(req, "\r\n\r\n");
+        size_t hlen = hdr_end ? (size_t)(hdr_end - req) : strlen(req);
+        const char *cl = NULL;
+        size_t off;
+
+        {
+            const char *rline_end = strstr(req, "\r\n");
+            size_t start = rline_end ? (size_t)(rline_end - req) + 2 : 0;
+            for (off = start; off + 15 <= hlen && !cl; off++)
+                if ((off == start || req[off - 1] == '\n') &&
+                    !strncasecmp(req + off, "content-length:", 15))
+                    cl = req + off;
+        }
         if (cl) {
             int want = atoi(cl + 15);
             char *end = strstr(req, "\r\n\r\n");
@@ -1493,7 +1558,7 @@ static void handle_conn(int fd, const susanin_config *cfg_in)
              * прежний лимит 4096. */
             char *big = NULL;
             size_t cap = sizeof(body);
-            if (want > 0 && (size_t)want >= sizeof(body) &&
+            if (!strcmp(method, "POST") && want > 0 && (size_t)want >= sizeof(body) &&
                 !strcmp(target, "/api/list/save")) {
                 if ((size_t)want > MAX_LIST_BODY) {
                     reply_text(fd, 413, "list body too large", head_only);
@@ -1505,6 +1570,12 @@ static void handle_conn(int fd, const susanin_config *cfg_in)
                     return;
                 }
                 cap = MAX_LIST_BODY + 1;
+            }
+            if (want > 0 && (size_t)want >= cap) {
+                /* Тело больше, чем этот endpoint готов принять (не list/save). */
+                free(big);
+                reply_text(fd, 413, "body too large", head_only);
+                return;
             }
             {
                 char *bp = big ? big : body;
@@ -1660,7 +1731,7 @@ int web_run(const susanin_config *cfg)
     struct sockaddr_in sa;
     int sfd, opt = 1;
     const char *listen_addr = cfg->web_listen;
-    int port = cfg->web_port > 0 ? cfg->web_port : 8087;
+    int port = cfg->web_port > 0 ? cfg->web_port : CFG_DEF_WEB_PORT;
 
     if (!cfg->web_enable) {
         fprintf(stderr, "web: disabled (set web_enable=1 in config)\n");

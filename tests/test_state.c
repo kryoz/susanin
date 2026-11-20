@@ -16,7 +16,11 @@ int main(void)
 {
     susanin_state s;
     char k[64], k2[64];
-    const char *path = "/tmp/susanin-state-test.txt";
+    char pathl[160];
+    const char *path = pathl;
+
+    snprintf(pathl, sizeof(pathl), "/tmp/susanin-state-%d.txt",
+             (int)getpid());
     time_t now = time(NULL);
 
     printf("=== state_key ===\n");
@@ -164,6 +168,20 @@ int main(void)
         }
         CHECK(bad == 0, "4000 промахов на малом наборе — без зацикливания/ложных хитов");
         state_free(&m);
+    }
+
+    printf("=== state_remove возвращает факт снятия ===\n");
+    {
+        /* ops.c («susanin why/reset») считает снятые записи по возврату
+         * функции; прежде она всегда возвращала 0, и счётчик «removed» был
+         * нулём даже когда записи реально удалялись. */
+        char rk[64];
+
+        state_key(rk, sizeof(rk), "203.0.113.77", 0);
+        state_remove(&s.ok_tcp, rk);                    /* на случайного мусора */
+        state_add(&s.ok_tcp, rk, time(NULL), 600, 0);
+        CHECK(state_remove(&s.ok_tcp, rk) == 1, "существующая запись -> 1");
+        CHECK(state_remove(&s.ok_tcp, rk) == 0, "повторное снятие -> 0");
     }
 
     state_free(&s);

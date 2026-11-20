@@ -30,6 +30,7 @@ tool    tools/profiles.sh
 tool    tools/xray-egress.sh
 tool    tools/soak.sh
 tool    tools/postinst.sh
+tool    tools/dnslan-guard.sh
 
 init    init/entware/S93xray-tproxy
 init    init/entware/S94susanin
@@ -50,6 +51,9 @@ share   vpn_always.txt
 share   vpn_never.txt
 share   xray-tproxy.json.example
 share   xray-tproxy-cdn.json.example
+share   lang/RU.json
+share   lang/EN.json
+share   lang/ZH.json
 
 www     www
 

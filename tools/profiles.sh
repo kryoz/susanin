@@ -1,7 +1,9 @@
 #!/bin/sh
 # profiles.sh — статические профили маршрутизации (P1, экспериментально).
 #
-# Профиль = список (домены / IP / CIDR) -> свой egress-туннель.
+# Профиль = список (домены / *.домены / IP / CIDR) -> свой egress-туннель.
+# Префикс мягкой записи '?' (смысл у него только в vpn_always) здесь не
+# поддерживается: такие строки отбрасываются с пометкой в выводе.
 # Задаётся в /opt/susanin/etc/susanin.conf повторяющимися ключами:
 #   profile1_name=cdn
 #   profile1_egress=nwg1
@@ -26,7 +28,7 @@ SETPFX="susanin_prof_"
 CHAIN="SUSANIN_PROFILES"
 MAXP=4
 
-cfg() { sed -n "s/^$1=[ \t]*//p" "$CONF" 2>/dev/null | head -n1; }
+cfg() { sed -n "s/^[[:space:]]*${1}[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" "$CONF" 2>/dev/null | tail -n1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # P2: профили можно задавать и файлами profiles.d/<name>.conf (один профиль на
@@ -37,20 +39,20 @@ MERGED="${TMPDIR:-/tmp}/susanin-profiles.$$.conf"
 CONF_ORIG="$CONF"
 build_merged() {
     : > "$MERGED"
-    grep -E '^profile[0-9]+_' "$CONF_ORIG" 2>/dev/null >> "$MERGED" || true
+    grep -E '^[[:space:]]*profile[0-9]+_' "$CONF_ORIG" 2>/dev/null >> "$MERGED" || true
     PD_DIR="${SUSANIN_PROFILES_DIR:-/opt/susanin/etc/profiles.d}"
     if [ -d "$PD_DIR" ]; then
-        _n=$(grep -cE '^profile[0-9]+_name=' "$MERGED" 2>/dev/null || true)
+        _n=$(grep -cE '^[[:space:]]*profile[0-9]+_name[[:space:]]*=' "$MERGED" 2>/dev/null || true)
         case "$_n" in ''|*[!0-9]*) _n=0;; esac
         for _f in "$PD_DIR"/*.conf; do
             [ -f "$_f" ] || continue
             _n=$((_n + 1))
             [ "$_n" -gt "$MAXP" ] && break
-            _nm=$(sed -n 's/^name=[ \t]*//p' "$_f" 2>/dev/null | head -n1)
+            _nm=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$_f" 2>/dev/null | tail -n1)
             [ -n "$_nm" ] || _nm=$(basename "$_f" .conf)
             printf 'profile%d_name=%s\n' "$_n" "$_nm" >> "$MERGED"
             for _k in egress list geo_url table mark auto; do
-                _v=$(sed -n "s/^${_k}=[ \t]*//p" "$_f" 2>/dev/null | head -n1)
+                _v=$(sed -n "s/^[[:space:]]*${_k}[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" "$_f" 2>/dev/null | tail -n1)
                 [ -n "$_v" ] && printf 'profile%d_%s=%s\n' "$_n" "$_k" "$_v" >> "$MERGED"
             done
         done
@@ -122,6 +124,7 @@ set_count() { "$IPSET" list "$1" 2>/dev/null | grep -cE '^[0-9]+\.'; }
 fill_set() { # set listfile
     _s="$1"; _f="$2"
     [ -n "$_f" ] && [ -f "$_f" ] || return 0
+    _soft=0; _softex=""
     # `|| [ -n "$_raw" ]` — иначе ПОСЛЕДНЯЯ строка файла без перевода строки в
     # конце теряется: read при EOF без разделителя возвращает не-ноль (значение
     # при этом уже присвоено) и тело цикла не выполняется. С одним доменом в
@@ -129,6 +132,19 @@ fill_set() { # set listfile
     while IFS= read -r _raw || [ -n "$_raw" ]; do
         _e=$(printf '%s' "$_raw" | sed 's/#.*//' | tr -d ' \t\r')
         [ -z "$_e" ] && continue
+        case "$_e" in
+            '?'*)
+                # Префикс '?' — мягкая запись, смысл у неё только в vpn_always.
+                # Профиль статический: адрес либо в туннеле профиля, либо нет,
+                # «мягко» тут быть не может. Такую строку не резолвим (резолв
+                # литерала "?domain" ничего не давал — молча) и не трактуем её
+                # как обычный домен: это самовольно добавило бы адреса в наборы
+                # уже настроенных профилей. Отбрасываем явно, с пояснением в выводе.
+                _soft=$((_soft + 1))
+                [ "$_soft" -le 3 ] && _softex="${_softex:+$_softex, }$_e"
+                continue
+                ;;
+        esac
         if is_ip4 "$_e" || is_cidr "$_e"; then
             "$IPSET" add "$_s" "$_e" -exist 2>/dev/null || true
         else
@@ -138,6 +154,12 @@ fill_set() { # set listfile
             done
         fi
     done < "$_f"
+    if [ "$_soft" -gt 0 ]; then
+        echo "[profiles] $_s: отброшено мягких записей (?): $_soft (${_softex}) —" \
+             "префикс '?' поддерживает только vpn_always; чтобы адрес пошёл в" \
+             "туннель профиля, уберите его"
+    fi
+    return 0
 }
 
 # P3: гео-базы — скачиваемый CIDR-список профиля (profileN_geo_url). Кэш

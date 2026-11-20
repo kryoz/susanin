@@ -34,20 +34,20 @@ INITD=/opt/etc/init.d
 SH=$PREFIX/tools/susanin.sh
 DP=$PREFIX/tools/datapath.sh
 
-port=$(sed -n 's/^tproxy_port=//p' "$CONF" 2>/dev/null | tail -n1)
+port=$(sed -n 's/^[[:space:]]*tproxy_port[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)
 [ -n "$port" ] || port=12345
-urp=$(sed -n 's/^udp_relay_port=//p' "$CONF" 2>/dev/null | tail -n1)
+urp=$(sed -n 's/^[[:space:]]*udp_relay_port[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)
 [ -n "$urp" ] || urp=1081
-et=$(sed -n 's/^egress_type=//p' "$CONF" 2>/dev/null | tail -n1)
+et=$(sed -n 's/^[[:space:]]*egress_type[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)
 [ -n "$et" ] || et=interface
 # Уровень логов Xray — ОТДЕЛЬНО от log_level Susanin.Keenetic. Применяется к
 # xray-tproxy.json при enable/run (Xray читает уровень только при старте).
-xlog=$(sed -n 's/^xray_loglevel=//p' "$CONF" 2>/dev/null | tail -n1)
-[ -n "$xlog" ] || xlog=warning
+xlog=$(sed -n 's/^[[:space:]]*xray_loglevel[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)
+[ -n "$xlog" ] || xlog=error
 # Память Xray (роутер без swap): агрессивнее GC + мягкий лимит.
-xgogc=$(sed -n 's/^xray_gogc=//p' "$CONF" 2>/dev/null | tail -n1)
+xgogc=$(sed -n 's/^[[:space:]]*xray_gogc[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)
 [ -n "$xgogc" ] || xgogc=50
-xgomem=$(sed -n 's/^xray_gomemlimit=//p' "$CONF" 2>/dev/null | tail -n1)
+xgomem=$(sed -n 's/^[[:space:]]*xray_gomemlimit[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | tail -n1)
 [ -n "$xgomem" ] || xgomem=64MiB
 
 say() { echo "[xray-egress] $*"; }
@@ -100,23 +100,23 @@ wait_pins() { # wait_pins [seconds]
 }
 
 ensure_tproxy_cfg() {
-    grep -q '^egress_type=' "$CONF" 2>/dev/null \
-        && sed -i 's|^egress_type=.*|egress_type=tproxy|' "$CONF" \
+    grep -Eq '^[[:space:]]*egress_type[[:space:]]*=' "$CONF" 2>/dev/null \
+        && sed -i 's|^[[:space:]]*egress_type[[:space:]]*=.*|egress_type=tproxy|' "$CONF" \
         || echo 'egress_type=tproxy' >> "$CONF"
-    grep -q '^tproxy_port=' "$CONF" 2>/dev/null \
+    grep -Eq '^[[:space:]]*tproxy_port[[:space:]]*=' "$CONF" 2>/dev/null \
         || echo "tproxy_port=$port" >> "$CONF"
-    grep -q '^udp_relay=' "$CONF" 2>/dev/null \
-        && sed -i 's|^udp_relay=.*|udp_relay=1|' "$CONF" \
+    grep -Eq '^[[:space:]]*udp_relay[[:space:]]*=' "$CONF" 2>/dev/null \
+        && sed -i 's|^[[:space:]]*udp_relay[[:space:]]*=.*|udp_relay=1|' "$CONF" \
         || echo 'udp_relay=1' >> "$CONF"
-    grep -q '^udp_relay_port=' "$CONF" 2>/dev/null \
+    grep -Eq '^[[:space:]]*udp_relay_port[[:space:]]*=' "$CONF" 2>/dev/null \
         || echo 'udp_relay_port=1081' >> "$CONF"
-    grep -q '^socks_addr=' "$CONF" 2>/dev/null \
+    grep -Eq '^[[:space:]]*socks_addr[[:space:]]*=' "$CONF" 2>/dev/null \
         || echo 'socks_addr=127.0.0.1' >> "$CONF"
-    grep -q '^socks_port=' "$CONF" 2>/dev/null \
+    grep -Eq '^[[:space:]]*socks_port[[:space:]]*=' "$CONF" 2>/dev/null \
         || echo 'socks_port=1080' >> "$CONF"
     # HTTP/3 (QUIC) в tproxy уходит в UDP-релей — клиенты должны идти по TCP.
-    grep -q '^quic_block=' "$CONF" 2>/dev/null \
-        && sed -i 's|^quic_block=.*|quic_block=1|' "$CONF" \
+    grep -Eq '^[[:space:]]*quic_block[[:space:]]*=' "$CONF" 2>/dev/null \
+        && sed -i 's|^[[:space:]]*quic_block[[:space:]]*=.*|quic_block=1|' "$CONF" \
         || echo 'quic_block=1' >> "$CONF"
     say "quic_block=1 (HTTP/3 из LAN -> TCP; иначе браузеры «висят» в tproxy)"
     et=tproxy

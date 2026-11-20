@@ -34,6 +34,9 @@ NO_START=0
 # 1 = не трогать существующие vpn_always.txt/vpn_never.txt (флаг --keep-lists).
 KEEP_LISTS=0
 DISK_MODE=""
+# 1 = режим задан явно (--disk-mode). Авто-определение не имеет права
+# перезаписывать сознательный выбор оператора при повторном запуске.
+DISK_MODE_SET=0
 DEPS=0
 XRAYTUN=0
 USE_IPK=0
@@ -54,7 +57,7 @@ CONF_FOR_FETCH="$PREFIX/etc/susanin.conf"
 # r7.2: локальный SOCKS доступен? Только tproxy-конфиг и слушающийся socks-in
 # (127.0.0.1:1080 = 0x0438, состояние LISTEN 0A в /proc/net/tcp).
 susanin_socks_avail() {
-    _et=$(sed -n 's/^egress_type=//p' "$CONF_FOR_FETCH" 2>/dev/null | head -n1)
+    _et=$(sed -n 's/^[[:space:]]*egress_type[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$CONF_FOR_FETCH" 2>/dev/null | tail -n1)
     [ "$_et" = "tproxy" ] || return 1
     awk '$2 ~ /:0438$/ && $4 == "0A" { f=1 } END { exit !f }' /proc/net/tcp 2>/dev/null
 }
@@ -239,6 +242,7 @@ while [ $# -gt 0 ]; do
 		;;
 	--disk-mode)
 		DISK_MODE="$2"
+		DISK_MODE_SET=1
 		shift
 		;;
 	--deps) DEPS=1 ;;
@@ -603,13 +607,21 @@ if [ -f "$DIR0/susanin-agent" ] || [ -f "$DIR0/bin/susanin-agent" ] ||
 	say "local package: $DIR"
 else
 	pick_fetch
+	# Поддерживаемые архитектуры — только те, для которых CI собирает бинарь
+	# (см. .github/workflows/release.yml). Проверка ДО загрузки: устройство с
+	# mips64el получало безликий «download failed, проверьте --arch», хотя
+	# причина была в том, что сборки для такой архитектуры нет.
+	case "$ARCH" in
+	mipsel|mips|aarch64|armv7|x86_64) : ;;
+	*) die "для архитектуры '$ARCH' готовых сборок нет (есть: mipsel, mips, aarch64, armv7, x86_64). Если устройство совместимо с одной из них — укажите явно: --arch mipsel" ;;
+	esac
 	ASSET="susanin-keenetic-deploy-$ARCH.tar.gz"
 	say "arch=$ARCH version=$VERSION"
 	TMP=$(mktemp -d /tmp/susanin-inst.XXXXXX)
 	trap 'rm -rf "$TMP"' EXIT INT TERM
 	say "downloading $BASE/$ASSET"
-	fetch "$BASE/$ASSET" "$TMP/pkg.tar.gz" ||
-		die "download failed (check --arch/--version or release assets): $BASE/$ASSET
+	fetch "$BASE/$ASSET" "$TMP/pkg.tar.gz" \
+		|| die "download failed (check --arch/--version or release assets): $BASE/$ASSET
      hint: opkg update && opkg install ca-certificates wget-ssl"
 	tar -xzf "$TMP/pkg.tar.gz" -C "$TMP" || die "bad archive $ASSET"
 	DIR=$TMP
@@ -838,7 +850,7 @@ fi
 
 mkdir -p "$PREFIX/bin" "$PREFIX/tools" "$PREFIX/etc" "$PREFIX/etc/profiles" "$PREFIX/var" "$INITD"
 cp "$DIR/$BINFILE" "$PREFIX/bin/susanin-agent"
-for f in datapath.sh susanin.sh update.sh uninstall.sh install.sh report.sh diagnose.sh profiles.sh xray-egress.sh postinst.sh; do
+for f in datapath.sh susanin.sh update.sh uninstall.sh install.sh report.sh diagnose.sh profiles.sh xray-egress.sh postinst.sh dnslan-guard.sh; do
 	_src=$(find_file "$f") || _src=""
 	[ -n "$_src" ] && cp "$_src" "$PREFIX/tools/$f"
 done
@@ -852,7 +864,7 @@ merge_csv() {
 }
 
 _cfg_val() { # значение ключа из уже установленного конфига
-	sed -n "s/^$1=[ \t]*//p" "$PREFIX/etc/susanin.conf" 2>/dev/null | head -1
+	sed -n "s/^[[:space:]]*${1}[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1
 }
 
 # egress/lan/subnets и disk_mode пишет tools/postinst.sh — тот же скрипт, который
@@ -923,6 +935,76 @@ SUSANIN_PREFIX="$PREFIX" SUSANIN_EGRESS="$_SE" SUSANIN_LAN="$_SL" SUSANIN_SUBNET
 	SUSANIN_DISK_MODE="$DISK_MODE" SUSANIN_NO_START="$NO_START" \
 	SUSANIN_KEEP_LISTS="$KEEP_LISTS" \
 	sh "$PREFIX/tools/postinst.sh"
+# --- MIGRATION-BEGIN (тест tests/test-installer-sync.sh вырезает этот участок;
+# границы менять только вместе с тестом) ---------------------------------------
+# Дописать отсутствующие ключи через агента (дефолты — в одном месте с кодом).
+# postinst.sh выше сделал то же самое ensure_key'ем; этот прогон — страховка
+# для случаев, когда postinst не дошёл до миграций (старая раскладка).
+if [ -f "$PREFIX/etc/susanin.conf" ] && [ -x "$PREFIX/bin/susanin-agent" ]; then
+	_sync_out=$(mktemp "${TMPDIR:-/tmp}/susanin-sync.XXXXXX" 2>/dev/null) || _sync_out=""
+	if [ -n "$_sync_out" ] &&
+		SUSANIN_CONF="$PREFIX/etc/susanin.conf" \
+		"$PREFIX/bin/susanin-agent" config sync >"$_sync_out" 2>/dev/null; then
+		say "конфиг: $(tr '\n' ' ' < "$_sync_out" 2>/dev/null)"
+	else
+		say "ВНИМАНИЕ: config sync не выполнился — отсутствующие ключи не дописаны"
+	fi
+	[ -n "$_sync_out" ] && rm -f "$_sync_out"
+fi
+
+# promo_per_min: в 0.4.0 дефолт поднят 30 -> 120. Меняем ТОЛЬКО прежний дефолт.
+if [ -f "$PREFIX/etc/susanin.conf" ]; then
+	_pp=$(sed -n "s/^[[:space:]]*promo_per_min[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" \
+	          "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+	if [ "$_pp" = "30" ]; then
+		sed -i "s|^[[:space:]]*promo_per_min[[:space:]]*=.*|promo_per_min=120|" \
+			"$PREFIX/etc/susanin.conf" 2>/dev/null \
+			&& say "promo_per_min: 30 -> 120 (новый дефолт)"
+	fi
+fi
+
+# disk_mode: явный --disk-mode применяется всегда (это заказ оператора),
+# авто-определение — только когда ключа в конфиге ещё нет. Прежнее поведение
+# («применяем всегда») затирало сознательный выбор при каждом запуске
+# установщика: поставил normal на внутренней флешке — после обновления снова
+# получил soft, потому что детектор увидел USB.
+if [ -f "$PREFIX/etc/susanin.conf" ]; then
+	_dm_have=0
+	grep -Eq '^[[:space:]]*disk_mode[[:space:]]*=' "$PREFIX/etc/susanin.conf" 2>/dev/null \
+		&& _dm_have=1
+	if [ "${DISK_MODE_SET:-0}" = "1" ] || [ "$_dm_have" = "0" ]; then
+		if [ "$_dm_have" = "1" ]; then
+			sed -i "s|^[[:space:]]*disk_mode[[:space:]]*=.*|disk_mode=$DISK_MODE|" \
+				"$PREFIX/etc/susanin.conf" 2>/dev/null || true
+		else
+			echo "disk_mode=$DISK_MODE" >> "$PREFIX/etc/susanin.conf"
+		fi
+		say "disk_mode=$DISK_MODE -> $PREFIX/etc/susanin.conf"
+	else
+		say "disk_mode оставлен как в конфиге; --disk-mode, чтобы изменить"
+	fi
+fi
+
+# Миграция уровня записи: прежние дефолты (info, warning) -> минимум (warn,
+# error). Осознанный выбор оператора (debug/trace/quiet/none) не трогается.
+if [ -f "$PREFIX/etc/susanin.conf" ]; then
+	_ll=$(sed -n "s/^[[:space:]]*log_level[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" \
+	          "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+	if [ "$_ll" = "info" ]; then
+		sed -i "s|^[[:space:]]*log_level[[:space:]]*=.*|log_level=warn|" \
+			"$PREFIX/etc/susanin.conf" 2>/dev/null \
+			&& say "log_level: info -> warn (новый дефолт: минимум записей)"
+	fi
+	_xl=$(sed -n "s/^[[:space:]]*xray_loglevel[[:space:]]*=[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p" \
+	          "$PREFIX/etc/susanin.conf" 2>/dev/null | tail -n1)
+	if [ "$_xl" = "warning" ]; then
+		sed -i "s|^[[:space:]]*xray_loglevel[[:space:]]*=.*|xray_loglevel=error|" \
+			"$PREFIX/etc/susanin.conf" 2>/dev/null \
+			&& say "xray_loglevel: warning -> error (новый дефолт)"
+	fi
+fi
+
+# --- MIGRATION-END -------------------------------------------------------------
 
 say "installed to $PREFIX (run: sh $PREFIX/tools/susanin.sh status)"
 

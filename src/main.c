@@ -29,9 +29,13 @@ static void usage(void)
         "  susanin-agent version\n"
         "  susanin-agent config show\n"
         "  susanin-agent config set <key> <value>\n"
+        "  susanin-agent config sync [--dry-run]   (дописать отсутствующие ключи\n"
+        "                                            действующими дефолтами)\n"
+        "  susanin-agent config check            (значения, которые код прочтёт\n"
+        "                                            иначе, чем задумано)\n"
         "  susanin-agent discover\n"
         "  susanin-agent ct-scan\n"
-        "  susanin-agent datapath {up|down|status|flush|add|del}\n"
+        "  susanin-agent datapath {up|down|dns-lan-up|dns-lan-down|dns-lan-status|status|flush|add|del}\n"
         "  susanin-agent run\n"
         "  susanin-agent web\n"
         "  susanin-agent status\n"
@@ -42,6 +46,7 @@ static void usage(void)
         "  susanin-agent reset <ip|domain>   (forget — синоним)\n"
         "  susanin-agent complain <ip|domain> (жалоба: сайт не работает)\n"
         "  susanin-agent why <ip|domain>     (почему адрес идёт так: списки/наборы/кэш)\n"
+        "  susanin-agent dnsprobe <домен> [сервер] [порт]  (проверка форвардера dns_lan)\n"
         "  susanin-agent diag errors         (ERROR/WARN из лога агента)\n",
         SUSANIN_VERSION);
 }
@@ -111,7 +116,7 @@ static int cmd_datapath(int argc, char **argv)
     int n = 0, i;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: susanin-agent datapath {up|down|status|flush|add <ip> <tcp|udp> <test|ok>|del <ip> <tcp|udp>}\n");
+        fprintf(stderr, "usage: susanin-agent datapath {up|down|dns-lan-up|dns-lan-down|dns-lan-status|status|flush|add <ip> <tcp|udp> <test|ok>|del <ip> <tcp|udp>}\n");
         return 2;
     }
     newargv[n++] = (char *)script;
@@ -155,6 +160,9 @@ int main(int argc, char **argv)
             return 0;
         }
         if (argc > 4 && !strcmp(argv[2], "set")) {
+            susanin_config after;
+            int i, unkn = 0;
+
             if (config_file_set(cfg_path(), argv[3], argv[4], 1) != 0) {
                 fprintf(stderr, "config set: не удалось записать %s "
                                 "(имя ключа — [a-z0-9_], значение — без переводов строк)\n",
@@ -162,7 +170,77 @@ int main(int argc, char **argv)
                 return 2;
             }
             printf("%s=%s\n", argv[3], argv[4]);
+            /* Строка записана — но неизвестно, читает ли её агент. Ключ с
+             * опечаткой выглядит настройкой и игнорируется молча; молчать об
+             * этом после явной команды оператора нельзя. */
+            if (config_load(cfg_path(), &after) == 0) {
+                for (i = 0; i < after.n_unknown_keys && i < CFG_MAX_BAD_VALUES; i++)
+                    if (!strcmp(after.unknown_keys[i], argv[3]))
+                        unkn = 1;
+            }
+            if (unkn) {
+                fprintf(stderr, "config set: ВНИМАНИЕ — ключ «%s» агентом не "
+                                "распознан: он записан, но ни на что не влияет "
+                                "(проверьте имя; susanin-agent config check)\n",
+                        argv[3]);
+                return 1;
+            }
             return 0;
+        }
+        if (argc > 2 && !strcmp(argv[2], "sync")) {
+            int dry = 0, n, sk = 0;
+            /* Не «всё, что не --dry-run, значит запись»: опечатка в третьем
+             * аргументе не должна молча менять конфиг на рабочем роутере. */
+            if (argc > 3) {
+                if (strcmp(argv[3], "--dry-run")) {
+                    fprintf(stderr, "config sync: непонятный аргумент '%s' "
+                                    "(ожидается --dry-run)\n", argv[3]);
+                    return 2;
+                }
+                dry = 1;
+            }
+            if (access(cfg_path(), R_OK) != 0) {
+                fprintf(stderr, "config sync: нет файла %s — создавать не буду\n",
+                        cfg_path());
+                return 2;
+            }
+            n = config_sync(cfg_path(), dry, &sk);
+            if (n < 0) {
+                fprintf(stderr, "config sync: не удалось обновить %s\n", cfg_path());
+                return 1;
+            }
+            if (dry)
+                printf("# config sync: не хватает %d ключ(ов) — выше то, что добавилось бы\n", n);
+            else
+                printf("config sync: добавлено %d ключ(ов)\n", n);
+            if (sk > 0)
+                printf("config sync: пропущено %d ключ(ей) пресета precision "
+                       "(их дописывать нельзя — пресет перестанет действовать)\n", sk);
+            return 0;
+        }
+        if (argc > 2 && !strcmp(argv[2], "check")) {
+            susanin_config cc;
+            char prob[2048];
+            int n;
+
+            if (access(cfg_path(), R_OK) != 0) {
+                fprintf(stderr, "config check: нет файла %s\n", cfg_path());
+                return 2;
+            }
+            /* Перечитываем сами: общий путь выше при неудаче молча берёт
+             * дефолты, а «проверка конфига» на дефолтах вместо конфига
+             * сказала бы ровно ничего полезного. */
+            if (config_load(cfg_path(), &cc) != 0) {
+                fprintf(stderr, "config check: %s не разбирается\n", cfg_path());
+                return 1;
+            }
+            n = config_validate(&cc, prob, sizeof(prob));
+            if (n == 0) {
+                printf("config check: %s — замечаний нет\n", cfg_path());
+                return 0;
+            }
+            printf("config check: %s — проблем: %d\n%s", cfg_path(), n, prob);
+            return 1;
         }
         usage();
         return 2;
@@ -193,6 +271,14 @@ int main(int argc, char **argv)
 
     if (!strcmp(cmd, "status"))
         return ops_status(&cfg, cfg_path());
+
+    if (!strcmp(cmd, "dnsprobe")) {
+        const char *nm = argc > 2 ? argv[2] : "";
+        const char *srv = argc > 3 ? argv[3] : "127.0.0.1";
+        /* без сервера — наш форвардер (5399), с сервером — обычный 53. */
+        int port = argc > 4 ? atoi(argv[4]) : (argc > 3 ? 53 : 5399);
+        return ops_dnsprobe(&cfg, nm, srv, port, 0);
+    }
 
     if (!strcmp(cmd, "apply")) {
         int dry = argc > 2 && !strcmp(argv[2], "--dry-run");
