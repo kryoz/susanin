@@ -40,7 +40,7 @@ pick() {
 	mips) echo "gcc-mips-linux-gnu libc6-dev-mips-cross mips-linux-gnu" ;;
 	aarch64) echo "gcc-aarch64-linux-gnu libc6-dev-arm64-cross aarch64-linux-gnu" ;;
 	armv7) echo "gcc-arm-linux-gnueabihf libc6-dev-armhf-cross arm-linux-gnueabihf" ;;
-	x86_64) echo "gcc libc6-dev x86_64-linux-gnu" ;;
+	x86_64) echo "gcc-x86-64-linux-gnu libc6-dev-amd64-cross x86_64-linux-gnu" ;;
 	*)
 		echo "docker-release: неизвестная архитектура: $1" >&2
 		return 1
@@ -72,7 +72,6 @@ mkdir -p dist
 for t in $SUSANIN_ARCHES; do
 	triplet=$(pick "$t" | cut -d' ' -f3)
 	cc="$triplet-gcc"
-	[ "$t" != "x86_64" ] || cc=gcc
 	command -v "$cc" >/dev/null 2>&1 || {
 		echo "docker-release: нет компилятора $cc" >&2
 		exit 1

@@ -928,6 +928,16 @@ if [ -n "$_s95" ]; then
 	chmod +x "$INITD/S95susanin-web"
 fi
 
+# Хук NDM: вне $PREFIX (его снимает uninstall.sh). В .ipk его кладёт manifest
+# (класс ndmhook), здесь — то же для tar-раскладки, иначе после tar-установки
+# пересборка правил ndm снова роняет ACCEPT по нашей метке.
+_NDM_HOOK_DIR=/opt/etc/ndm/netfilter.d
+_ndmhook=$(find_file 60-susanin-forward.sh) || _ndmhook=""
+if [ -n "$_ndmhook" ]; then
+	mkdir -p "$_NDM_HOOK_DIR"
+	cp "$_ndmhook" "$_NDM_HOOK_DIR/60-susanin-forward.sh"
+	chmod +x "$_NDM_HOOK_DIR/60-susanin-forward.sh"
+fi
 # «Пути + конфиг + сервис» — ровно тот же скрипт, который opkg выполняет из
 # control.tar.gz при установке .ipk (он же поднимает Xray в tproxy-режиме и
 # перезапускает веб-панель после подмены бинаря).
