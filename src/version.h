@@ -1,7 +1,7 @@
 #ifndef SUSANIN_VERSION_H
 #define SUSANIN_VERSION_H
 
-#define SUSANIN_VERSION "0.5.4-oc"
+#define SUSANIN_VERSION "0.5.4.1-oc"
 /* Суффикс -oc = сборки форка под OpenConnect-коннектор (конвенция 0.4.x-oc,
  * пакет susanin-keenetic_<версия>-oc_<arch>.ipk): имя пакета совпадает с тегом
  * релиза — install.sh --version v0.5.4-oc скачивает ровно то имя, что лежит в
