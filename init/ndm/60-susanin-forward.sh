@@ -35,6 +35,22 @@ _mask=$(sed -n 's/^[[:space:]]*mark_mask[[:space:]]*=[[:space:]]*//p' "$CONF" 2>
 [ -n "$_ok" ] || _ok=0x20000000
 [ -n "$_mask" ] || _mask=0x30000000
 
+# Цепочка SUSANIN сносится целиком (вместе с jump в PREROUTING) — ACCEPT по
+# метке её не возвращает, и пока её нет, новые соединения клиентов идут без
+# метки, то есть напрямую. Поднимаем mangle сами: агент заметит пропажу только
+# на следующем контроле (раз в секунду) и поднимет всё полным `up` (~1 с),
+# а этот путь стоит ~0.3 с. Отсутствие одного лишь FORWARD ещё ни о чём не
+# говорит — полный `up` на каждый вызов хук дёргать не должен.
+DP=/opt/susanin/tools/datapath.sh
+if [ -f "$DP" ]; then
+    _ch=$("$IPT" -w -t mangle -S SUSANIN 2>/dev/null | grep -c '^-A' || true)
+    if [ "${_ch:-0}" = "0" ]; then
+        printf '%s chain rebuilt\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" \
+            >> /tmp/susanin-hook.log 2>/dev/null || true
+        sh "$DP" rules >/dev/null 2>&1 || true
+    fi
+fi
+
 "$IPT" -C FORWARD -m mark --mark "$_ok/$_mask" -j ACCEPT 2>/dev/null && exit 0
 "$IPT" -A FORWARD -m mark --mark "$_ok/$_mask" -j ACCEPT 2>/dev/null || true
 exit 0

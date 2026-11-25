@@ -928,6 +928,28 @@ command_up() {
     say "data plane UP (table=$TABLE dev=$EGRESS mask=$MARK_MASK)"
 }
 
+# Быстрое восстановление mangle после пересборки правил: NDM снимает цепочку
+# SUSANIN и jump в PREROUTING целиком, и одно правило ACCEPT их не возвращает.
+# Вызывается хуком /opt/etc/ndm/netfilter.d/60-susanin-forward.sh сразу после
+# пересборки: ~0.3 с против ~1 с полного `up` у агента, потому что здесь нет
+# ipset, таблицы маршрутизации, бэкапа netfilter и правил nat/IPv6 — только
+# то, что живёт в mangle. Значения — из окружения агента, а при его отсутствии
+# (хук запускает не агент) из того же конфига через cfg_val. Если конфиг агента
+# разойдётся с тем, что здесь построено, агент увидит это своим backend_ready()
+# и пересоберёт полным `up`: этот путь — страховка окна, а не второй источник
+# истины.
+command_rules() {
+    "ipt" -t mangle -N "$CHAIN" >/dev/null 2>&1 || true
+    "ipt" -t mangle -F "$CHAIN" >/dev/null 2>&1 || true
+    rule_priv
+    rule_mark
+    profiles_return_rules
+    ensure_jump
+    quic_block_rules
+    mss_clamp_rules
+    say "mangle rules restored (chain=$CHAIN jump=PREROUTING)"
+}
+
 command_down() {
     "ipt" -t mangle -D PREROUTING -j "$CHAIN" >/dev/null 2>&1 || true
     if "ipt" -t mangle -S "$CHAIN" >/dev/null 2>&1; then
@@ -1127,6 +1149,7 @@ command_del() {
 
 case "${1:-}" in
     up) command_up ;;
+    rules) command_rules ;;
     sets) ensure_sets ;;
     sets-down)
         for _s in $SETS; do set_exists "$_s" && "$IPSET" destroy "$_s" || true; done
@@ -1150,7 +1173,7 @@ case "${1:-}" in
     add) command_add "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     del) command_del "${2:-}" "${3:-}" "${4:-}" ;;
     *)
-        echo "usage: $0 {up|down|status|flush|egress <iface>|dns-lan-up|dns-lan-down|dns-lan-status|add <ip> [<port>] <tcp|udp> <test|ok>|del <ip> [<port>] <tcp|udp>}" >&2
+        echo "usage: $0 {up|rules|down|status|flush|egress <iface>|dns-lan-up|dns-lan-down|dns-lan-status|add <ip> [<port>] <tcp|udp> <test|ok>|del <ip> [<port>] <tcp|udp>}" >&2
         echo "  (порт обязателен при SUSANIN_PORT_AWARE=1; ok_net/never/direct всегда по адресу)" >&2
         exit 2 ;;
 esac
