@@ -145,7 +145,16 @@ load_mod() {
 }
 ensure_mod() { load_mod "$1" || true; }
 
-mangle() { "ipt" -t mangle -D "$@" >/dev/null 2>&1 || true; "ipt" -t mangle -A "$@"; }
+mangle() {
+    # REBUILD=1 (режим `rules`): цепочка только что очищена, правила в ней
+    # заведомо нет — минус один вызов iptables на каждое правило. Только для
+    # $CHAIN: в PREROUTING (mss_clamp) правило могло остаться, там дедупликация
+    # через -D обязательна.
+    if [ "${REBUILD:-0}" != "1" ] || [ "${1:-}" != "$CHAIN" ]; then
+        "ipt" -t mangle -D "$@" >/dev/null 2>&1 || true
+    fi
+    "ipt" -t mangle -A "$@"
+}
 iprule() { "$IPCMD" rule del "$@" >/dev/null 2>&1 || true; "$IPCMD" rule add "$@"; }
 # ip rule для НАШИХ меток: добавляем с маской (чтобы не зависеть от чужих битов),
 # при этом удаляем и старую запись без маски, если была.
@@ -941,6 +950,7 @@ command_up() {
 command_rules() {
     "ipt" -t mangle -N "$CHAIN" >/dev/null 2>&1 || true
     "ipt" -t mangle -F "$CHAIN" >/dev/null 2>&1 || true
+    REBUILD=1
     rule_priv
     rule_mark
     profiles_return_rules
