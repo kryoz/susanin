@@ -186,7 +186,7 @@ must already work. IPv6 is not supported in v1.
 
 ```sh
 opkg update && opkg install ca-certificates wget-ssl
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 susanin version && susanin status && susanin diagnose
 ```
 
@@ -258,7 +258,7 @@ v1 不支持 IPv6。
 
 ```sh
 opkg update && opkg install ca-certificates wget-ssl
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 susanin version && susanin status && susanin diagnose
 ```
 

@@ -392,7 +392,7 @@ grep 172.16.5 /proc/net/nf_conntrack | head -3     # mark=0x20000000/0x10000000
 - в `susanin.conf` не выключена проверка: `release_check=1`; период —
   `release_check_interval` (по умолчанию 43200 секунд, 12 часов);
 - на роутере есть HTTPS-клиент и корневые сертификаты:
-  `wget -qO- https://api.github.com/repos/R17a/Susanin.Keenetic/releases/latest | head -c 200`
+  `wget -qO- https://api.github.com/repos/kryoz/susanin/releases/latest | head -c 200`
   (если BusyBox-wget без TLS — `curl -fsS --max-time 10 <тот же URL>`);
 - последняя проверка была недавно, а GitHub тогда был недоступен — подождите
   период или удалите кэш и перезапустите демон:

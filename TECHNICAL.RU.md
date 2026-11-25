@@ -129,7 +129,7 @@ Susanin.Keenetic может выносить помеченный трафик �
 ```sh
 # 1) вместе с установкой: любой способ, флаг --with-xray(-tproxy)
 sh bootstrap.sh --with-xray --yes                       # tar-архив
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
   | sh -s -- --ipk --with-xray-tproxy                    # пакет .ipk
 # 2) вручную: xray/xray.<arch> из репозитория -> /opt/sbin/xray, chmod +x,
 #    sha256 сверить с xray/SHA256SUMS
@@ -428,7 +428,7 @@ opkg update && opkg install ca-certificates wget-ssl
 **Способ 1 — установщик сам определит архитектуру и поставит пакет**:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh -s -- --ipk
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh -s -- --ipk
 ```
 
 > Пакет установщик берёт из последнего релиза (`v0.4.6`) и сверяет SHA256 по
@@ -449,7 +449,7 @@ wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.s
 
 ```sh
 # VLESS/REALITY пакетом: Xray в .ipk не входит, установщик скачает его отдельно
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh \
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh \
   | sh -s -- --ipk --with-xray-tproxy
 ```
 
@@ -474,9 +474,9 @@ opkg print-architecture | awk '{print $2}'
 ```sh
 mkdir -p /opt/tmp && cd /opt/tmp
 wget -O susanin-keenetic_0.4.6_mipsel-3.4.ipk \
-  https://github.com/R17a/Susanin.Keenetic/releases/download/v0.4.6/susanin-keenetic_0.4.6_mipsel-3.4.ipk
+  https://github.com/kryoz/susanin/releases/download/v0.5.4.1-oc/susanin-keenetic_0.5.4.1-oc_mipsel-3.4.ipk
 wget -O SHA256SUMS \
-  https://github.com/R17a/Susanin.Keenetic/releases/download/v0.4.6/SHA256SUMS
+  https://github.com/kryoz/susanin/releases/download/v0.5.4.1-oc/SHA256SUMS
 sha256sum -c SHA256SUMS 2>/dev/null | grep mipsel-3.4   # ожидаем: ...: OK
 opkg install susanin-keenetic_0.4.6_mipsel-3.4.ipk
 susanin version && susanin status && susanin diagnose
@@ -521,17 +521,17 @@ opkg update && opkg install ca-certificates ipset iptables conntrack wget-ssl
 определит LAN и VPN, затем спросит подтверждение:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh
 ```
 
 Либо поставьте curl и используйте его:
 ```sh
 opkg install curl
-curl -fsSL https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/install.sh | sh
 ```
 
-Установка идёт с ветки `main` — это стабильная версия; установщик сам скачает
-архив последнего стабильного релиза под вашу архитектуру.
+Установка идёт с ветки форка `fix/oc-connector-egress` (не с `main` — там апстрим);
+установщик сам скачает архив последнего релиза форка под вашу архитектуру.
 
 Архитектура определяется автоматически по данным Entware
 (`/opt/etc/entware_release`, затем фид из `/opt/etc/opkg.conf`, затем
@@ -558,7 +558,7 @@ Xray (`--with-xray`):
 
 ```sh
 cd /opt/tmp
-wget -qO- https://raw.githubusercontent.com/R17a/Susanin.Keenetic/main/bootstrap.sh | sh -s -- --yes
+wget -qO- https://raw.githubusercontent.com/kryoz/susanin/fix/oc-connector-egress/bootstrap.sh | sh -s -- --yes
 # пакетом:           sh -s -- --yes --ipk
 # пакетом + Xray:    sh -s -- --yes --ipk --with-xray
 # tar-архив + Xray:  sh -s -- --yes --with-xray
