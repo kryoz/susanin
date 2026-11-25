@@ -1169,6 +1169,40 @@ static int be_ready_int(const susanin_config *c, int *unknown,
         return 0;
     }
 
+    /* «Цепочка есть» без jump в PREROUTING — мёртвая цепочка. Быстрый контроль
+     * раньше про неё ничего не знал: после сноса ndm цепочка возвращалась за ~1 с,
+     * а jump дожидался общего reconcile (dp_check_interval), и всё это время
+     * помеченный трафик шёл мимо наших правил (замер 2026-11-25: chain=up, jump=0). */
+    {
+        char *ln;
+        int jump;
+        argv[0] = (char *)tool_iptables();
+        argv[1] = "-w"; argv[2] = "-t"; argv[3] = "mangle"; argv[4] = "-S";
+        argv[5] = "PREROUTING"; argv[6] = NULL;
+        rc = run_check(argv, out, sizeof(out));
+        if (rc == XT_BUSY) {
+            if (unknown)
+                *unknown = 1;
+            return 1;
+        }
+        /* Ищем построчно: «-A PREROUTING» встречается и у других правил (у нас
+         * первым стоит DROP на QUIC), а jump — отдельная строка
+         * `-A PREROUTING -j SUSANIN` в конце цепочки. */
+        jump = 0;
+        if (rc == 0) {
+            for (ln = strtok(out, "\n"); ln; ln = strtok(NULL, "\n")) {
+                if (strstr(ln, "-A PREROUTING") && strstr(ln, "-j SUSANIN")) {
+                    jump = 1;
+                    break;
+                }
+            }
+        }
+        if (!jump) {
+            why_set(why, whysz, "mangle jump");
+            return 0;
+        }
+    }
+
     /* T3: dns_hijack ставит DNAT 53 для клиентов серверных VPN (oc+/wdtt+), в
      * том числе шаблоном `-i oc+` без живого клиента. Признак готовности —
      * отдельная цепочка SUSANIN_DNSHIJ с правилами. Комментарий для этого не
