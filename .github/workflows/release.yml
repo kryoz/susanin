@@ -111,11 +111,12 @@ jobs:
       - name: Compose release notes
         run: |
           V="${GITHUB_REF_NAME#v}"
-          # "Что нового" берём из CHANGELOG.md (секция ## vX.Y.Z), чтобы
-          # заметки релиза не были захардкожены под старую версию.
+          # "Что нового" берём из CHANGELOG.md (секция ## vX.Y.Z; в этом форке заголовок
+          # пишется как ## X.Y.Z-oc — с суффиксом и без `v`), чтобы заметки релиза не
+          # были захардкожены под старую версию.
           awk -v v="$V" '
-            $0 ~ "^## v" v "([[:space:]]|$)" { f=1; next }
-            f && /^## v/ { exit }
+            $0 ~ "^## v?" v "([[:space:]]|$)" { f=1; next }
+            f && /^## / { exit }
             f { print }
           ' CHANGELOG.md > /tmp/changes.md
           if [ ! -s /tmp/changes.md ]; then
