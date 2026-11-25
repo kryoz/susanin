@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 /* Тест локализации журнала: перевод шаблона по языку, откат на русский и
  * фактическая строка, которую печатает slogf(). */
+#define _GNU_SOURCE
 #include "lang.h"
 #include "log.h"
 

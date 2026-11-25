@@ -39,6 +39,7 @@ grep -vE '^[[:space:]]*(#|$)' "$MAN" | while read -r cls src; do
         tool|init)  cp "$SRC/$src" "$OUT/$(basename "$src")" ;;
         doc)        cp "$SRC/$src" "$OUT/docs/$(basename "$src")" ;;
         share)      cp "$SRC/$src" "$OUT/$(basename "$src")" ;;
+        ndmhook)    cp "$SRC/$src" "$OUT/$(basename "$src")" ;;
         cfg)        cp "$SRC/$src" "$OUT/config.example.conf" ;;
         www)        cp -r "$SRC/$src/." "$OUT/www/" ;;
         root)       cp "$SRC/$src" "$OUT/$(basename "$src")" ;;

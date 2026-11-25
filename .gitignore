@@ -9,11 +9,16 @@
 /AGENTS.md
 /readme.html
 /release-notes-*.md
+/DNS.md
+/DNS_result.md
 
-# build intermediates (release binaries ARE committed, see build/)
+# build intermediates: готовые бинарники агента в репозитории НЕ лежат —
+# их собирает локально tools/wsl-build.sh или CI, а .ipk и архив релиза
+# собираются из этого файла (make-ipk/stage-release берут его аргументом)
 *.o
 susanin-agent
-# копии кросс-бинарников в корне (build/susanin-agent.* — коммитятся)
+/build/
+# копии кросс-бинарников в корне
 /susanin-agent.*
 # скомпилированные host-тесты (исходники .c/.sh — на месте)
 /tests/test_*
@@ -32,7 +37,6 @@ susanin-agent
 
 # OpenWRT artifacts (built by CI / tools/build-openwrt.sh; not committed)
 /deploy-openwrt/
-/build/susanin-agent.openwrt-*
 
 # editors / OS
 .DS_Store

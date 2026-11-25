@@ -66,7 +66,9 @@
         { title: 'Тоннель', fields: [
           f('egress_interface', 'Интерфейс(ы) тоннеля', 'через запятую; порядок = приоритет фейловера — перетаскивайте чипы или ← / →', 'text', { kind: 'ifacelist' }),
           f('egress_address', 'Адрес(а) тоннеля', 'по индексу совпадает с интерфейсами (источник для health-проб)', 'text', { kind: 'iplist' }),
-          f('egress_type', 'Тип egress', '', 'select', { options: ['interface', 'tproxy'] }),
+          f('egress_type', 'Тип egress', '', 'select', { options: [
+            'interface', 'tproxy'
+          ] }),
           f('tproxy_port', 'Порт локального Xray', 'только для egress_type=tproxy', 'number', { kind: 'int' })
         ]},
         { title: 'UDP-релей (для tproxy/XRay)', fields: [
@@ -108,7 +110,10 @@
         { title: 'DNS клиентов LAN через туннель', fields: [
           f('dns_lan', 'DNS клиентов через туннель', 'DNAT udp/53 клиентов br0/br1 на форвардер агента: ответы приходят из туннеля, а не с прямого пути, где провайдер их подменяет', 'bool'),
           f('dns_lan_upstream', 'Upstream-ы форвардера', 'через запятую, IPv4: 8.8.8.8,1.1.1.1', 'text'),
-          f('dns_lan_fallback', 'Fail-open: спросить напрямую', 'если туннель не ответил — обычный запрос, чтобы не оставить дом без DNS', 'bool')
+          f('dns_lan_fallback', 'Fail-open: спросить напрямую', 'если туннель не ответил — обычный запрос, чтобы не оставить дом без DNS', 'bool'),
+          f('dns_lan_smart', 'Сначала локальный резолвер', 'да — локальный ответ быстрее, в туннель уходит только подмена (127.0.0.1/0.0.0.0) или пустой ответ; нет — весь DNS через туннель', 'bool'),
+          f('dns_lan_thread', 'Форвардер в своём потоке', 'да — свой опрос сокетов с шагом 50 мс, не зависит от тика движка; нужно там, где тик редкий и обмен через SOCKS не успевает', 'bool'),
+          f('dns_lan_pin', 'Пинить адрес при подмене', 'да — если прямой ответ подменён, а туннель вернул настоящий адрес, адрес уходит в VPN без записи в vpn_always; так же запинятся заглушки блокировщиков рекламы', 'bool')
         ]},
         { title: 'Kernel-offload (быстрый путь для CDN)', fields: [
           f('kernel_offload', 'Offload включён', 'адреса из ok_net идут маршрутом через интерфейс, минуя userspace-обработку', 'bool'),
@@ -964,14 +969,20 @@
         sel.appendChild(placeholderOpt);
         /* Ключа нет — оставляем выбор доступным: при сохранении он будет создан. */
       }
+      /* Вариант — строка или {value,label}: в конфиг уходит value, в списке
+       * показывается label. */
+      var optValues = [];
       (fld.options || []).forEach(function (opt) {
+        var ov = (opt && typeof opt === 'object') ? opt.value : opt;
+        var ol = (opt && typeof opt === 'object') ? (opt.label || opt.value) : opt;
+        optValues.push(ov);
         var o = document.createElement('option');
-        o.value = opt;
-        o.textContent = opt;
-        if (present && opt === val) o.selected = true;
+        o.value = ov;
+        o.textContent = ol;
+        if (present && ov === val) o.selected = true;
         sel.appendChild(o);
       });
-      if (present && (fld.options || []).indexOf(val) < 0) {
+      if (present && optValues.indexOf(val) < 0) {
         var custom = document.createElement('option');
         custom.value = val;
         custom.textContent = T('cfg.select.notInList', '{value} (нет в списке)', { value: val });
@@ -1019,7 +1030,7 @@
       /* Поле без ключа в файле оставляем доступным: сервер создаст ключ, если
        * значение не пустое (пустые строки в конфиг не дописываем). */
       if (fld.kind || fld.noZero) attachValidation(inp, fld);
-      if (!present) wrap.appendChild(missingTag());
+      wrap.appendChild(missingTag());
     }
 
     return wrap;
@@ -1124,6 +1135,7 @@
       toast(T('cfg.save.error', 'Ошибка сохранения: {err}', { err: e.message }), false);
     });
   }
+
 
   /* Закладка со своим готовым блоком (view): блок живёт в index.html, при
    * смене закладки возвращается в скрытый контейнер, чтобы не потерять обработчики. */
@@ -1306,6 +1318,7 @@
     body.appendChild(save);
 
     takeSnapshot();
+
   }
 
   /* --- «грязная» форма: перед сменой языка предупреждаем о потере ввода --- */

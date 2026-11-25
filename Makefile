@@ -6,6 +6,7 @@ BINDIR = $(PREFIX)/susanin/bin
 CONFDIR = $(PREFIX)/susanin/etc
 VARDIR = $(PREFIX)/susanin/var
 
+
 SRCS = src/main.c src/config.c src/discover.c src/conntrack.c src/state.c \
        src/backend.c src/classifier.c src/health.c src/engine.c src/log.c src/ops.c \
        src/vpn_always.c src/vpn_never.c src/web.c src/web_choices.c \
@@ -97,6 +98,7 @@ tests/test_entryparse: tests/test_entryparse.c src/entryparse.c src/entryparse.h
 # ни сети, ни конфига, поэтому линкуем только его.
 tests/test_dns_lan: tests/test_dns_lan.c src/dns_lan.h src/log.c src/log.h src/config.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_dns_lan.c src/log.c src/lang.c src/lang_catalog.c
+
 
 tests/test_lang: tests/test_lang.c src/lang.c src/lang_catalog.c src/log.c src/lang.h src/log.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_lang.c src/lang.c src/lang_catalog.c src/log.c

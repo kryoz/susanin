@@ -2,6 +2,7 @@
 #include "config.h"
 #include "lang.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -114,6 +115,7 @@ void config_parse_egress(susanin_config *c)
     char *save = NULL, *asave = NULL, *tok, *atok;
     int i = 0;
 
+
     c->n_egress = 0;
     snprintf(buf, sizeof(buf), "%s", c->egress_interface);
     snprintf(abuf, sizeof(abuf), "%s", c->egress_address);
@@ -218,6 +220,8 @@ void config_set_defaults(susanin_config *c)
              "8.8.8.8,1.1.1.1");
     c->dns_lan_fallback = 1;         /* туннель молчит — спросить напрямую */
     c->dns_lan_smart = 1;            /* локальный резолвер быстрее туннеля */
+    c->dns_lan_thread = 0;           /* по умолчанию — прежний тик движка */
+    c->dns_lan_pin = 0;              /* пиннинг по подмене выключен */
     c->soft_state_interval = 12 * 3600;   /* soft: сохранять состояние раз в 12 ч */
     /* Порты, которые не участвуют в автообучении (типовой скан-шум). */
     snprintf(c->learn_exclude_ports, sizeof(c->learn_exclude_ports), "%s",
@@ -764,20 +768,20 @@ int config_load(const char *path, susanin_config *c)
             c->vpn_never_interval = cfg_dur(c, key, val, U_SEC);
         else if (!strcmp(key, "vpn_refresh_budget_ms"))
             c->vpn_refresh_budget_ms = (int)cfg_num(c, key, val);
-            else if (!strcmp(key, "log_level"))
-                set_str(c->log_level, sizeof(c->log_level), val);
-            else if (!strcmp(key, "xray_loglevel"))
-                set_str(c->xray_loglevel, sizeof(c->xray_loglevel), val);
-            else if (!strcmp(key, "xray_gogc"))
-                set_str(c->xray_gogc, sizeof(c->xray_gogc), val);
-            else if (!strcmp(key, "xray_gomemlimit"))
-                set_str(c->xray_gomemlimit, sizeof(c->xray_gomemlimit), val);
-            else if (!strcmp(key, "xray_watchdog"))
-                c->xray_watchdog = (int)cfg_num(c, key, val);
-            else if (!strcmp(key, "xray_min_mem_kb"))
-                c->xray_min_mem_kb = (int)cfg_num(c, key, val);
-            else if (!strcmp(key, "xray_log_max_kb"))
-                c->xray_log_max_kb = (int)cfg_num(c, key, val);
+        else if (!strcmp(key, "log_level"))
+            set_str(c->log_level, sizeof(c->log_level), val);
+        else if (!strcmp(key, "xray_loglevel"))
+            set_str(c->xray_loglevel, sizeof(c->xray_loglevel), val);
+        else if (!strcmp(key, "xray_gogc"))
+            set_str(c->xray_gogc, sizeof(c->xray_gogc), val);
+        else if (!strcmp(key, "xray_gomemlimit"))
+            set_str(c->xray_gomemlimit, sizeof(c->xray_gomemlimit), val);
+        else if (!strcmp(key, "xray_watchdog"))
+            c->xray_watchdog = (int)cfg_num(c, key, val);
+        else if (!strcmp(key, "xray_min_mem_kb"))
+            c->xray_min_mem_kb = (int)cfg_num(c, key, val);
+        else if (!strcmp(key, "xray_log_max_kb"))
+            c->xray_log_max_kb = (int)cfg_num(c, key, val);
         else if (!strcmp(key, "disk_mode"))
             set_str(c->disk_mode, sizeof(c->disk_mode), val);
         else if (!strcmp(key, "lang"))
@@ -790,6 +794,10 @@ int config_load(const char *path, susanin_config *c)
             c->dns_lan_fallback = val[0] ? (int)cfg_num(c, key, val) : 1;
         else if (!strcmp(key, "dns_lan_smart"))
             c->dns_lan_smart = val[0] ? (int)cfg_num(c, key, val) : 1;
+        else if (!strcmp(key, "dns_lan_thread"))
+            c->dns_lan_thread = val[0] ? (int)cfg_num(c, key, val) : 0;
+        else if (!strcmp(key, "dns_lan_pin"))
+            c->dns_lan_pin = val[0] ? (int)cfg_num(c, key, val) : 0;
         else if (!strcmp(key, "soft_state_interval"))
             c->soft_state_interval = cfg_dur(c, key, val, U_HOUR);
         else if (!strcmp(key, "learn_exclude_ports"))
@@ -1188,6 +1196,14 @@ int config_save(const char *path, const susanin_config *c)
     fprintf(fp, "# 1 = спрашивать локальный резолвер первым (быстро), в туннель —\n");
     fprintf(fp, "# только если ответ подменён (127.0.0.1/0.0.0.0) или пуст.\n");
     fprintf(fp, "dns_lan_smart=%d\n", c->dns_lan_smart);
+    fprintf(fp, "# 1 = форвардер в своём потоке (свой опрос сокетов), 0 = по тику движка.\n");
+    fprintf(fp, "# Нужен там, где тик редкий: обмен DNS-over-TCP через SOCKS идёт шагами\n");
+    fprintf(fp, "# и при тике ~1 с не успевает в бюджет запроса.\n");
+    fprintf(fp, "dns_lan_thread=%d\n", c->dns_lan_thread);
+    fprintf(fp, "# 1 = если прямой ответ подменён, а туннель вернул настоящий адрес —\n");
+    fprintf(fp, "# запинить этот адрес (трафик домена пойдёт через VPN без vpn_always).\n");
+    fprintf(fp, "# Внимание: так же запинятся заглушки блокировщиков рекламы.\n");
+    fprintf(fp, "dns_lan_pin=%d\n", c->dns_lan_pin);
     fprintf(fp, "# Период сохранения состояния в soft-режиме, ч; 0 = никогда.\n");
     out_dur_exact(c->soft_state_interval, U_HOUR, dv, sizeof(dv));
     fprintf(fp, "soft_state_interval=%s\n", dv);
@@ -1888,6 +1904,18 @@ int config_validate(const susanin_config *c, char *out, size_t n)
     if (!strcmp(c->egress_type, "interface") && !c->egress_interface[0])
         CFGV("egress_type=interface без egress_interface: учение будет, маршрутизации — нет");
 
+    {
+        static const char *known_types[] = { "interface", "tproxy", "xray" };
+        size_t j;
+        int known = 0;
+
+        for (j = 0; j < sizeof(known_types) / sizeof(known_types[0]); j++)
+            if (!strcmp(c->egress_type, known_types[j]))
+                known = 1;
+        if (!known)
+            CFGV("egress_type=%s: неизвестный тип — работает как interface", c->egress_type);
+    }
+
     for (i = 0; i < c->n_egress && i < CFG_MAX_EGRESS; i++)
         if (!c->egress_list[i][0])
             CFGV("egress %d: пустой интерфейс в списке", i + 1);
@@ -1960,6 +1988,8 @@ void config_print(const susanin_config *c)
     printf("dns_lan_upstream=%s\n", c->dns_lan_upstream);
     printf("dns_lan_fallback=%d\n", c->dns_lan_fallback);
     printf("dns_lan_smart=%d\n", c->dns_lan_smart);
+    printf("dns_lan_thread=%d\n", c->dns_lan_thread);
+    printf("dns_lan_pin=%d\n", c->dns_lan_pin);
     out_dur_exact(c->soft_state_interval, U_HOUR, dv, sizeof(dv));
     printf("soft_state_interval=%s\n", dv);
     printf("learn_exclude_ports=%s\n", c->learn_exclude_ports);

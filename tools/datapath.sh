@@ -61,6 +61,7 @@ MSS_CLAMP_LAN=${SUSANIN_MSS_CLAMP_LAN:-0}
 DNS_HIJACK=${SUSANIN_DNS_HIJACK:-0}
 DNS_HIJACK_TARGET=${SUSANIN_DNS_HIJACK_TARGET:-}
 
+
 # Ручной запуск (не из демона): значения берём из конфига; из демона всё
 # приходит через окружение (backend.c) — поведение не меняется.
 CONF_FILE=${SUSANIN_CONF:-/opt/susanin/etc/susanin.conf}
@@ -663,11 +664,13 @@ _dns_hijack_ifaces() {
     printf '%s' "$_out" | sed 's/^ *//'
 }
 
-# Метка наших правил: по ней ищем/удаляем и проверяем готовность датаплейна.
-# iptables не допускает больше одного `-d` в правиле («multiple -d flags not
-# allowed»), поэтому приватные сети исключаем отдельными RETURN-правилами ДО
-# DNAT, а не тремя `! -d` в одном правиле.
+# Метка прежних версий: правила помечались комментарием susanin-dns. На части
+# прошивок Keenetic модуля xt_comment нет (`-m comment` отдаёт «No
+# chain/target/match by that name»), поэтому свои правила держим в отдельной
+# цепочке — её имя и служит меткой. Комментарий оставлен только для снятия
+# правил, поставленных прежними версиями.
 DNS_HIJACK_COMMENT=susanin-dns
+DNS_HIJACK_CHAIN=SUSANIN_DNSHIJ
 DNS_HIJACK_PRIVATE="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 
 dns_hijack_clean() {
@@ -676,6 +679,9 @@ dns_hijack_clean() {
             _spec=$(printf '%s' "$_line" | sed 's/^-A PREROUTING //')
             "ipt" -t nat -D PREROUTING $_spec >/dev/null 2>&1 || true
         done || true
+    while "ipt" -t nat -D PREROUTING -j "$DNS_HIJACK_CHAIN" >/dev/null 2>&1; do :; done
+    "ipt" -t nat -F "$DNS_HIJACK_CHAIN" >/dev/null 2>&1 || true
+    "ipt" -t nat -X "$DNS_HIJACK_CHAIN" >/dev/null 2>&1 || true
 }
 
 # DNS клиентов LAN через туннель (dns_lan=1): DNAT 53 на локальный форвардер
@@ -767,7 +773,9 @@ _dns_lan_owned_by_agent() {
     [ -n "$_ino" ] || return 1
     _ap=$(cat /opt/susanin/var/susanin-agent.pid 2>/dev/null || true)
     [ -n "$_ap" ] || return 0        # pid-файла нет — судить не по чему
-    kill -0 "$_ap" 2>/dev/null || return 0
+    # Мёртвый pid — агента нет, сокет мог остаться у наследника (fork без exec):
+    # DNAT на такой сокет ставить нельзя.
+    kill -0 "$_ap" 2>/dev/null || return 1
     for _f in /proc/"$_ap"/fd/*; do
         [ "$(readlink "$_f" 2>/dev/null)" = "socket:[$_ino]" ] || continue
         return 0
@@ -833,6 +841,11 @@ dns_lan_rules() {
     fi
     # Порт форвардера — только из LAN, снаружи закрыт.
     if "ipt" -t filter -N "$DNS_LAN_IN_CHAIN" >/dev/null 2>&1; then
+        # Локальные запросы (диагностика: `susanin-agent dnsprobe`) идут по lo.
+        # Без этого ACCEPT их рубит DROP ниже, и проба врёт «форвардер не
+        # отвечает», хотя клиенты обслуживаются.
+        "ipt" -t filter -A "$DNS_LAN_IN_CHAIN" -i lo -p udp \
+            --dport "$DNS_LAN_PORT" -j ACCEPT >/dev/null 2>&1 || true
         for _i in $_ifaces; do
             "ipt" -t filter -A "$DNS_LAN_IN_CHAIN" -i "$_i" -p udp \
                 --dport "$DNS_LAN_PORT" -j ACCEPT >/dev/null 2>&1 || true
@@ -862,37 +875,39 @@ dns_hijack_rules() {
         say "dns_hijack=1, но в lan_interfaces нет oc+/wdtt+ — пропускаю"
         return 0
     fi
+    if ! _msg=$("ipt" -t nat -N "$DNS_HIJACK_CHAIN" 2>&1); then
+        say "dns_hijack: цепь $DNS_HIJACK_CHAIN не создана: ${_msg:-неизвестная ошибка}"
+        return 0
+    fi
+    # Приватные назначения не перехватываем: RETURN должен срабатывать раньше
+    # DNAT, поэтому добавляется первым. Цепочка своя, отдельная от dns_lan, а
+    # iptables не допускает больше одного `-d` в правиле — отсюда три RETURN.
     _n=0
+    _err=""
     for _i in $_ifaces; do
         for _p in udp tcp; do
-            # Ставим В НАЧАЛО PREROUTING (-I 1): у Keenetic в nat PREROUTING
-            # могут быть свои ранние терминальные правила (jump/RETURN), из-за
-            # которых DNAT в конце цепочки не сработал бы. Порядок вставки:
-            # сначала DNAT, затем RETURN-исключения — каждый на позицию 1, в
-            # итоге RETURN'ы оказываются выше DNAT.
-            if "ipt" -t nat -I PREROUTING 1 -i "$_i" -p "$_p" --dport 53 \
-                   -m comment --comment "$DNS_HIJACK_COMMENT" \
-                   -j DNAT --to-destination "$_dst" 2>/dev/null; then
+            for _net in $DNS_HIJACK_PRIVATE; do
+                "ipt" -t nat -A "$DNS_HIJACK_CHAIN" -i "$_i" -p "$_p" --dport 53 \
+                    -d "$_net" -j RETURN >/dev/null 2>&1 || true
+            done
+            if _msg=$("ipt" -t nat -A "$DNS_HIJACK_CHAIN" -i "$_i" -p "$_p" --dport 53 \
+                    -j DNAT --to-destination "$_dst" 2>&1); then
                 _n=$((_n + 1))
             else
-                say "dns_hijack: не удалось добавить $_p/53 для $_i (нет xt_comment?)"
-                continue
+                [ -n "$_err" ] || _err="$_msg"
             fi
-            # Приватные адреса назначения (свой DNS/AdGuard в LAN) не трогаем:
-            # RETURN срабатывает раньше DNAT.
-            for _net in $DNS_HIJACK_PRIVATE; do
-                "ipt" -t nat -I PREROUTING 1 -i "$_i" -p "$_p" --dport 53 \
-                    -d "$_net" -m comment --comment "$DNS_HIJACK_COMMENT" \
-                    -j RETURN >/dev/null 2>&1 || true
-            done
         done
     done
     if [ "$_n" -eq 0 ]; then
-        say "dns_hijack=1, но правила не добавлены — фича не работает (проверьте xt_comment/nat)"
+        say "dns_hijack=1, но правила не добавлены: ${_err:-неизвестная ошибка}"
         return 0
     fi
+    # Переход ставим в начало PREROUTING: у Keenetic там бывают свои ранние
+    # терминальные правила, из-за которых переход в конце цепочки не сработал бы.
+    "ipt" -t nat -I PREROUTING 1 -j "$DNS_HIJACK_CHAIN" >/dev/null 2>&1 || true
     say "dns_hijack: DNS клиентов ($_ifaces) -> $_dst (правил DNAT: $_n)"
 }
+
 
 
 command_up() {
@@ -979,8 +994,11 @@ command_status() {
         done
     fi
     echo "forward_accept: rules=$_fa/$_fan (метки ok/test/профили — нужны клиентам серверных VPN: oc+/wdtt+)"
-    # Считаем только НАШИ правила (по comment-метке), а не любой DNAT 53.
-    _dh=$("ipt" -t nat -S PREROUTING 2>/dev/null | grep -cF -- "$DNS_HIJACK_COMMENT" || true)
+    # Считаем правила своей цепочки; правила прежней версии (с комментарием)
+    # тоже учитываем, иначе status врёт на установке, где они ещё остались.
+    _dh=$("ipt" -t nat -S "$DNS_HIJACK_CHAIN" 2>/dev/null | grep -c '^-A' || true)
+    _dh_old=$("ipt" -t nat -S PREROUTING 2>/dev/null | grep -cF -- "$DNS_HIJACK_COMMENT" || true)
+    _dh=$(( ${_dh:-0} + ${_dh_old:-0} ))
     if [ "$DNS_HIJACK" = "1" ]; then
         echo "dns_hijack: on (серверные VPN: $(_dns_hijack_ifaces) -> $(_dns_hijack_dest); наших правил=$_dh)"
     elif [ "${_dh:-0}" -gt 0 ] 2>/dev/null; then

@@ -47,7 +47,16 @@ pick_pkg() {
 }
 
 rm -rf "$DEST"
-cp -r "$SRC" "$DEST"
+mkdir -p "$DEST"
+# Копируем через tar с исключениями: `cp -r` тащил .git (сотни мегабайт
+# объектов), dist/ и build/ — на 9p это занимало минуты и ничего не давало
+# сборке. Каталог build/ создаётся заново ниже.
+( cd "$SRC" && tar -cf - \
+    --exclude=./.git --exclude=./dist --exclude=./dist-* \
+    --exclude=./build --exclude=./local --exclude='./~&&' . ) | \
+    ( cd "$DEST" && tar -xf - )
+
+
 mkdir -p "$SRC/build"
 ok=0
 

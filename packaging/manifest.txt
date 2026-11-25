@@ -57,5 +57,11 @@ share   lang/ZH.json
 
 www     www
 
+
+# Хук NDM: возвращает FORWARD-разрешение по метке VPN сразу после пересборки
+# netfilter (иначе агент восстанавливает его за 5–8 с, и трафик в это окно
+# упирается в политику DROP). Ставится в /opt/etc/ndm/netfilter.d/.
+ndmhook init/ndm/60-susanin-forward.sh
+
 root    install.sh
 root    bootstrap.sh

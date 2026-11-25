@@ -9,12 +9,15 @@
 # и мёртвом агенте теряется не «маршрутизация», а разрешение имён.
 #
 # Сторож запускается из datapath.sh вместе с правилами и раз в INTERVAL
-# секунд проверяет, что порт форвардера кто-то слушает. Как только слушателя
-# нет — снимает ТОЛЬКО цепь DNS (остальной датаплейн не трогает) и выходит:
-# DNS клиентов возвращается на прямой путь (fail-open), маршрутизация остаётся
-# в текущем состоянии.
+# секунд проверяет, что порт форвардера слушает ИМЕННО агент и что он отвечает.
+# Если агент мёртв или сокет достался наследнику (Xray и т.п.) — снимает ТОЛЬКО
+# цепь DNS (остальной датаплейн не трогает) и выходит: DNS клиентов
+# возвращается на прямой путь (fail-open), маршрутизация остаётся как была.
+# Затем пытается поднять агент (не чаще 3 раз в час).
 #
-# Не перезапускает агент: восстановление — `susanin restart` или панель.
+# Живой агент, который не ответил на пробу, DNAT не снимает: прямой путь в РФ
+# для части домён хуже туннеля, а форвардер живёт в своём потоке и обычно
+# восстанавливается сам. Такие случаи только пишутся в заметку.
 #
 # POSIX sh (busybox ash compatible).
 
@@ -53,7 +56,9 @@ agent_holds_socket() {
     [ -n "$_ino" ] || return 1
     _ap=$(cat "$AGENT_PID" 2>/dev/null || true)
     [ -n "$_ap" ] || return 0
-    kill -0 "$_ap" 2>/dev/null || return 0
+    # Мёртвый pid — агента нет; сокет мог достаться наследнику (fork без exec).
+    # Это НЕ «агент держит сокет»: иначе DNAT остаётся и DNS уходит в никуда.
+    kill -0 "$_ap" 2>/dev/null || return 1
     for _f in /proc/"$_ap"/fd/*; do
         [ "$(readlink "$_f" 2>/dev/null)" = "socket:[$_ino]" ] || continue
         return 0
@@ -66,13 +71,12 @@ chain_present() {
     "$IPT" -w -t nat -S "$CHAIN" >/dev/null 2>&1
 }
 
-# Поднять агент, если он умер не по команде stop/down. Цепь DNAT на месте —
-# значит правила никто штатно не снимал, и без перезапуска LAN останется без
-# туннеля до ручного вмешательства (агент может упасть ночью). Ограничиваем
-# число попыток, чтобы падение на старте не превратилось в бесконечный цикл.
+# Поднять агент, если он умер не по команде stop/down. Ограничиваем число
+# попыток, чтобы падение на старте не превратилось в бесконечный цикл.
 RESTARTS=/opt/susanin/var/dnslan-guard.restarts
 maybe_restart() {
     _now=$(date +%s 2>/dev/null || echo 0)
+    _old=$(cat "$AGENT_PID" 2>/dev/null || true)
     _n=0
     if [ -f "$RESTARTS" ]; then
         _n=$(awk -v t="$((_now - 3600))" '$1 + 0 > t' "$RESTARTS" 2>/dev/null | wc -l)
@@ -83,7 +87,12 @@ maybe_restart() {
     fi
     printf '%s\n' "$_now" >>"$RESTARTS" 2>/dev/null || true
     if [ -x "$TOOLS/susanin.sh" ] && sh "$TOOLS/susanin.sh" start >/dev/null 2>&1; then
-        note "dns_lan: агент перезапущен сторожем (правила датаплейна он поставит сам)"
+        _new=$(cat "$AGENT_PID" 2>/dev/null || true)
+        if [ -n "$_new" ] && [ "$_new" != "$_old" ]; then
+            note "dns_lan: агент перезапущен сторожем (pid ${_old:-?} -> $_new; правила датаплейна он поставит сам)"
+        else
+            note "dns_lan: start вызван, но pid не сменился (${_new:-?}) — агент уже работал"
+        fi
     else
         note "dns_lan: перезапустить агент не удалось — нужен susanin start вручную"
     fi
@@ -91,6 +100,22 @@ maybe_restart() {
 }
 
 echo $$ >"$PIDFILE" 2>/dev/null || true
+# Проверка ОТВЕТА, а не только сокета: агент может быть жив и держать порт,
+# но не успевать отвечать (занят iptables/пересборкой). Три неудачи подряд
+# (раз в PROBE_EVERY тиков) — повод записать в заметку. Две не годятся: один
+# пропущенный тик агента давал ложное «мёртв».
+PROBE_EVERY=${SUSANIN_DNSLAN_PROBE_EVERY:-12}
+PROBE_FAIL_MAX=${SUSANIN_DNSLAN_PROBE_FAIL_MAX:-3}
+AGENT_BIN=/opt/susanin/bin/susanin-agent
+probe_answers() {
+    [ -x "$AGENT_BIN" ] || return 0
+    "$AGENT_BIN" dnsprobe example.com 127.0.0.1 "$PORT" >/dev/null 2>&1
+}
+# Причина неудачи — в журнал: без неё «не отвечает» не отличить от таймаута,
+# отказа upstream-а и занятого цикла.
+probe_why() {
+    "$AGENT_BIN" dnsprobe example.com 127.0.0.1 "$PORT" 2>&1 | tail -n1
+}
 # Убираем pid-файл только если он всё ещё наш: иначе сторож, вышедший после
 # restart, удалил бы pid-файл нового сторожа, и тот через тик решил бы, что его
 # сняли.
@@ -100,15 +125,35 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+tick=0
+pfail=0
+
 while :; do
     sleep "$INTERVAL"
+    tick=$((tick + 1))
     # Нас заменил новый сторож (up после restart) или сняли pid-файл — выходим.
     [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] || exit 0
-    agent_holds_socket && continue
-    # Слушателя нет (или порт держит не агент). Цепь уже снята — тихо выходим.
+    if agent_holds_socket; then
+        if [ $((tick % PROBE_EVERY)) -eq 0 ] && ! probe_answers; then
+            pfail=$((pfail + 1))
+            note "dns_lan: сокет udp/$PORT есть, но форвардер не отвечает (проба $pfail/$PROBE_FAIL_MAX: $(probe_why))"
+            if [ "$pfail" -ge "$PROBE_FAIL_MAX" ]; then
+                pfail=0
+                note "dns_lan: форвардер не отвечает, но агент жив (pid $(cat "$AGENT_PID" 2>/dev/null || echo '?')) — DNAT не снимаю"
+            fi
+            continue
+        fi
+        pfail=0
+        continue
+    fi
+    # Слушателя нет или порт держит не агент — это и есть случай, от которого
+    # сторож защищает (мёртвый агент + живые DNAT-правила). Цепь уже снята —
+    # тихо выходим.
     chain_present || exit 0
-    if [ -n "$(socket_inode)" ]; then
-        _why="порт udp/$PORT занят не агентом (унаследован Xray?)"
+    _ino=$(socket_inode)
+    _ap=$(cat "$AGENT_PID" 2>/dev/null || true)
+    if [ -n "$_ino" ]; then
+        _why="порт udp/$PORT занят не агентом (inode $_ino, pid-файл ${_ap:-нет})"
     else
         _why="форвардер (udp/$PORT) не слушает"
     fi
